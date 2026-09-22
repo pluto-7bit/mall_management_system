@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      ★ 不加这一行的话，浏览器每个页面都会去请求 /favicon.ico，
+        拿不到就留一条 404 —— 控制台里那条红字会一直挂着，
+        真出别的问题时不好分辨。
+        type 必须写：SVG 图标的 MIME 是 image/svg+xml，
+        漏了的话部分浏览器会当成普通文件下载而不是当图标用。
+    -->
+    <link rel="icon" type="image/svg+xml" href="/images/favicon.svg" />
+    <title>商城</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

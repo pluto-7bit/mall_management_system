@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.OrderTimeoutMapper">
+
+    <!--
+      ★★★ 超时订单扫描 —— 全项目唯一一个【系统视角】的不带 member_id 的订单查询。
+
+      ⚠️ 「唯一」这个词在里程碑 10 之后要加个限定语。绕过会员隔离的订单查询
+        现在有两个，但它们的豁免理由【完全不同】，别混为一谈：
+          - 这里（OrderTimeoutMapper）：调用者是定时任务，代表系统视角，
+            而且★结果永远不会返回给客户端；
+          - OrderAdminMapper：调用者是管理员（真人，通过 HTTP），
+            结果【会】直接渲染到管理端页面上，靠 AdminAuthInterceptor
+            对 /api/admin/** 的一刀切拦截来挡越权。
+        ★ 一句话：豁免不是没有边界，而是边界换了地方。
+          详见 OrderAdminMapper 接口的类注释。
+
+      它为什么可以不带 member_id：因为它的调用者是【定时任务】，
+      代表的是【系统】视角，不是某个会员的视角。
+      系统要把所有人的超时订单都取消掉，本来就该跨会员查。
+
+      ★ 那它为什么不危险：因为它【只读】，而且结果不会返回给客户端。
+        真正的写法是：这里只捞出「哪些订单超时了」，
+        捞出之后逐条调 OrderMapper.markCancelled(orderNo, memberId) ——
+        ★ 那一条 UPDATE 是带 member_id 的，隔离还在。
+        隔离的例外只存在于「读」，不存在于「写」。
+        详见 OrderTimeoutMapper 接口的类注释。
+        （⚠️ 这句「不存在于『写』」只对【本文件】成立 ——
+          OrderAdminMapper.markShipped 就是一个不带 member_id 的写，
+          它靠的是拦截器而不是「结果不出系统」。）
+
+      ⚠️ 这是一条全表范围的查询，说清楚它为什么不会拖垮数据库：
+        WHERE status = 0 AND create_time <= #{deadline}
+        建表时已经有 idx_status 和 idx_create_time（见 mall.sql），
+        MySQL 会挑一个走，不需要再额外加索引。
+        订单量小的时候足够了 —— 加索引要有 EXPLAIN 做依据，别凭感觉加。
+
+      ★ LIMIT 不是优化，是【自我保护】：
+        定时任务每 10 秒跑一次。如果积压了几十万单，
+        不限量的 SELECT 会把几十万行一次性拉进内存，每 10 秒一次。
+        有 LIMIT 之后积压会按 limit / 间隔 的速度慢慢排掉 ——
+        慢没关系，定时清理任务宁可慢，不能把服务拖垮。
+
+      ★ ORDER BY id 而不是 ORDER BY create_time：
+        两个都是全序，但 id 是主键，排序走聚簇索引，不用额外排序。
+        更重要的是：id 的顺序就是插入顺序，也就是 create_time 的顺序 ——
+        越早的超时订单越先被处理，符合直觉。
+
+      ⚠️ 列清单用全限定的 refid 引用 OrderMapper 的片段，不要在这里重抄。
+        两个 mapper 查同一张表，列清单只该有一份 ——
+        否则哪天加了一列，改了这边忘了那边，
+        症状是「有的查询能拿到这个字段、有的拿不到」，非常难查。
+        ★ 里程碑 10 给那份片段加上了 `o.` 前缀（因为管理端的 JOIN 查询也要用它），
+          所以这里必须跟着把表别名写成 `FROM orders o` —— 否则列找不到。
+    -->
+    <select id="selectTimeoutCandidates" resultType="Order">
+        SELECT <include refid="com.example.mall.mapper.OrderMapper.baseColumns"/>
+        FROM orders o
+        WHERE o.status = 0
+          AND o.create_time &lt;= #{deadline}
+        ORDER BY o.id
+        LIMIT #{limit}
+    </select>
+
+</mapper>

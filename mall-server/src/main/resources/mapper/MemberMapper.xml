@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.MemberMapper">
+
+    <!--
+      登录查询：会员这边唯一一个 SELECT 里带 password 的地方。
+
+      和 AdminUserMapper.selectByUsername 的写法完全一致，因为要解决的问题
+      完全一致 —— 精确匹配（不是 LIKE），LIMIT 1。
+      这种「两个 Mapper 里有相似的查询」是正常的，不要为了消除这个重复
+      去抽一个公共父类。它们的表不同、字段不同、以后的变化方向也不同，
+      强行抽象只会让两边都被对方的改动牵连。
+    -->
+    <select id="selectByUsername" resultType="Member">
+        SELECT id, username, password, nickname, phone, status, create_time, update_time
+        FROM member
+        WHERE username = #{username}
+        LIMIT 1
+    </select>
+
+    <!-- 按 id 查，刻意不返回 password -->
+    <select id="selectById" resultType="Member">
+        SELECT id, username, nickname, phone, status, create_time, update_time
+        FROM member
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      注册查重。
+
+      用 COUNT(*) 而不是 selectByUsername 再判 null，是为了「不把密码读出来」。
+      查重这个动作根本不需要密码字段，那就别读 —— 和 selectById
+      不查 password 是同一个原则：用不上的敏感数据不进内存。
+    -->
+    <select id="countByUsername" resultType="long">
+        SELECT COUNT(*)
+        FROM member
+        WHERE username = #{username}
+    </select>
+
+    <!--
+      新增会员。
+
+      ★ useGeneratedKeys="true" + keyProperty="id" 的作用：
+        插入完成后，MySQL 生成的自增值会被写回参数对象的 id 字段。
+        没有它的话，insert 之后 member.getId() 还是 null，
+        注册完就签不出带正确 id 的 token。
+
+      ★ 注意这里【没有插入 status】。
+        表定义里 status 有 DEFAULT 1，让它走数据库默认值，
+        而不是在 Java 里硬编码一个 1 ——
+        万一以后要改「新用户默认禁用，需审核」，只改表结构就够了。
+
+      ★ 也【没有插入 create_time / update_time】。
+        它们由表定义的 DEFAULT CURRENT_TIMESTAMP 维护。
+        应用层不碰时间字段，就不用担心「服务器和应用时区不一致」这类问题。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO member (username, password, nickname, phone)
+        VALUES (#{username}, #{password}, #{nickname}, #{phone})
+    </insert>
+
+</mapper>

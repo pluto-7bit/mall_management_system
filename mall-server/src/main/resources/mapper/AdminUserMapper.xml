@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.AdminUserMapper">
+
+    <!--
+      ★ 登录查询：这是本项目唯一一个 SELECT 里带 password 的地方。
+        登录校验必须要拿到密码哈希才能和用户输入的比对，没别的办法。
+
+        注意它是按 username 精确匹配，不是 LIKE。
+        登录查询永远要用精确匹配 —— 用 LIKE 的话，
+        输入 "adm" 就能匹配到 "admin"，等于把账号也变成了可枚举的。
+    -->
+    <select id="selectByUsername" resultType="AdminUser">
+        SELECT id, username, password, nickname, status, create_time, update_time
+        FROM admin_user
+        WHERE username = #{username}
+        LIMIT 1
+    </select>
+
+    <!--
+      按 id 查，刻意<b>不返回 password</b>。
+
+      这不是笔误，是「最小权限」原则在数据层的体现：
+      这个方法的使用场景是「登录后恢复用户信息」，
+      它根本不需要密码字段。既然不需要，就别从数据库读出来 ——
+      少读一次，将来某个地方不小心把它返回给前端的机会就少一次。
+
+      养成这个习惯的成本是零，收益是消灭了一整类事故。
+    -->
+    <select id="selectById" resultType="AdminUser">
+        SELECT id, username, nickname, status, create_time, update_time
+        FROM admin_user
+        WHERE id = #{id}
+    </select>
+
+</mapper>

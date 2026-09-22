@@ -1,0 +1,237 @@
+server:
+  port: 8080
+
+  # ----------------------------------------------------------------------
+  # Tomcat 自己的请求体上限（里程碑 11：图片上传）
+  #
+  # ★ max-swallow-size 是什么，以及为什么非配不可：
+  #   请求体超限被拒时（下面 spring.servlet.multipart 那两条规则），
+  #   Tomcat 不能直接把连接扔了 —— HTTP/1.1 的连接是要复用的，
+  #   它必须把【剩下没读完的】请求体先读掉（swallow，吞掉），
+  #   然后才能回一个响应、让这条连接继续用。
+  #
+  #   而 swallow 本身有一个上限，默认就是 2MB。
+  #   超过它，Tomcat 就放弃治疗，【直接中断连接】。
+  #
+  # ⚠️⚠️ 后果一点都不直观：客户端收到的不是一句 JSON 错误，
+  #    而是一个空响应（浏览器里是 net::ERR_CONNECTION_RESET，
+  #    axios 里是 Network Error）。前端的统一错误处理会弹
+  #    「网络异常，请稍后重试」—— 一个「图太大」的提示，
+  #    变成了一句和它毫无关系的网络故障提示。
+  #
+  #   所以这里给到 10MB：比 max-request-size（5MB）大一倍，
+  #   保证「请求被拒」时请求体一定吞得下，错误才能干干净净地
+  #   走 GlobalExceptionHandler 返回给前端，而不是变成连接重置。
+  # ----------------------------------------------------------------------
+  tomcat:
+    max-swallow-size: 10MB
+
+spring:
+  application:
+    name: mall-server
+
+  # ----------------------------------------------------------------------
+  # 数据源配置
+  # URL 里几个参数的用途：
+  #   useUnicode + characterEncoding=utf8  防止中文乱码
+  #   serverTimezone=Asia/Shanghai         时区，不配可能差 8 小时
+  #   useSSL=false                         本地开发不加密
+  #   allowPublicKeyRetrieval=true         MySQL 8 默认用 caching_sha2_password
+  #                                        认证插件，不加这个会报
+  #                                        "Public Key Retrieval is not allowed"
+  # ----------------------------------------------------------------------
+  # ----------------------------------------------------------------------
+  # 文件上传（里程碑 11：商品图片）
+  #
+  # ★ 这两条【必须显式配】。Spring Boot 的默认值是单文件 1MB / 单请求 10MB，
+  #   而 1MB 对一张手机拍的图或一张普通截图（经常 2~5MB）来说太小了。
+  #   本文件在此之前【没有任何】spring.servlet.multipart.* 配置，
+  #   所以走的就是那个 1MB —— 不改的话第一次传真图就会失败，
+  #   而失败原因藏在框架里，不翻文档看不出来。
+  #
+  #   项目一贯的做法是「默认值能跑通就不写」（见上面 Redis 那段）。
+  #   这里写，正是因为默认值跑不通。
+  #
+  # ★ 为什么 max-request-size（5MB）故意大于 max-file-size（2MB）的两倍？
+  #   为了让「单文件超限」和「整个请求超限」是两条路：
+  #     · 超单文件限 → Spring 干净地抛 MaxUploadSizeExceededException，
+  #                    GlobalExceptionHandler 有一条专门的处理器接住它，
+  #                    前端拿到「图片太大了，最大 2MB」。这是想让它走的路。
+  #     · 超整个请求限 → Tomcat 可能在读流阶段就把连接断了，
+  #                      客户端拿到的是连接被重置而不是一个响应。
+  #   这两个值贴得太近的话，测试想验「超大小」时会莫名其妙地
+  #   测到第二条路上去。留出余量，测到的才是想测的那条。
+  # ----------------------------------------------------------------------
+  servlet:
+    multipart:
+      max-file-size: 2MB
+      max-request-size: 5MB
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/mall?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: 123456
+
+  # ----------------------------------------------------------------------
+  # Redis 配置（里程碑 7 开始用）
+  #
+  # Redis 跑在 Docker 里（容器名 mall-redis），把 6379 映射到了宿主机。
+  # 所以这里写 localhost 就能连上 —— 宿主机上的 Java 进程和
+  # 容器里的 Redis 之间是通过「端口映射」通信的，不是通过容器网络。
+  #
+  # ★ 这里【不需要】配 spring.data.redis.host 和 port 吗？
+  #   需要，但它们的默认值恰好就是 localhost:6379。
+  #   默认值能跑通的时候就别写 —— 写了的坏处是
+  #   「看到这一行的人会以为它是特意配的，其实只是默认值」，
+  #   将来环境变了还得记得改。这里只写默认值给不了的东西。
+  # ----------------------------------------------------------------------
+  data:
+    redis:
+      # 连接超时。不配的话默认可能等很久，
+      # 开发时 Redis 没启动会卡住好几秒才报错，很难判断是哪里出了问题
+      connect-timeout: 3s
+      timeout: 3s
+      lettuce:
+        pool:
+          # 连接池配置。这几个数字的来源：
+          #   max-active 8   够用了。每个操作都是毫秒级的，
+          #                  真正会并发等待的场景在学习项目里不会出现
+          #   max-idle 8     和 max-active 一样，避免连接被频繁创建销毁
+          #   min-idle 2     保持 2 个空闲连接，让第一个请求不用等建连
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+          max-wait: 3s
+
+  jackson:
+    # ⚠️ 注意：下面这个 date-format 只对 java.util.Date / Calendar 生效，
+    #    对我们实际使用的 LocalDateTime 【完全无效】！
+    #    LocalDateTime 属于 java.time 包，由 Jackson 的 JSR-310 模块单独处理，
+    #    必须在 JacksonConfig 里显式注册序列化器才能改格式。
+    #    这里保留它只是为了万一以后有老代码用到 java.util.Date。
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    # 值为 null 的字段直接从 JSON 里去掉，避免返回一堆 null
+    # （比如商品的 cover 没上传时，前端拿到的 JSON 里就没有这个 key）
+    default-property-inclusion: non_null
+
+# ----------------------------------------------------------------------
+# MyBatis 配置
+# ----------------------------------------------------------------------
+mybatis:
+  # XML 映射文件的位置
+  mapper-locations: classpath:mapper/*.xml
+  # 类型别名的包。配了之后 XML 里的 resultType 可以只写简单类名
+  # （写 Product 而不是 com.example.mall.entity.Product）。
+  # 多个包用逗号分隔
+  type-aliases-package: com.example.mall.entity,com.example.mall.vo
+  configuration:
+    # ★ 关键配置：把数据库的 snake_case 列名自动映射到 Java 的 camelCase 字段
+    #   比如 create_time 列 -> createTime 字段。
+    #   不开这个，每个字段都得在 XML 里手写 resultMap，非常啰嗦
+    map-underscore-to-camel-case: true
+    # 把执行的 SQL 打到控制台，学习阶段强烈建议开着，能直观看到生成了什么 SQL
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# ----------------------------------------------------------------------
+# JWT 配置
+#
+# 用 ${环境变量:默认值} 的写法：
+#   - 本地开发：环境变量 MALL_JWT_SECRET 没设，就用冒号后面的默认值
+#   - 生产环境：设了环境变量就用环境变量的值
+#
+# ★ 为什么密钥绝对不能硬编码在代码里、也不该提交到 Git？
+#   因为 JWT 的安全性完全建立在「只有服务端知道密钥」这一点上。
+#   任何人拿到密钥，就能自己签发一个「我是管理员」的 token，
+#   所有校验都会通过 —— 这等于把系统的大门钥匙贴在公告栏上。
+#
+#   默认值写成一句提醒文字（change-me-in-production），
+#   就是为了让人一眼看出「这里必须改」，而不是抄了个看着很像密钥的字符串
+#   就以为没问题了。
+# ----------------------------------------------------------------------
+mall:
+  jwt:
+    # HMAC 签名要求密钥足够长。太短 jjwt 会直接抛异常，
+    # 这是个好设计 —— 与其让你用一个不安全的密钥，不如启动就失败。
+    #
+    # ⚠️ 实际用的是哪个算法？不是这里写死的，而是 jjwt 根据密钥长度【自己选】的：
+    #    ≥64 字节 → HS512   ≥48 字节 → HS384   ≥32 字节 → HS256
+    #    下面这个密钥是 78 字节，所以签出来的是 HS512
+    #    （实测：解出 token 头部是 {"alg":"HS512"}）。
+    #
+    # 顺带一提，验签时 jjwt 是照着 token 自己声明的 alg 走的，
+    # 所以 HS256 签的 token 也能通过。这不是漏洞 ——
+    # HS256/384/512 都需要同一个密钥才能签出来，换个算法绕不过签名。
+    # 详见 sql/test-auth.py 里那几个伪造 token 的用例。
+    secret: ${MALL_JWT_SECRET:mall-learning-project-dev-secret-key-change-me-in-production-0123456789abcdef}
+    # token 有效期（分钟）。2 小时对学习项目够用
+    expire-minutes: 120
+
+  # ----------------------------------------------------------------------
+  # 订单相关（里程碑 9：模拟支付 + 超时自动取消）
+  #
+  # ★ 为什么这三个值做成配置而不是写成 Java 常量？
+  #   因为它们是【业务参数】，不是技术参数 —— 真实项目里运营会改它们。
+  #   而且超时时长同时被三个地方用到（支付校验、超时扫描、给前端的
+  #   payDeadline），做成配置才只有一处定义。
+  #
+  #   硬编码 30 在 Service 里的另一个代价是【测试没法推理它】：
+  #   test-pay.py 里要构造一个"已超时"的订单，只能靠改数据库里的
+  #   create_time，而"改早多少"取决于这个值。写在配置里，测试
+  #   才能知道自己该往前拨几分钟。
+  # ----------------------------------------------------------------------
+  order:
+    # 待付款订单超过这么多分钟，就自动取消并归还库存
+    pay-timeout-minutes: 30
+
+    # 超时扫描的间隔（毫秒）。★★ 这个值故意设成 10 秒，不是几分钟。
+    #
+    #   理由：它同时决定了「测试要等多久」。
+    #   test-pay.py 里验证超时自动取消的做法是：
+    #     用 SQL 把某笔订单的 create_time 改早 31 分钟
+    #     → 然后轮询等下一轮扫描把它捡走
+    #   10 秒让这个用例能在 20 秒内跑完；设成 5 分钟的话，
+    #   整个测试套件要多等五分钟，没人会愿意跑它。
+    #
+    #   代价是「没事的时候每 10 秒查一次库」。这个代价是可以接受的，
+    #   因为那条查询走索引、订单量小、而且【没事的时候它不打印任何日志】
+    #   （见 OrderTimeoutJob 的注释）。
+    #   ⚠️ 这是学习项目的取舍。真实系统里如果订单表很大，
+    #      会把这个间隔调大（几十秒到几分钟），
+    #      或者干脆换成"用延迟队列/消息中间件"的方案。
+    timeout-scan-interval-ms: 10000
+
+    # 一轮扫描最多处理多少单。
+    # ★ 它不是为了性能，是为了【自我保护】：
+    #   积压几十万单时，不限量的查询会把它们一次全拉进内存，
+    #   而且每 10 秒一次。有上限之后，积压会按
+    #   timeout-batch-limit / timeout-scan-interval-ms 的速度慢慢排掉。
+    timeout-batch-limit: 200
+
+  # ----------------------------------------------------------------------
+  # 上传文件存放（里程碑 11：商品图片）
+  #
+  # 用 ${环境变量:默认值} 的写法，和上面的 MALL_JWT_SECRET 一致。
+  #
+  # ⚠️ 相对路径是相对【进程的工作目录】的，不是相对 jar 包：
+  #    mvn spring-boot:run 的工作目录是 mall-server/，
+  #    所以默认落在 mall-server/uploads/。
+  #    从项目根目录启动的话会落在 java/uploads/ —— 另一个目录。
+  #
+  # ★★ 正因为相对路径的含义依赖「从哪儿启动」，FileStorageServiceImpl
+  #    在启动时会把解析后的【绝对路径】打进日志。否则这个坑的症状是
+  #    「上传成功、返回了 URL、但图片显示不出来」，而日志里什么都看不出来
+  #    （因为两边的目录都是空的，谁都没报错）。
+  #
+  # ⚠️⚠️ 绝对不能放在 src/main/resources/ 下面：
+  #    那里面的东西会被打进 jar，而且 mvn clean 会把它整个删掉 ——
+  #    用户上传的图片不该是构建产物的一部分。
+  # ----------------------------------------------------------------------
+  upload:
+    dir: ${MALL_UPLOAD_DIR:./uploads}
+
+# 日志级别
+logging:
+  level:
+    com.example.mall: debug

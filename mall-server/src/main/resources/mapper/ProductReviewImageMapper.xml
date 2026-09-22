@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.ProductReviewImageMapper">
+
+    <!--
+      批量插入，拼出 "多组 VALUES" 的形状：
+
+        INSERT INTO product_review_image (review_id, url) VALUES
+          (7, '/uploads/a.png'), (7, '/uploads/b.png')
+
+      ★ reviewId 单独传参，不从每个 image 对象里取 ——
+        理由见接口上的注释（消灭「第 3 个元素忘了赋值」这种可能）。
+
+      ★ 只有两列：晒图【没有 sort_no】（和 product_image 的对照，
+        理由见 ProductReviewImage 的类注释）。展示顺序 = 插入顺序，
+        读的时候 ORDER BY id 就够了。
+
+      ⚠️⚠️ 调用前必须判空！空集合会拼出没有 VALUES 的 INSERT ——
+         SQL 语法错误，不是「插入 0 行」。
+         这条约束没法在 XML 里表达，只能靠调用方守住
+         （ProductReviewServiceImpl.create 里的 isEmpty 判断是承重的）。
+    -->
+    <insert id="batchInsert">
+        INSERT INTO product_review_image (review_id, url)
+        VALUES
+        <foreach collection="images" item="img" separator=",">
+            (#{reviewId}, #{img.url})
+        </foreach>
+    </insert>
+
+    <!--
+      一次查多条评价的晒图（消掉 N+1）。
+
+      ★ ORDER BY review_id, id —— 两段都承重：
+        · 按 review_id 排，让【同一条评价的晒图一定相邻】，
+          调用方顺序扫一遍就能分组。
+        · 末尾的 id 让组内保持插入顺序（= 展示顺序）。
+          只按 review_id 排的话，组内顺序由数据库说了算，是不确定的 ——
+          那就是「同一批晒图两次打开顺序不一样」，用户会以为是 bug。
+        这和 OrderItemMapper.selectByOrderIds 的 ORDER BY order_id, id
+        是逐字同一个理由。
+
+      ★ 只查 review_id 和 url 两列。
+        两个调用点都是「按评价分组出一串 URL」，id / create_time 没有读者。
+        ⚠️ 这意味着返回的实体是【部分填充】的（另两个字段为 null），
+           调用方只能读这两个字段 —— 详见接口上的注释。
+
+      ⚠️⚠️ 调用方必须保证 reviewIds 非空：空的 IN () 是【SQL 语法错误】，
+        不是「返回 0 行」。<foreach> 会把空集合拼成一个光秃秃的 IN ()。
+        「这一页一条评价都没有」必须在 Java 里提前返回，别指望这里兜底。
+    -->
+    <select id="selectByReviewIds" resultType="ProductReviewImage">
+        SELECT review_id AS reviewId,
+               url
+        FROM product_review_image
+        WHERE review_id IN
+        <foreach collection="reviewIds" item="rid" open="(" close=")" separator=",">
+            #{rid}
+        </foreach>
+        ORDER BY review_id, id
+    </select>
+
+    <!--
+      删掉某条评价的全部晒图。
+      ⚠️ 影响 0 行【不是错误】—— 晒图是可选的，「这条评价没晒图」很正常。
+      所以返回值不参与任何判断。
+
+      ⚠️ 管理端删评价时必须【先】调它、【再】删评价行，顺序不能反：
+        全库没有外键，反了会留下孤儿行且没有任何东西会报错。
+    -->
+    <delete id="deleteByReviewId">
+        DELETE FROM product_review_image
+        WHERE review_id = #{reviewId}
+    </delete>
+
+    <!--
+      删掉某个商品下所有评价的晒图 —— 「删商品」四级级联的第一级。
+
+      ★ 子查询写法：删的是 product_review_image，选的是 product_review，
+        不是同表自引用，所以 MySQL 允许。
+        一条 SQL 干完，不用先把评价 id 查回 Java 再拼一个 IN ——
+        后者多一次往返，而且评价多的时候会拼出一个巨大的 IN。
+
+      ★ 这也正是 product_review.product_id 那个冗余列的收益之一：
+        不用绕 product_review → order_item → product 两跳。
+
+      ⚠️ 影响 0 行不是错误（这个商品可能没人评价过，或者评价都没晒图）。
+    -->
+    <delete id="deleteByProductId">
+        DELETE FROM product_review_image
+        WHERE review_id IN (
+            SELECT id FROM product_review WHERE product_id = #{productId}
+        )
+    </delete>
+
+</mapper>

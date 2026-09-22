@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.OrderAdminMapper">
+
+    <!--
+      ★ 列清单复用 OrderMapper 的 baseColumns（全限定 refid），不在这里重抄。
+
+      里程碑 10 给那份清单的每一列都加上了 `o.` 前缀，本文件正是原因之一 ——
+      下面那条查询要 LEFT JOIN member，而 orders 和 member 都有
+      id / status / create_time / update_time，
+      写成不带前缀的 SELECT id, status, ... 会直接报
+      "Column 'id' in field list is ambiguous"。
+
+      ★ 这就是「列清单只该有一份」这条规矩在 JOIN 面前的正确解法：
+        把【那一份】限定化，而不是复制出第二份。
+        （如果复制一份，里程碑 10 加的 ship_time / complete_time
+          就要记得改两处，而漏改的症状是字段从 JSON 里静默消失。）
+    -->
+
+    <!--
+      ★ 列表和总数共用这一份条件片段 —— 和 OrderMapper / ProductMapper 一致。
+
+      ★★ 会员筛选为什么写成【子查询】而不是 m.username LIKE？
+
+      因为 count 查询【不 join member 表】（下面的 countAdminQuery 里没有 join），
+      而本片段要被两者共用。如果这里写成 `m.username LIKE ...`，
+      count 就被迫也必须 join —— 而「count 能少 join 就少 join」
+      是本项目分页写法的既有约定（数数不需要别的表的列，
+      多一个 join 就多一次可能出错、可能变慢的机会）。
+
+      写成 `o.member_id IN (SELECT id FROM member WHERE ...)` 之后，
+      同一份片段可以【原样】用在「有 join 的列表查询」和「没 join 的 count 查询」里,
+      这才是「共用一份条件」真正兑现的地方。
+      ★ 否则条件一分叉，症状是「页面显示 12 条、分页器说总共 8 条」，
+        而且只在某些筛选组合下出现。
+
+      ⚠️ 注意 memberKeyword 对 username 和 nickname 是【或】的关系，
+        两个字段任一命中即可 —— 管理员记人的时候记的通常是昵称。
+
+      ⚠️ 这里【没有】member_id 条件，这是本文件的特别之处。
+        绝大多数查询都该带会员隔离，但这个不是 —— 理由见
+        OrderAdminMapper 接口的类注释（管理员就该看到所有人的订单）。
+    -->
+    <sql id="queryCondition">
+        <where>
+            <if test="status != null">
+                AND o.status = #{status}
+            </if>
+            <if test="orderNo != null">
+                AND o.order_no = #{orderNo}
+            </if>
+            <if test="memberKeyword != null">
+                AND o.member_id IN (
+                    SELECT id FROM member
+                    WHERE username LIKE CONCAT('%', #{memberKeyword}, '%')
+                       OR nickname LIKE CONCAT('%', #{memberKeyword}, '%')
+                )
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      分页查全部会员的订单。
+
+      ★ LEFT JOIN member m，【不是】INNER JOIN —— 这个选择是承重的：
+
+        如果是 INNER JOIN，那么「会员记录被硬删了」的订单会从列表里消失。
+        更糟的是它在 count 里【不会】消失（count 不 join），
+        于是症状是「总数说 10 条，翻到底只有 9 条」——
+        这种不一致极难查，因为报错的地方（列表）和产生分歧的地方（join）离得很远。
+
+        LEFT JOIN 之后，会员没了订单还在，memberUsername 是 null，页面显示空。
+        ★ 这也正是 AdminOrderVO.memberUsername 允许为 null 的原因。
+        （order_item 故意没有外键、订单快照不引用来源表，是同一个思路：
+          快照数据不该因为来源消失而消失。）
+
+      ★ ORDER BY o.create_time DESC, o.id DESC ——
+        末尾的 o.id 是正确性的一部分，不是装饰。create_time 只到秒，
+        同一秒创建的订单顺序不确定，而 LIMIT 分页在顺序不确定时
+        会出现「某些行重复出现、某些行从未出现」。
+        见 OrderMapper.xml 里 selectPageByMember 的同一段说明。
+
+      ★ 会员模糊搜索走 LIKE '%x%'，用不上 member 的 uk_username 索引，
+        是一次全表扫 —— 和项目里其余 LIKE 搜索一致，刻意接受。
+        数据量大了要换全文索引，但那是数据量的问题，不是写法的问题。
+
+      ⚠️ 这里【不查明细】。明细由 Service 用一次 selectByOrderIds 批量装上，
+        避免一页 10 条查 10 次的 N+1。
+    -->
+    <select id="selectAdminPage" resultType="AdminOrderVO">
+        SELECT <include refid="com.example.mall.mapper.OrderMapper.baseColumns"/>,
+               m.username AS memberUsername,
+               m.nickname AS memberNickname
+        FROM orders o
+        LEFT JOIN member m ON m.id = o.member_id
+        <include refid="queryCondition"/>
+        ORDER BY o.create_time DESC, o.id DESC
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!--
+      数全部会员有多少单。
+
+      ★ 和上面的列表共用 queryCondition —— 所以筛选条件永远一致，
+        包括那个会员子查询（它不依赖 join，这正是写成子查询的收益）。
+
+      ⚠️ 不 join、不排序、不 LIMIT：数数不需要这些。
+    -->
+    <select id="countAdminQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM orders o
+        <include refid="queryCondition"/>
+    </select>
+
+    <!--
+      按订单号查订单（不带会员条件），带会员字段。
+
+      ★ 它服务于 markShipped：条件更新返回 0 行时重查一次，
+        分辨「订单不存在」和「状态不允许发货」；
+        发货成功时也用它把更新后的订单返回给页面。
+        一次查询同时满足两个用途。
+
+      ⚠️ 为什么不拆成「先查 memberId，再用会员维度的查询查」？
+        那要多读一次数据库，而且两次查询之间订单可能已经被改了（TOCTOU）。
+        详见 OrderAdminMapper 接口里这个方法的注释。
+
+      ★ 同样用 LEFT JOIN（理由和上面那条一样：会员没了订单不该消失）。
+
+      ⚠️ 它【会】被返回给管理员（不是内部工具），
+        安全边界是 AdminAuthInterceptor，不是「结果不出系统」。
+    -->
+    <select id="selectAdminByOrderNo" resultType="AdminOrderVO">
+        SELECT <include refid="com.example.mall.mapper.OrderMapper.baseColumns"/>,
+               m.username AS memberUsername,
+               m.nickname AS memberNickname
+        FROM orders o
+        LEFT JOIN member m ON m.id = o.member_id
+        WHERE o.order_no = #{orderNo}
+    </select>
+
+    <!--
+      ★★★ 标记为已发货 —— 里程碑 10 的核心 SQL 之一。
+
+      两个条件：
+        order_no = #{orderNo}   →  改哪一行
+        status   = 1            →  ★ 并发闸门 + 状态机约束（只有「已付款」能发货）
+
+      ★ 注意这里【没有】member_id，这是全项目唯一一个不带会员隔离的【写】。
+        管理员发货就是在操作别人的订单，加 memberId 反而是语义错误。
+        安全边界由 AdminAuthInterceptor 对 /api/admin/** 的一刀切拦截提供。
+        详见 OrderAdminMapper 接口的类注释（那里有一张和
+        OrderTimeoutMapper 的对照表，说明两者的豁免理由完全不同）。
+
+      ★ status = 1 的含义：发货在状态图里只有「已付款 → 已发货」这一条边。
+        待付款的还没收到钱，发什么货？
+        这条约束写在 SQL 里，不靠前端隐藏按钮 ——
+        前端只是个界面，绕过它直接调接口是很容易的事。
+
+      ★ 同时它也是并发闸门：两个管理员同时点发货，只有一个拿到 affected = 1，
+        不会出现「发两次货、写了两次 ship_time」。
+
+      ★ 不碰库存：扣库存在下单那一刻就发生了（decreaseStock）。
+        发货只是「东西出库了」的状态变更，这里再动库存就是重复扣减。
+
+      ★ ship_time = NOW() 交给数据库的时钟，理由和 markPaid 一致：
+        多台应用服务器时钟不一致时，会出现「发货时间早于付款时间」这种诡异数据。
+    -->
+    <update id="markShipped">
+        UPDATE orders
+        SET status    = 2,
+            ship_time = NOW()
+        WHERE order_no = #{orderNo}
+          AND status = 1
+    </update>
+
+</mapper>

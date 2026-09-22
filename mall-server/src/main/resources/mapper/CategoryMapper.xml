@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.CategoryMapper">
+
+    <!--
+      列名 create_time 会自动映射到字段 createTime，
+      靠的是 application.yml 里的 map-underscore-to-camel-case: true。
+      没开这个配置的话，这里就得手写 <resultMap> 一个个列出来。
+    -->
+
+    <!--
+      把列清单抽出来复用。
+
+      这么做的好处不只是少打字：以后加字段（比如给分类加个图标 icon）
+      只需要改这一行，四个查询自动都有。
+      如果每个 <select> 都抄一遍列名，加字段时漏改一个，
+      那个接口就会莫名其妙地少返回一个字段，而且不报错 —— 这种 bug 最难查。
+    -->
+    <sql id="baseColumns">
+        id, name, sort, status, create_time, update_time
+    </sql>
+
+    <!--
+      管理页的查询条件。
+      列表查询和总数查询共用这一份，保证两者永远一致。
+    -->
+    <sql id="queryCondition">
+        <where>
+            <!--
+              <where> 标签的两个作用：
+                1. 如果内部所有 <if> 都不成立，它不会生成 WHERE 关键字
+                2. 会自动去掉开头多余的 AND/OR
+              没有它的话，就得写 WHERE 1=1 这种凑数条件，很丑
+            -->
+            <if test="name != null">
+                <!--
+                  CONCAT('%', #{name}, '%') 拼成 LIKE '%数码%' 的模糊匹配。
+                  注意 % 是写在 SQL 里的常量，不是拼进参数里的，
+                  所以这里用 #{} 完全安全（对比 ${} 的 SQL 注入风险）
+                -->
+                AND name LIKE CONCAT('%', #{name}, '%')
+            </if>
+            <if test="status != null">
+                AND status = #{status}
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      排序的分页查询。
+
+      ORDER BY sort ASC, id ASC 里的 id 是「保底排序」——
+      sort 相同的分类如果只按 sort 排，MySQL 返回的顺序是不确定的，
+      翻页时同一条数据可能在两页都出现、或者两页都不出现。
+      加上 id 让排序变得完全确定。这是个很容易被忽略的坑。
+    -->
+    <select id="selectPage" resultType="Category">
+        SELECT <include refid="baseColumns"/>
+        FROM category
+        <include refid="queryCondition"/>
+        ORDER BY sort ASC, id ASC
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!--
+      查总数。WHERE 条件用同一个 <include>，保证和列表查询永远一致。
+      分页参数（offset/pageSize）跟总数无关，所以这里当然不能带上 LIMIT。
+    -->
+    <select id="countByQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM category
+        <include refid="queryCondition"/>
+    </select>
+
+    <!-- 下拉框用：只查启用的 -->
+    <select id="selectEnabledList" resultType="Category">
+        SELECT <include refid="baseColumns"/>
+        FROM category
+        WHERE status = 1
+        ORDER BY sort ASC, id ASC
+    </select>
+
+    <select id="selectById" resultType="Category">
+        SELECT <include refid="baseColumns"/>
+        FROM category
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      按名称精确查，用于重复性校验。
+      用 = 而不是 LIKE：做重复校验必须是精确匹配，
+      否则「手机」和「手机壳」会被误判成重名。
+    -->
+    <select id="selectByName" resultType="Category">
+        SELECT <include refid="baseColumns"/>
+        FROM category
+        WHERE name = #{name}
+        LIMIT 1
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO category (name, sort, status)
+        VALUES (#{name}, #{sort}, #{status})
+    </insert>
+
+    <update id="updateById">
+        UPDATE category
+        <set>
+            <if test="name != null">name = #{name},</if>
+            <if test="sort != null">sort = #{sort},</if>
+            <if test="status != null">status = #{status},</if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <!--
+      物理删除。返回的 int 是影响行数，0 表示这个 id 不存在。
+
+      ★ 注意这里<b>没有</b>「先查分类下有没有商品」的判断 ——
+      那条判断在 Service 里。原因：
+        1. 它是业务规则（「分类下有商品就不许删」是人为定的规矩，不是技术约束）
+        2. 就算写在这里，也只是多一次查询，挡不住并发
+           （检查的瞬间没有商品，删的瞬间有商品插进来了）
+      真正能兜住并发的是数据库外键约束，但那属于另一个话题。
+      学习阶段把规则放在 Service 里，清晰易读，已经足够。
+    -->
+    <delete id="deleteById">
+        DELETE FROM category
+        WHERE id = #{id}
+    </delete>
+
+</mapper>

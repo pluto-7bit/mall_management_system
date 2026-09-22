@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.ProductReviewMapper">
+
+    <!--
+      ========================================================================
+      一、用户端（公开）
+      ========================================================================
+    -->
+
+    <!--
+      ★★ 列表和 count 共用这一段条件 —— 和 OrderMapper / OrderAdminMapper 一致。
+
+      现在它只有一个条件、看起来是「抽了也白抽」，但加第二个筛选条件的
+      那天就见分晓了：那时候如果列表和 count 各写一遍，
+      症状是「页面显示 5 条、分页器说总共 3 条」——
+      报错的地方（列表）和产生分歧的地方（count）离得很远，
+      而且只在某些筛选组合下出现。
+
+      ⚠️ 这里的条件里【没有】member_id，这是这个功能的设计而不是疏忽：
+        商品评价是给所有人看的公开内容。加会员隔离反而是语义错误
+        （那就变成「我只能看到自己的评价」了）。
+        安全上的考虑体现在【写】的那一侧（见 selectOrderItemForReview）。
+    -->
+    <sql id="productCondition">
+        WHERE r.product_id = #{productId}
+    </sql>
+
+    <!--
+      分页查某个商品的评价。
+
+      ★ LEFT JOIN member 只为了一件事：把 member.nickname 显示成评价者。
+
+      ⚠️⚠️ 注意 SELECT 的清单里【没有】m.username、【更没有】m.phone。
+        这是一个【任何人不用登录都能调】的接口，所以这里出现的每一列
+        都等于向全世界公开。详见 ReviewVO 的类注释 ——
+        那里面记着 MemberInfoVO.phone 早在里程碑 10 就留下的预言。
+
+      ★ LEFT JOIN 而不是 INNER JOIN：member.nickname 允许为空、
+        会员记录也可能被硬删。用 INNER 的话「昵称为空」的评价会
+        整条从列表里消失，而 count（不 join）仍然数着它 ——
+        又是那个「总数说 10 条、翻到底只有 9 条」。
+
+      ★ ORDER BY r.create_time DESC, r.id DESC ——
+        末尾的 r.id 是【正确性的一部分】，不是装饰。
+        create_time 只到秒，同一秒提交的多条评价顺序不确定，
+        而 LIMIT 分页在顺序不确定时会出现
+        「某些行重复出现、某些行从未出现」。
+        这条规矩和订单列表完全一样，别把它当成可选的优化。
+
+      ★ LIMIT 直接内联写 #{query.offset} / #{query.pageSize}，
+        不抽 <sql> 片段：本项目没有分页片段可复用 ——
+        管理端那边拿到的是裸的 DTO（写 #{offset}），
+        这边是 @Param("query") 包着的（要写 #{query.offset}），
+        传参形状本来就不同，抽了反而要写两份。
+
+      ⚠️ 它不查晒图，由 Service 批量装填（避免 N+1）。
+    -->
+    <select id="selectPageByProduct" resultType="ReviewVO">
+        SELECT r.id,
+               r.rating,
+               r.content,
+               r.create_time AS createTime,
+               m.nickname    AS memberNickname
+        FROM product_review r
+        LEFT JOIN member m ON m.id = r.member_id
+        <include refid="productCondition"/>
+        ORDER BY r.create_time DESC, r.id DESC
+        LIMIT #{query.offset}, #{query.pageSize}
+    </select>
+
+    <!--
+      数某个商品有多少条评价。
+
+      ★ 和上面的列表共用 productCondition，所以筛选条件永远一致。
+      ⚠️ 不 join、不排序、不 LIMIT：数数不需要这些。
+        这就是「条件写成 r.product_id 而不是 m.xxx」的收益 —— 它不依赖 join。
+    -->
+    <select id="countByProduct" resultType="long">
+        SELECT COUNT(*)
+        FROM product_review r
+        <include refid="productCondition"/>
+    </select>
+
+    <!--
+      ★★ 一个商品的评价聚合 —— 详情页顶上那块「4.7 分 / 共 128 条 / 星级分布」。
+
+      ★★★ 这里最要紧的一件事：它没有 GROUP BY，
+        所以【永远返回且只返回一行】—— 包括这个商品一条评价都没有的时候。
+        于是 Service 里不需要判空、返回类型也不是 List。
+        对照同一张表上的 selectPageByProduct：那条「查不到就是空列表」。
+        【形状是由 SQL 决定的，不是由习惯决定的。】
+
+      ★★ 为什么 AVG 和五个 SUM 全都包了 COALESCE？
+        因为在【零行】上，这几个函数返回 NULL，而 COUNT(*) 返回 0：
+          COUNT(*)  → 0      ← 这个语义本来就是 0，合理
+          AVG(...)  → NULL   ← 0 行时它没见过任何一个值，给不出 0
+          SUM(...)  → NULL   ← 同上，尽管「没有 5 星」看起来就应该是 0
+        不包的话，Jackson 的 non_null 会让这几个键【整个从 JSON 里消失】，
+        前端读到 undefined → 渲染出 `undefined 分`，而且不报任何错。
+        详见 ReviewSummaryVO 的类注释（那里有完整论证）。
+
+      ★ 这里【不做】ROUND：AVG 原样给到 4 位小数（4.6667）。
+        四舍五入到 1 位是【展示层】的事 —— 和「金额只用 .toFixed(2) 格式化」
+        是同一条规矩。在 SQL 里 ROUND 掉之后，前端就再也算不了别的了
+        （比如将来想同时显示 93% 好评率，那需要原始值）。
+        而前端要显示 4.7 时自己 toFixed(1) 只花一行代码 ——
+        提前丢掉的精度是【补不回来】的。
+
+      ★ count5..count1 这种命名是为了让前端能循环写 summary[`count${star}`]。
+        改成 fiveStarCount 之类，前端就得维护一张 5 分支的映射表，
+        而那张表在某天加第 6 档时会被漏改。
+    -->
+    <select id="selectSummary" resultType="ReviewSummaryVO">
+        SELECT COUNT(*)                                     AS total,
+               COALESCE(AVG(rating), 0)                     AS avgRating,
+               COALESCE(SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END), 0) AS count5,
+               COALESCE(SUM(CASE WHEN rating = 4 THEN 1 ELSE 0 END), 0) AS count4,
+               COALESCE(SUM(CASE WHEN rating = 3 THEN 1 ELSE 0 END), 0) AS count3,
+               COALESCE(SUM(CASE WHEN rating = 2 THEN 1 ELSE 0 END), 0) AS count2,
+               COALESCE(SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END), 0) AS count1
+        FROM product_review
+        WHERE product_id = #{productId}
+    </select>
+
+
+    <!--
+      ========================================================================
+      二、写评价（登录会员）
+      ========================================================================
+    -->
+
+    <!--
+      ★★★ 本轮的核心查询：查一条订单明细，判断它能不能被【这个会员】评价。
+
+      三个要点，每一个都是承重的：
+
+      1. ★★ o.member_id = #{memberId} 是 WHERE 的一部分，不是查出来再在 Java 里比。
+         它是【授权边界】：判错就等于「能评价别人的订单」。
+         放在 SQL 里意味着这个方法【不可能】返回一条「不属于你的明细」——
+         「查不到」和「不该放行」在这条路径上是同一件事。
+         （这和 OrderMapper 那条「会员 id 一律用独立 @Param、
+           绝不做成会被 Spring MVC 自动绑定的 DTO 字段」是同一个思路：
+           越权的判断要绑死在数据访问这一层。）
+         ⚠️ 所以千万别「优化」成先查出明细再看是不是自己的 ——
+            那会多出一个「查到了但不该给」的中间状态，而那种状态迟早会被漏判。
+
+      2. ★ JOIN orders（INNER）而不是 LEFT JOIN —— 和 OrderAdminMapper 正相反。
+         那里用 LEFT 是因为「会员被删了订单不该从列表里消失」（它是【展示】用的）；
+         这里要的是「订单不存在就别放行」（它是【授权】用的）。
+         同一个关键字，两个相反的选择，区别在「这一行是用来展示的还是授权的」。
+
+      3. ★ 一次同时查回 o.status —— 不拆成两次查询。
+         拆开的话，两次查询之间订单状态可能已经变了（TOCTOU），
+         于是「查的时候是已完成、插的时候其实已被取消」这个窗口就存在了。
+         一次查完，资格判断至少是基于同一个快照的。
+         （和 OrderAdminMapper.selectAdminByOrderNo 的注释同一个理由。）
+
+      ⚠️ 这里【不】带 status = 3 的条件，尽管只有已完成的订单能评价。
+        那是刻意的：把状态带回 Java 判，才能把
+        「这条明细不是你的」和「还没确认收货」分成两句不同的话。
+        塞进 SQL 的话两者都会变成「查不到」，而那个错误信息是不诚实的。
+        【「把条件尽量写进 SQL」这条规则只适用于并发闸门 ——
+          那里的错误信息可以很粗（正常路径根本撞不上）。
+          这里两条分支都是用户会正常走到的。】
+    -->
+    <select id="selectOrderItemForReview" resultType="ReviewEligibleVO">
+        SELECT oi.id           AS orderItemId,
+               oi.product_id   AS productId,
+               oi.product_name AS productName,
+               o.status        AS orderStatus
+        FROM order_item oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE oi.id = #{orderItemId}
+          AND o.member_id = #{memberId}
+    </select>
+
+    <!--
+      这条明细是不是已经评过了。
+
+      ★ 用 COUNT(*) > 0 让数据库直接给出布尔值 —— 而不是 COUNT(*) 交给
+        JDBC 的 getBoolean 去把 0/1 强转成 false/true。
+        两者今天都能用，但后者是「碰巧能用」。
+        （order_item_id 上有唯一索引，所以这条 COUNT 就是一次索引查找，
+          不存在「COUNT(*) 比 EXISTS 慢」的问题。）
+
+      ⚠️⚠️ 这个方法的返回值【不能当安全依据】。
+        它挡不住并发：两个请求可以同时查到「没评过」，然后一起去插，
+        一个成功、一个撞唯一索引。
+        真正的闸门是数据库上的 uk_order_item 唯一索引 ——
+        这个方法存在的意义只是让【正常路径】给出一句干净的、
+        不依赖异常的错误信息。见 ProductReviewServiceImpl.create。
+    -->
+    <select id="existsByOrderItemId" resultType="boolean">
+        SELECT COUNT(*) > 0
+        FROM product_review
+        WHERE order_item_id = #{orderItemId}
+    </select>
+
+    <!--
+      ★ useGeneratedKeys + keyProperty：把自增主键写回 review.id。
+
+      没有它，插完评价就拿不到评价 id，也就插不了晒图
+      （product_review_image.review_id 要靠它）。
+      项目的既有先例见 MemberMapper.insert / ProductMapper.insert。
+
+      ★ 只列需要的列：id / create_time 交给数据库
+        （create_time 的 DEFAULT CURRENT_TIMESTAMP 是【唯一】的时间来源，
+         理由和 orders 一样：多台应用服务器时钟不一致时，
+         「评价时间早于下单时间」这种数据一旦写进去就解释不清了）。
+
+      ⚠️⚠️ 这条 INSERT 会抛 DuplicateKeyException —— 当 order_item_id
+        已经存在时。调用方【必须】catch 它，理由见上面 exists 那段注释。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO product_review (order_item_id, product_id, member_id, rating, content)
+        VALUES (#{orderItemId}, #{productId}, #{memberId}, #{rating}, #{content})
+    </insert>
+
+
+    <!--
+      ========================================================================
+      三、管理端
+      ========================================================================
+    -->
+
+    <!--
+      ★ 列表和 count 共用这一段条件 —— 和 OrderAdminMapper.queryCondition 同构。
+
+      ★★ 两个筛选都写成【子查询】，不写成 p.name LIKE / m.nickname LIKE。
+        原因不是风格，是【承重】：count 查询不 join 任何表（下面那条），
+        而这段片段要被列表和 count 共用。
+        写成子查询之后，同一份片段可以【原样】用在
+        「join 了两张表的列表查询」和「一个 join 都没有的 count 查询」里。
+        否则条件一分叉，症状是「页面显示 12 条、分页器说总共 8 条」。
+
+      ⚠️ memberKeyword 对 username 和 nickname 是【或】的关系 ——
+        管理员记人的时候记的通常是昵称。
+
+      ⚠️ 这里【故意没有】member_id 条件，理由和 OrderAdminMapper 一样：
+        管理员看的就该是所有人的评价。安全边界是
+        AdminAuthInterceptor 对 /api/admin/** 的一刀切拦截，不是数据本身。
+        （但注意这个「豁免」的性质和 OrderAdminMapper 那个不同 ——
+          那边是「不该按会员隔离」，这边是「评价本来就是公开数据」。）
+    -->
+    <sql id="adminCondition">
+        <where>
+            <if test="productKeyword != null">
+                AND r.product_id IN (
+                    SELECT id FROM product
+                    WHERE name LIKE CONCAT('%', #{productKeyword}, '%')
+                )
+            </if>
+            <if test="memberKeyword != null">
+                AND r.member_id IN (
+                    SELECT id FROM member
+                    WHERE username LIKE CONCAT('%', #{memberKeyword}, '%')
+                       OR nickname LIKE CONCAT('%', #{memberKeyword}, '%')
+                )
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      分页查全部会员的评价。
+
+      ★ 两个 LEFT JOIN 都是刻意的，理由见接口上的注释：
+        商品或会员被硬删了，评价不该从管理端列表里消失。
+        （用 INNER 的话列表少行、count 不少行 → 「总数说 10 条、只有 9 条」。）
+
+      ★ 这里【可以】给 m.username —— 和用户端那条查询的对照是刻意的：
+        判据是「看这个接口的人是谁」。管理员在管理端的订单列表里
+        本来就看得到 username（AdminOrderVO.memberUsername），
+        所以给他不是新增一处泄露。
+        ⚠️ 但 m.phone 【两个端都不给】—— 这个列表没有任何需要手机号的地方。
+        「上一个接口给了所以这个也给」是最容易写出泄露的一种推理。
+
+      ★ ORDER BY r.create_time DESC, r.id DESC —— 同用户端那条，
+        末尾的 r.id 是正确性的一部分（同秒插入的多条要有稳定顺序，
+        否则 LIMIT 分页会有行重复出现或从未出现）。
+
+      ★ adminCondition 的位置在 LEFT JOIN 【之后】——
+        正因为条件是子查询而不是 join 条件，它才能放在这里，
+        也才能被下面那个不 join 的 count 原样复用。
+
+      ⚠️ 不查晒图，由 Service 批量装填。
+    -->
+    <select id="selectAdminPage" resultType="AdminReviewVO">
+        SELECT r.id,
+               r.rating,
+               r.content,
+               r.create_time AS createTime,
+               r.product_id  AS productId,
+               p.name        AS productName,
+               m.username    AS memberUsername,
+               m.nickname    AS memberNickname
+        FROM product_review r
+        LEFT JOIN product p ON p.id = r.product_id
+        LEFT JOIN member  m ON m.id = r.member_id
+        <include refid="adminCondition"/>
+        ORDER BY r.create_time DESC, r.id DESC
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!--
+      数一共有多少条评价。
+
+      ★ 和上面的列表共用 adminCondition —— 所以筛选条件永远一致，
+        包括那两个子查询（它们不依赖 join，这正是写成子查询的收益）。
+      ⚠️ 不 join、不排序、不 LIMIT。
+    -->
+    <select id="countAdminQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM product_review r
+        <include refid="adminCondition"/>
+    </select>
+
+
+    <!--
+      ========================================================================
+      四、删除
+      ========================================================================
+    -->
+
+    <!--
+      按 id 删一条评价（管理端删除）。
+
+      ⚠️⚠️ 调用方必须先删晒图行，再调这个方法 —— 全库没有外键，
+        顺序反了会留下 product_review_image.review_id 指向不存在评价的
+        孤儿行，而且【没有任何东西会报错】。
+
+      ⚠️ 这是物理删除，它有一个必须写进注释和测试的后果：
+        删掉之后 order_item_id 上唯一索引的槽位【就空出来了】，
+        那个会员可以【重新评价】这条明细。
+        语义上合理（被删掉的违规评价不该永久剥夺重写的权利），
+        但它是「删除」这个动作的真实后果，不是附带小事。
+    -->
+    <delete id="deleteById">
+        DELETE FROM product_review
+        WHERE id = #{id}
+    </delete>
+
+    <!--
+      删掉某个商品的全部评价 —— 「删商品」四级级联里的第二级。
+
+      ★ 靠 product_id 这一列直接删，而不是
+        `WHERE order_item_id IN (SELECT id FROM order_item WHERE product_id = ...)`。
+        这正是当初把 product_id 冗余存一份的收益之一：
+        删商品时不需要绕 order_item 一圈。
+        （冗余的正当性见 sql/migration-12-review.sql：源头不可变 → 冗余没有代价。）
+
+      ⚠️ 影响 0 行不是错误 ——「这个商品本来就没人评价过」是常态。
+    -->
+    <delete id="deleteByProductId">
+        DELETE FROM product_review
+        WHERE product_id = #{productId}
+    </delete>
+
+</mapper>

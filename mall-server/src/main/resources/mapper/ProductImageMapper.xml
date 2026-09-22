@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.ProductImageMapper">
+
+    <!--
+      ★ ORDER BY sort_no, id —— 结尾那个 id 是【承重】的，不是凑数。
+
+        sort_no 允许重复（建表默认值就是 0，将来批量导入的数据也会全是 0），
+        而 SQL 标准里【排序键相同的行，返回顺序是不保证的】。
+        不加决胜列的后果是：同一份数据、同一条 SQL，两次查出来顺序可能不一样。
+
+        数据量小的时候这种不确定性基本看不出来（优化器多半会走主键顺序），
+        所以它是一类「平时没事、某天突然乱序」的 bug —— 最难查的那种。
+
+        本项目的同一条规矩见 OrderItemMapper.selectByOrderId 的 ORDER BY id
+        和订单列表的 ORDER BY create_time DESC, id DESC。
+
+      ★ 这里用 resultType 而不是 resultMap：
+        列名 → 字段名的对应关系（product_id → productId）由
+        application.yml 里的 map-underscore-to-camel-case 自动处理。
+        只有【列名和字段名对不上】时才需要手写 AS 别名 ——
+        而 product_id / sort_no / create_time 全都能自动映射成
+        productId / sortNo / createTime，所以一条别名都不用写。
+        （对比 ProductMapper.xml 里那几条要 AS categoryName 的，
+          那个列在表里根本不存在，是 LEFT JOIN 出来的。）
+    -->
+    <select id="selectByProductId" resultType="ProductImage">
+        SELECT id, product_id, url, sort_no, create_time
+        FROM product_image
+        WHERE product_id = #{productId}
+        ORDER BY sort_no, id
+    </select>
+
+    <!--
+      同一张表、同一批行的另一种读法：只要 URL 那一列。
+
+      ★ 为什么单独写一条，而不是查出实体再在 Java 里 map 一下？
+        因为「查出来再截取」会白白传输 id / sort_no / create_time 三列，
+        而且更要紧的是：调用方拿到了实体，就【有能力】去做别的事
+        （比如拿 sort_no 去排序、拿 id 去删除）——
+        而商品详情页不该有这些能力。
+        少给一点，就少一个将来被误用的机会。
+
+      ⚠️ 两条 SQL 的 WHERE 和 ORDER BY 【必须保持一致】。
+        它们语义上是「同一批行的不同投影」，一旦有一个改了条件
+        而另一个没改，就会出现「详情页有 3 张图、管理端说 5 张」这种
+        自相矛盾的状态。改一条的时候记得看一眼另一条。
+    -->
+    <select id="selectUrlsByProductId" resultType="java.lang.String">
+        SELECT url
+        FROM product_image
+        WHERE product_id = #{productId}
+        ORDER BY sort_no, id
+    </select>
+
+    <!--
+      删掉某个商品的全部图集。
+      ⚠️ 影响 0 行【不是错误】—— 「这个商品本来就没图」是正常情况。
+      所以这个方法的返回值不参与任何判断，理由见接口上的注释。
+    -->
+    <delete id="deleteByProductId">
+        DELETE FROM product_image
+        WHERE product_id = #{productId}
+    </delete>
+
+    <!--
+      批量插入，拼出 "多组 VALUES" 的形状：
+
+        INSERT INTO product_image (product_id, url, sort_no) VALUES
+          (1, '/uploads/a.png', 0), (1, '/uploads/b.png', 1)
+
+      ★ productId 单独传参，不从每个 image 对象里取。
+        因为调用方（ProductServiceImpl）需要保证「这一批图都属于同一个商品」，
+        而让 id 从参数来、而不是从每个元素来，就消灭了
+        「第 3 个元素的 productId 忘了赋值」这种可能 ——
+        那样会插出一行 product_id = NULL，而这张表的这一列是 NOT NULL，
+        报的会是一条和真实原因相距很远的 SQL 错误。
+
+      ★ sort_no 由调用方按【数组下标】填好（见 ProductServiceImpl.buildImageRows）。
+        这个「下标就是顺序」的约定是整个图集排序功能的基础。
+
+      ⚠️⚠️ 调用前必须判空！空集合会拼出没有 VALUES 的 INSERT —— SQL 语法错误。
+         见接口上的注释（里程碑 10 的 attachItems 已经踩过同一个坑）。
+         这条约束没法在 XML 里表达，只能靠调用方守住。
+    -->
+    <insert id="batchInsert">
+        INSERT INTO product_image (product_id, url, sort_no)
+        VALUES
+        <foreach collection="images" item="img" separator=",">
+            (#{productId}, #{img.url}, #{img.sortNo})
+        </foreach>
+    </insert>
+
+</mapper>

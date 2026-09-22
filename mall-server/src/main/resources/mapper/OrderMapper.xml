@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.OrderMapper">
+
+    <!--
+      ★ 这个 <sql> 片段被【三处】复用（另外两处都用全限定的 refid 引它）：
+          OrderMapper.selectByMemberAndKey / selectByOrderNoAndMember
+          OrderTimeoutMapper.selectTimeoutCandidates
+          OrderAdminMapper.selectAdminPage          ← 里程碑 10 新增
+        三个文件查的是同一张表，列清单只该有一份 ——
+        否则哪天加了一列，改了这边忘了那边，症状是
+        「有的查询能拿到这个字段、有的拿不到」，非常难查。
+        （里程碑 10 加的 ship_time / complete_time 就是靠这一份清单
+          一次性对所有查询生效的。）
+
+      ★★ 为什么每一列都带 `o.` 前缀？—— 因为不带的话这个片段在 JOIN 里根本用不了。
+        OrderAdminMapper.selectAdminPage 要 LEFT JOIN member 才能拿到会员名，
+        而 orders 和 member 都有 id / status / create_time / update_time，
+        写成 `SELECT id, status, ...` 会直接报
+        "Column 'id' in field list is ambiguous"。
+
+        那为什么不是「让管理端自己再抄一份带别名的列清单」？
+        因为那正好是这段注释开头警告的事 —— 列清单一旦有了第二份，
+        加字段漏改就成了必然，只是时间问题。
+        ★ 所以修法是把【这一份】限定化，而不是复制第二份。
+          （对比 ProductMapper.selectPage：它自己写了一份带别名的列清单，
+            因为商品那条查询从一开始就带 JOIN，没有「一份」的历史包袱。）
+
+      ★ 这是纯限定、零行为变化：MySQL 对 `o.id` 这种「有表别名但没写列别名」
+        的引用，返回的列标签仍然是 `id`，MyBatis 的下划线转驼峰照常工作。
+        使用它的 FROM 子句必须写成 `FROM orders o`（三个使用者都已改）。
+    -->
+    <sql id="baseColumns">
+        o.id, o.order_no, o.member_id,
+        o.receiver_name, o.receiver_phone, o.receiver_address, o.address_id,
+        o.total_amount, o.status, o.pay_time, o.cancel_time, o.pay_method,
+        o.ship_time, o.complete_time,
+        o.idempotency_key, o.remark,
+        o.create_time, o.update_time
+    </sql>
+
+    <!--
+      useGeneratedKeys + keyProperty：把数据库生成的自增 id 回填到
+      入参对象的 id 字段上。
+
+      ★ 这一步在订单这里【必须】成功，不能是可选的：
+        写完订单主表之后，紧接着要用这个 id 去写明细表的 order_id。
+        如果没有回填，order.getId() 是 null，
+        明细就会带着 order_id = null 插进去 —— 而 order_id 是 NOT NULL，
+        会直接报错。（报错还是好的，如果哪天放宽成可空，
+        就会出现一批"不属于任何订单"的孤儿明细。）
+
+      注意列清单里【没有 create_time / update_time】——
+      它们交给数据库的 DEFAULT CURRENT_TIMESTAMP 处理。
+      理由：下单时间应该由【数据库】的时钟说了算。
+      如果用应用服务器的时钟，多台机器时钟不一致时，
+      订单的先后顺序会出现"后下的单时间更早"这种诡异现象。
+-->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO orders (order_no, member_id,
+                            receiver_name, receiver_phone, receiver_address, address_id,
+                            total_amount, status, idempotency_key, remark)
+        VALUES (#{orderNo}, #{memberId},
+                #{receiverName}, #{receiverPhone}, #{receiverAddress}, #{addressId},
+                #{totalAmount}, #{status}, #{idempotencyKey}, #{remark})
+    </insert>
+
+    <!--
+      ★★ WHERE 里的 member_id 条件是【安全边界】，不是过滤条件。
+
+      少了它，这个"查重"的查询就变成了"按幂等键读任意订单"——
+      而 orders 表里装着所有人的姓名、电话、住址。
+      详见 OrderMapper 接口的类注释。
+
+      ★ 这里不能用 <if test="memberId != null"> 包起来。
+        包起来之后万一传了 null，SQL 就退化成"查所有会员里
+        用这个键的订单"—— 一个不该存在的查询路径被静默打开了。
+        （同 MemberAddressMapper 的 selectByMemberId。）
+
+      查不到时返回 null，这是【正常情况】：说明这个幂等键
+      是这个会员第一次用，该继续走下单流程。
+    -->
+    <select id="selectByMemberAndKey" resultType="Order">
+        SELECT <include refid="baseColumns"/>
+        FROM orders o
+        WHERE o.member_id = #{memberId}
+          AND o.idempotency_key = #{idempotencyKey}
+    </select>
+
+    <!--
+      按「会员 + 订单号」查订单。
+
+      和上面那条同一个形状：member_id 是【安全边界】。
+      少了它，「查看订单详情」就变成了「按订单号读任意订单」——
+      而订单里装着所有人的姓名、电话、住址。
+
+      订单不存在 和 订单不属于当前会员 都返回 null（查不到）。
+      这是刻意的：调用方对这两种情况返回同一个错误码，
+      区分开来等于确认了「这个订单号是存在的」。
+    -->
+    <select id="selectByOrderNoAndMember" resultType="Order">
+        SELECT <include refid="baseColumns"/>
+        FROM orders o
+        WHERE o.order_no = #{orderNo}
+          AND o.member_id = #{memberId}
+    </select>
+
+    <!--
+      ★★★ 标记为已付款 —— 里程碑 9 的核心 SQL 之一。
+
+      WHERE 里的四个条件，每一个都在挡一件事：
+
+        order_no  = #{orderNo}          →  改哪一行
+        member_id = #{memberId}         →  安全边界：只能改自己的订单
+        status    = 0                   →  ★ 并发闸门 + 状态机约束
+        create_time > #{deadline}       →  ★ 超时规则（过期了不许付）
+
+      为什么 status = 0 这一条如此重要：
+        InnoDB 执行 UPDATE 时给这一行加排他锁，「检查 status = 0」
+        和「把 status 改成 1」在同一次加锁中完成，中间没有缝隙。
+        所以两个人同时点支付，只有一个能拿到 affected = 1。
+        调用方【不需要】先查一次状态再判断 —— 那样反而会引入竞态。
+
+      为什么 create_time > #{deadline} 放在 SQL 里而不是只在定时任务里判断：
+        这条规则的含义是「超过 N 分钟不能付款」。如果只在定时任务里判断，
+        那么在「订单已过期」到「扫描跑到」之间的那段空窗期里，
+        用户是可以付款成功的 —— 那是一个真实存在的漏洞窗口。
+        规则在 SQL 里说一次就够了，定时任务只负责过后把库存还回去。
+
+        deadline 由调用方算好传进来（此刻 − 支付时限），
+        因为时限是可配置的，SQL 里读不到 Spring 的配置。
+        让 SQL 只做一个纯粹的时刻比较，不需要知道「30 分钟」这个数。
+
+      ★ 这里写 NOW() 而不是从 Java 传一个时间进来：
+        支付时间应该由【数据库】的时钟说了算，理由和 insert 里
+        不写 create_time 是同一个 —— 多台应用服务器时钟不一致时，
+        会出现「支付时间早于下单时间」这种诡异数据。
+
+      ⚠️ 没有做成幂等（第二次支付返回 0 行而不是静默成功），
+        这是刻意的：见 OrderServiceImpl.pay 的注释。
+    -->
+    <update id="markPaid">
+        UPDATE orders
+        SET status     = 1,
+            pay_time   = NOW(),
+            pay_method = #{payMethod}
+        WHERE order_no = #{orderNo}
+          AND member_id = #{memberId}
+          AND status = 0
+          AND create_time &gt; #{deadline}
+    </update>
+
+    <!--
+      ★★★ 标记为已取消 —— 里程碑 9 的核心 SQL 之二。
+
+      三个条件：
+        order_no  = #{orderNo}   →  改哪一行
+        member_id = #{memberId}  →  安全边界
+        status    = 0            →  ★ 并发闸门
+
+      ⚠️ 这里【没有】超时条件，和 markPaid 不一样，别搞对称：
+        过期恰恰是取消的【理由】，不是取消的障碍。
+        用户主动取消自己的待付款订单，无论下了多久都应该允许。
+
+      ★★ 调用方必须先调这个方法、拿到 affected = 1，才有资格去归还库存。
+         顺序绝对不能反 —— 如果先归还库存再改状态，两个并发的取消请求
+         会【都】把库存还一遍（两边在还的时候状态都还是「待付款」），
+         库存凭空翻倍。必须让这条条件更新当闸门。
+         仓库里没有超卖，靠的就是这一条。
+
+      ★ cancel_time = NOW() 同理交给数据库的时钟。
+    -->
+    <update id="markCancelled">
+        UPDATE orders
+        SET status      = 4,
+            cancel_time = NOW()
+        WHERE order_no = #{orderNo}
+          AND member_id = #{memberId}
+          AND status = 0
+    </update>
+
+    <!-- ======================================================================
+         以下是里程碑 10 加的
+         ====================================================================== -->
+
+    <!--
+      ★ 列表和总数共用这一份条件片段 —— 这是本项目分页的固定写法
+        （ProductMapper.selectPage / countByQuery 也是这么分的）。
+
+      为什么必须共用：两份条件一旦分叉，症状是
+      「页面显示 12 条，分页器说总共 8 条」，而且只在某些筛选组合下出现。
+      共用之后，这种不一致在结构上就不可能发生。
+
+      ★ WHERE 里的 member_id 是【安全边界】，不是过滤条件 ——
+        和本文件其他查询同一条纪律（见 OrderMapper 接口的类注释）。
+        少了它，「我的订单」就变成了「所有人的订单」。
+
+      ⚠️ status 用 <if> 包住，所以「全部」这一档不能传 -1 之类的哨兵值，
+        而是【不传】这个参数（Java 侧用 null 表示「全部」）。
+        哨兵值的问题在于它是个魔法数字，而且会和真实状态值撞车。
+
+      ★★ 为什么 status 要写成 query.status，而 memberId 是裸的？
+        因为这两个条件的来源【根本不同】：
+          memberId  →  独立参数，来自 JWT，客户端说了不算
+          query.*   →  ShopOrderQueryDTO，Spring MVC 从查询串自动绑定
+        身份一旦做成 DTO 的字段，就会被自动绑定，
+        于是 ?memberId=999 就能查到别人的订单 —— 而且是静默生效的。
+        详见 OrderMapper.selectPageByMember 的注释。
+    -->
+    <sql id="queryCondition">
+        WHERE o.member_id = #{memberId}
+        <if test="query.status != null">
+            AND o.status = #{query.status}
+        </if>
+    </sql>
+
+    <!--
+      分页查当前会员的订单。
+
+      ★ ORDER BY o.create_time DESC, o.id DESC ——
+        末尾那个 o.id 不是装饰，是【正确性的一部分】：
+
+        create_time 只到秒。同一秒里创建的订单（测试脚本批量下单时经常发生），
+        谁在前谁在后是【不确定的】。而分页是 LIMIT offset, size ——
+        如果两次查询对「同一秒的这几行」给出了不同的顺序，
+        就会出现【某些行重复出现、某些行从来没出现过】。
+        o.id 是唯一的，加上它之后整个排序才是全序，翻页才稳定。
+
+      ★ 倒序（最新的订单在最前）是刻意的：用户打开「我的订单」
+        想看的一定是刚下的那一单，而不是三年前的。
+
+      ⚠️ 这里【不查明细】。明细由 Service 用一次 selectByOrderIds 批量装上，
+        避免一页 10 条查 10 次的 N+1。见 OrderItemMapper.selectByOrderIds。
+    -->
+    <select id="selectPageByMember" resultType="OrderVO">
+        SELECT <include refid="baseColumns"/>
+        FROM orders o
+        <include refid="queryCondition"/>
+        ORDER BY o.create_time DESC, o.id DESC
+        LIMIT #{query.offset}, #{query.pageSize}
+    </select>
+
+    <!--
+      数当前会员有多少单。
+
+      ★ 和上面的列表共用 queryCondition，所以两者的筛选条件永远一致。
+
+      ⚠️ 这里【不 join 任何表】—— 能少 join 就少 join。
+        count 只需要「有多少行」，不需要任何别的表的列，
+        多一个 join 就多一次可能出错、可能变慢的机会。
+
+      ★ 当然也没有 ORDER BY 和 LIMIT：数数不需要顺序。
+    -->
+    <select id="countByMember" resultType="long">
+        SELECT COUNT(*)
+        FROM orders o
+        <include refid="queryCondition"/>
+    </select>
+
+    <!--
+      ★★★ 标记为已完成（用户确认收货）—— 里程碑 10 的核心 SQL。
+
+      三个条件，和 markPaid / markCancelled 是同一个模式：
+        order_no  = #{orderNo}   →  改哪一行
+        member_id = #{memberId}  →  安全边界（只能确认自己的订单）
+        status    = 2            →  ★ 并发闸门 + 状态机约束
+
+      ★★ 这里【绝不能】归还库存，这是最容易被"顺手补上"的一处。
+
+        看到 markCancelled 的调用方要去还库存，很容易想给这里也对称地补一次。
+        那样做的后果是【超卖】：
+          取消   →  货还在仓里      → 还回去是对的
+          确认收货 → 货已经在买家手里 → 还回去 = 凭空多出一件可以卖的货
+
+        「已完成」表示这笔交易结束了，不是「这笔交易没发生」。
+
+      ★ status = 2 的含义：确认收货在状态图里只有「已发货 → 已完成」这一条边。
+        已付款的订单还没发货，确认什么？这条约束写在 SQL 里，
+        不靠前端按钮是否显示 —— 绕过前端直接调接口是很容易的事。
+
+      ★ complete_time = NOW() 交给数据库的时钟，理由和 markPaid 一致：
+        发货时间应该由数据库说了算，多台应用服务器时钟不一致时
+        会出现「完成时间早于发货时间」这种诡异数据。
+    -->
+    <update id="markCompleted">
+        UPDATE orders
+        SET status        = 3,
+            complete_time = NOW()
+        WHERE order_no = #{orderNo}
+          AND member_id = #{memberId}
+          AND status = 2
+    </update>
+
+</mapper>

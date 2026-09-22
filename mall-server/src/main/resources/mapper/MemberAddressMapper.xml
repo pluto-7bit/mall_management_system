@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.MemberAddressMapper">
+
+    <sql id="baseColumns">
+        id, member_id, receiver, phone, region, detail, is_default, create_time, update_time
+    </sql>
+
+    <!--
+      ★ 注意这个 SQL 里 WHERE 的两个条件都是【必须】的，没有 <if>。
+
+      这是刻意的：memberId 不是可选过滤条件，而是「这条数据属于谁」的定义。
+      用 <if test="memberId != null"> 包起来的话，万一传了 null，
+      SQL 就退化成「查所有会员的地址」—— 一个不该存在的查询路径
+      被静默地打开了。
+
+      **凡是「加了 <if> 反而会变成危险查询」的参数，就别加 <if>。**
+      <if> 适合「用户可选地筛一筛」，不适合「这是谁的数据」。
+    -->
+    <select id="selectByMemberId" resultType="MemberAddress">
+        SELECT <include refid="baseColumns"/>
+        FROM member_address
+        WHERE member_id = #{memberId}
+        ORDER BY is_default DESC, id DESC
+    </select>
+
+    <select id="selectByIdAndMember" resultType="MemberAddress">
+        SELECT <include refid="baseColumns"/>
+        FROM member_address
+        WHERE id = #{id}
+          AND member_id = #{memberId}
+    </select>
+
+    <!--
+      默认地址可能不存在（用户一个都没设，或者还没存过地址），
+      所以不能写 LIMIT 1 就完事 —— 得保证最多返回一条。
+      加了 is_default = 1 之后理论上最多一条，但
+      「理论上」和「一定」是两回事（见下面的 clearDefaultByMemberId 注释），
+      所以这里加 LIMIT 1 兜底：万一数据真的坏了，
+      查询也不会抛异常或者返回多行导致 MyBatis 报错。
+    -->
+    <select id="selectDefaultByMemberId" resultType="MemberAddress">
+        SELECT <include refid="baseColumns"/>
+        FROM member_address
+        WHERE member_id = #{memberId}
+          AND is_default = 1
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="countByMemberId" resultType="int">
+        SELECT COUNT(*)
+        FROM member_address
+        WHERE member_id = #{memberId}
+    </select>
+
+    <!--
+      useGeneratedKeys + keyProperty：把数据库生成的自增值回填到
+      入参对象的 id 字段上。没有它的话，插入完之后 address.getId() 还是 null，
+      后面要用这个 id 就没法用了。
+
+      列清单里【没有 member_id 的更新】—— 见 Mapper 接口
+      updateById 的注释：归属不允许改。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO member_address (member_id, receiver, phone, region, detail, is_default)
+        VALUES (#{memberId}, #{receiver}, #{phone}, #{region}, #{detail}, #{isDefault})
+    </insert>
+
+    <!--
+      <set> 标签的两个作用，和 <where> 对称：
+        1. 自动加 SET 关键字
+        2. 自动去掉最后一个多余的逗号
+      配合 <if> 就实现了「只更新传了值的字段」。
+    -->
+    <update id="updateById">
+        UPDATE member_address
+        <set>
+            <if test="receiver != null">receiver = #{receiver},</if>
+            <if test="phone != null">phone = #{phone},</if>
+            <if test="region != null">region = #{region},</if>
+            <if test="detail != null">detail = #{detail},</if>
+            <if test="isDefault != null">is_default = #{isDefault},</if>
+        </set>
+        WHERE id = #{id}
+          AND member_id = #{memberId}
+    </update>
+
+    <!--
+      ★ WHERE 里 two 个条件缺一不可：id 定位「删哪一行」，
+      member_id 保证「只能删自己的」。
+
+      少了 member_id 就是水平越权漏洞 —— 而且删除不可逆，
+      比查到别人的数据严重得多。
+    -->
+    <delete id="deleteByIdAndMember">
+        DELETE FROM member_address
+        WHERE id = #{id}
+          AND member_id = #{memberId}
+    </delete>
+
+    <!--
+      把该会员所有地址的 is_default 置 0。
+
+      这里【不带】 is_default = 1 的条件，是无条件全置 0。
+      带了条件反而会漏 —— 如果数据坏了（有两行都是 1），
+      带条件也只清掉… 其实也能清掉。但无条件写更简单，
+      而且意图更清楚：「这个人的地址全部先取消默认」。
+
+      MySQL 有个安全模式（sql_safe_updates）会拒绝没有 WHERE 的
+      UPDATE/DELETE。这里的 WHERE member_id = ? 是有的，不受影响 ——
+      但这也从侧面说明了「为什么 UPDATE 一定要有 WHERE」。
+    -->
+    <update id="clearDefaultByMemberId">
+        UPDATE member_address
+        SET is_default = 0
+        WHERE member_id = #{memberId}
+          AND is_default = 1
+    </update>
+
+    <!--
+      注意这里故意没有 selectById(id) —— 见 Mapper 接口的注释：
+      任何只按主键查地址的方法都是越权的入口。
+    -->
+
+</mapper>

@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.OrderItemMapper">
+
+    <!--
+      一条 INSERT 插多行，靠 <foreach> 把"多组 VALUES"拼出来：
+
+        INSERT INTO order_item (order_id, ...) VALUES
+          (1, ...), (1, ...), (1, ...)
+
+      <foreach> 的三个属性：
+        collection="items"  ← @Param("items") 指定的参数名
+        item="it"           ← 循环变量，下面 #{it.xxx} 取它的属性
+        separator=","       ← 每组之间用逗号连接
+
+      ★ 注意这里【没有】open/close。因为要拼的不是
+        "(1,2,3), (4,5,6)" 这样的一串括号，
+        而是逗号分隔的【多组完整括号】——
+        每组括号已经写在循环体里了，外面再加一层就错了。
+
+      ⚠️ 为什么用 #{} 而不是 ${}？
+        #{} 会编译成 JDBC 的 ? 占位符，值走参数通道，
+        天然防 SQL 注入；${} 是字符串直接拼进 SQL。
+        这里拼的是【值】（订单 id、商品名、价格），
+        所以必须 #{}(详见 ProductMapper.xml 里关于动态排序的讨论——
+        那里用 ${} 是因为要拼的是【列名】，值没法用占位符表达，
+        所以才必须配一层 Java 白名单)。
+    -->
+    <insert id="batchInsert">
+        INSERT INTO order_item (order_id, product_id, product_name, price, quantity, subtotal)
+        VALUES
+        <foreach collection="items" item="it" separator=",">
+            (#{it.orderId}, #{it.productId}, #{it.productName},
+             #{it.price}, #{it.quantity}, #{it.subtotal})
+        </foreach>
+    </insert>
+
+    <!--
+      查一笔订单的明细。
+
+      ★ 这里的 ORDER BY oi.id 是有意义的，不是可有可无的：
+        不加 ORDER BY 时，MySQL 返回行的顺序【是不保证的】——
+        数据量小的时候看起来总是按主键顺序返回，
+        但那只是"碰巧"，一旦执行计划变了（走了别的索引、
+        或者数据量变大导致优化器换了策略），顺序就会变。
+        而订单详情的商品顺序如果每次刷新都不一样，用户会觉得是 bug。
+
+        凡是要"稳定顺序"的输出，都必须显式写 ORDER BY。
+      （购物车列表那边的顺序是另一回事：它按加购时间排，
+        而 Redis Hash 本身无序，所以那边是在 Java 里排的。）
+
+      ⚠️ 里程碑 10 起这里【也】返回 orderId（原来省掉了）。
+        理由见 OrderItemVO 的类注释 —— 为了和下面那条批量查询形状一致，
+        而形状一致的代价比省一个字段小得多。
+
+      ★★ 里程碑 12 加了两样：oi.id 和 LEFT JOIN product_review。
+
+        oi.id   → 前端提交评价时要把它当 orderItemId 传回来。
+                  它原来是【没有的】，而 OrderItemVO 的注释里却写着
+                  「前端用不到（但留着无害）」—— 一句描述了不存在字段的假话。
+        reviewId → 那一行显示「评价」按钮还是「已评价」标签。
+
+      ★ LEFT JOIN 为什么安全：product_review.order_item_id 上有【唯一索引】，
+        所以每条明细最多匹配一行 —— join 不会让明细行数变多，
+        也不会产生重复行。代价是每行一次索引查找，不是 N+1。
+
+      ⚠️ 两个 SELECT 的列清单和 join 必须【和下面那条批量查询逐字一致】。
+        本文件的注释反复强调这一点：形状不一致的症状是
+        「订单列表里点不了评价、订单详情里能点」，而它们共用同一个 VO，
+        看 Java 代码根本看不出差别。
+
+      ★ 表加了别名 oi（原来没有）—— 因为 join 进来的 product_review
+        也有 id 列，不加限定符的话 SELECT id 会直接报
+        "Column 'id' in field list is ambiguous"。
+        这和 OrderMapper.baseColumns 给每列加 o. 前缀是同一件事。
+    -->
+    <select id="selectByOrderId" resultType="OrderItemVO">
+        SELECT oi.id           AS id,
+               oi.order_id     AS orderId,
+               oi.product_id   AS productId,
+               oi.product_name AS productName,
+               oi.price,
+               oi.quantity,
+               oi.subtotal,
+               r.id            AS reviewId
+        FROM order_item oi
+        LEFT JOIN product_review r ON r.order_item_id = oi.id
+        WHERE oi.order_id = #{orderId}
+        ORDER BY oi.id
+    </select>
+
+    <!--
+      ★ 批量查明细 —— 里程碑 10 加的，用来消掉订单列表里的 N+1。
+
+      一页 10 笔订单，逐个调 selectByOrderId 就是 1 + 10 = 11 次数据库往返；
+      换成本方法之后是 1 + 1 = 2 次，和这一页有多少笔订单无关。
+
+      ★ 返回类型和单笔那条【完全一致】（都是 OrderItemVO，都带 orderId）。
+        为什么不让批量这条返回 Entity、在 Java 里再转一次？
+        因为那会造出第二条转换路径，而 OrderServiceImpl.toVO 的注释
+        专门警告过：第二条路径就是将来加字段时漏改一处的来源。
+
+      ★ ORDER BY order_id, id 而不是只 ORDER BY id：
+        只按 id 排，同一笔订单的明细当然也连在一起（它们是连续插入的），
+        但「连续插入」是一个不写在 SQL 里的假设。
+        显式按 order_id 排，让「同一笔的明细一定相邻」成为查询自身的性质。
+        末尾的 `, id` 是让每笔订单【内部】保持插入顺序 ——
+        只按 order_id 排的话，组内顺序由数据库说了算，是不确定的
+        （和上面那条单笔查询加 ORDER BY id 是同一个理由）。
+
+      ⚠️ 调用方必须保证 orderIds 非空：空的 IN () 是【SQL 语法错误】，
+        不是「返回 0 行」。<foreach> 会把空集合拼成一个光秃秃的 IN ()。
+        「这一页一条订单都没有」必须在 Java 里提前返回，别指望这里兜底。
+        这是 MyBatis 动态 SQL 最经典的翻车点之一。
+
+      ★★ 里程碑 12 和上面那条单笔查询【同步】加了 oi.id 和 LEFT JOIN
+        product_review。两条必须一起改、列清单必须逐字一致 ——
+        只改一条的症状是「订单列表里点不了评价、订单详情里能点」，
+        而两个页面拿到的是同一个 VO，读 Java 代码看不出任何差别。
+        理由（为什么这次敢往共用的查询里加字段）见 OrderItemVO 的类注释。
+
+      ⚠️ foreach 的循环变量叫 oid（order id），
+        结果 SELECT 里也用 oi（order item）当表别名 —— 两个名字很像但不是一回事，
+        改这里的 SQL 时留意别把它们看成一回事。
+    -->
+    <select id="selectByOrderIds" resultType="OrderItemVO">
+        SELECT oi.id           AS id,
+               oi.order_id     AS orderId,
+               oi.product_id   AS productId,
+               oi.product_name AS productName,
+               oi.price,
+               oi.quantity,
+               oi.subtotal,
+               r.id            AS reviewId
+        FROM order_item oi
+        LEFT JOIN product_review r ON r.order_item_id = oi.id
+        WHERE oi.order_id IN
+        <foreach collection="orderIds" item="oid" open="(" close=")" separator=",">
+            #{oid}
+        </foreach>
+        ORDER BY oi.order_id, oi.id
+    </select>
+
+</mapper>

@@ -1,0 +1,475 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  namespace 必须写 Mapper 接口的全限定名。
+  MyBatis 靠它把 XML 和接口绑定起来，然后按「标签 id == 接口方法名」配对。
+  写错了启动就会报 Invalid bound statement (not found)。
+-->
+<mapper namespace="com.example.mall.mapper.ProductMapper">
+
+    <!--
+      ============================================================
+       ★ 先说一个必须记住的安全点： #{} 和 ${} 的区别
+      ============================================================
+
+      #{}  生成的是 JDBC 的预编译占位符 ?，参数值走 setXxx() 设置。
+           值永远被当成「数据」，不会被解析成 SQL 语法。
+           → 安全，防 SQL 注入。99% 的情况都用这个。
+
+      ${}  是直接把值拼进 SQL 字符串里。
+           如果值是用户输入的，攻击者可以构造这样的输入：
+              name = "1' OR '1'='1"
+           拼出来就变成：
+              WHERE name = '1' OR '1'='1'      ← 条件恒成立，全表数据泄露
+           更狠的可以拼 DROP TABLE。
+           → 极其危险，只用于「值本身就该是 SQL 片段」的场景，
+             比如动态排序字段 ORDER BY ${sortField}。
+             而且那种场景也必须在 Java 侧用白名单校验，不能直接用前端传来的值。
+
+      本项目里除了动态排序，其他地方一律用 #{}。
+    -->
+
+    <!--
+      通用查询条件片段。
+      用 <sql> + <include> 抽出来，是因为列表查询和总数查询的 WHERE 条件
+      必须完全一致（否则分页会错乱），抽成一份能保证它们不会写岔。
+    -->
+    <sql id="queryCondition">
+        <where>
+            <!--
+              <where> 标签的两个作用：
+                1. 如果内部所有 <if> 都不成立，它不会生成 WHERE 关键字
+                2. 会自动去掉开头多余的 AND/OR
+              没有它的话，就得写 WHERE 1=1 这种凑数条件，很丑
+            -->
+            <if test="name != null">
+                <!--
+                  CONCAT('%', #{name}, '%') 拼成 LIKE '%手机%' 的模糊匹配。
+                  注意 % 是写在 SQL 里的常量，不是拼进参数里的，
+                  所以这里用 #{} 完全安全
+                -->
+                AND p.name LIKE CONCAT('%', #{name}, '%')
+            </if>
+            <if test="categoryId != null">
+                AND p.category_id = #{categoryId}
+            </if>
+            <if test="status != null">
+                AND p.status = #{status}
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      分页查询商品列表。
+
+      resultType 用 ProductVO 而不是 Product，因为要装 join 出来的 category_name。
+      application.yml 里开了 map-underscore-to-camel-case=true，
+      所以 category_name 这一列会自动映射到 categoryName 字段，不用手写映射。
+    -->
+    <select id="selectPage" resultType="ProductVO">
+        SELECT
+            p.id,
+            p.category_id,
+            p.name,
+            p.price,
+            p.stock,
+            p.cover,
+            p.description,
+            p.status,
+            p.create_time,
+            p.update_time,
+            c.name AS category_name
+        FROM product p
+                 LEFT JOIN category c ON c.id = p.category_id
+        <include refid="queryCondition"/>
+        ORDER BY p.id DESC
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!--
+      查总数。WHERE 条件用同一个 <include>，保证和列表查询永远一致。
+
+      这里把 category 的 join 去掉了：总数只跟 product 的筛选条件有关，
+      join 一张表纯粹是浪费。能少 join 就少 join，这是 SQL 性能的基本意识。
+    -->
+    <select id="countByQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM product p
+        <include refid="queryCondition"/>
+    </select>
+
+    <!--
+      统计某个分类下的商品数量。
+
+      注意这里不带上 status 条件 —— 下架的商品也是「挂在分类下」的，
+      删了分类它们一样会变成孤儿数据。
+      做这种统计时要先想清楚「算不算数」的边界：
+      如果只统计上架商品，运营可能会遇到「显示 0 个商品，但删不掉」的困惑。
+    -->
+    <select id="countByCategoryId" resultType="long">
+        SELECT COUNT(*)
+        FROM product
+        WHERE category_id = #{categoryId}
+    </select>
+
+    <!--
+      查详情，要带分类名，所以 join。
+
+      ★ 里程碑 11：resultType 从 ProductVO 改成了它的子类 AdminProductDetailVO。
+
+        这里值得说清楚两件事：
+
+        ① resultType 天然支持子类 —— MyBatis 按 setter 往对象里填值，
+           子类继承了父类【全部】的 setter，所以下面这些列一个都不会漏。
+           本方法的 SQL 因此【一个字都没改】。
+
+        ② ⚠️ 但图集（images）不在上面这些列里，也【不在】这条 SQL 里查。
+           它是 Service 查完商品之后单独查一次、set 进去的。
+           原因见 ProductServiceImpl.getById 的 javadoc
+           （一句话：selectShopById 被购物车复用了，
+            不能往共用的查询里塞只给详情页用的东西）。
+
+        ★ 为什么用继承的子类，而不是「查出 ProductVO 再手工 new 一个子类拷字段」？
+          因为后者会造出【第二条转换路径】，而 OrderServiceImpl.toVO 的注释
+          专门警告过：第二条路径就是将来加字段时漏掉一处的来源。
+          现在仍然只有一条路径，只是它的产出类型变成了子类。
+    -->
+    <select id="selectById" resultType="AdminProductDetailVO">
+        SELECT
+            p.id,
+            p.category_id,
+            p.name,
+            p.price,
+            p.stock,
+            p.cover,
+            p.description,
+            p.status,
+            p.create_time,
+            p.update_time,
+            c.name AS category_name
+        FROM product p
+                 LEFT JOIN category c ON c.id = p.category_id
+        WHERE p.id = #{id}
+    </select>
+
+    <!--
+      查实体，不 join —— 写操作前的校验不需要分类名，少查一张表。
+
+      参数是单个基本类型时，{@code #{id}} 里的名字其实随便写都行
+      （MyBatis 会直接取那唯一的值），但为了可读性还是写成和参数名一致。
+      如果方法有多个参数，就必须用 @Param 指定名字，否则只能用 param1/param2。
+    -->
+    <select id="selectEntityById" resultType="Product">
+        SELECT id, category_id, name, price, stock, cover, description, status, create_time, update_time
+        FROM product
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      新增商品。
+
+      useGeneratedKeys="true" + keyProperty="id" 这两个属性配合起来，
+      MyBatis 会把数据库生成的自增主键回填到入参对象的 id 字段上。
+      所以 Service 里调用完 insert，product.getId() 立刻就有值了，
+      不需要再发一条 SELECT 去查。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO product (category_id, name, price, stock, cover, description, status)
+        VALUES (#{categoryId}, #{name}, #{price}, #{stock}, #{cover}, #{description}, #{status})
+    </insert>
+
+    <!--
+      根据 id 更新。
+
+      <set> 标签的两个作用：
+        1. 自动去掉最后一个多余的逗号（否则 SQL 语法错误）
+        2. 内部全为空时不生成 SET 关键字
+
+      每个字段都包在 <if> 里，实现「只更新传了值的字段」。
+      这样同一个方法既能做全量更新，也能做局部更新。
+
+      注意 update_time 不用手动更新 —— 建表时写了
+      ON UPDATE CURRENT_TIMESTAMP，MySQL 会自动维护。
+    -->
+    <update id="updateById">
+        UPDATE product
+        <set>
+            <if test="categoryId != null">category_id = #{categoryId},</if>
+            <if test="name != null">name = #{name},</if>
+            <if test="price != null">price = #{price},</if>
+            <if test="stock != null">stock = #{stock},</if>
+            <if test="cover != null">cover = #{cover},</if>
+            <if test="description != null">description = #{description},</if>
+            <if test="status != null">status = #{status},</if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <!-- 物理删除。返回的 int 是影响行数，0 表示这个 id 不存在 -->
+    <delete id="deleteById">
+        DELETE FROM product
+        WHERE id = #{id}
+    </delete>
+
+    <!--
+      ==========================================================================
+      以下是用户端（商城前台）的查询
+      ==========================================================================
+    -->
+
+    <!--
+      用户端的查询条件。
+
+      ★ 和管理端的 queryCondition 最关键的区别：这里把 status = 1
+        【写死在 SQL 里】，不是靠 <if> 判断参数。
+
+        也就是说：无论 Service 传什么、无论前端怎么构造 URL，
+        这条 SQL 都只会返回上架商品。想绕过它只有一个办法 ——
+        改这个文件。而改文件是会被 code review 看到的。
+
+        注意 <where> 标签在这里的作用：因为第一行 p.status = 1 是恒成立的，
+        所以后面那些 <if> 里就可以安心用 AND 开头，不用担心变成
+        "WHERE AND p.name LIKE ..." 这种语法错误
+    -->
+    <sql id="shopQueryCondition">
+        <where>
+            p.status = 1
+            <if test="keyword != null">
+                AND p.name LIKE CONCAT('%', #{keyword}, '%')
+            </if>
+            <if test="categoryId != null">
+                AND p.category_id = #{categoryId}
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      ★★ 动态排序 —— 本项目唯一一处「不能用 #{}」的地方，值得仔细看。
+
+      问题：ORDER BY 后面跟的是【列名】，而 #{} 生成的是预编译占位符 ?。
+           预编译只能替换「值」，替换不了「标识符」：
+             SELECT * FROM t WHERE price = ?       ← 合法
+             SELECT * FROM t ORDER BY ?            ← 语法错误！
+           所以动态排序没法用 #{}，只能用 ${} 拼字符串。
+
+      而 ${} 是 SQL 注入的入口。如果写成 ORDER BY ${sort}，
+      前端传 sort = "id; DROP TABLE product 然后再加个 SQL 注释符" 就可能把表删了。
+
+      （顺带一提：写这段注释时我把那个注释符原样打了出来，
+        结果 MyBatis 启动直接报「注释中不允许出现字符串」并起不来 ——
+        XML 注释里是不允许出现连续两个减号的，这是 XML 规范。
+        而这个错误 mvn compile 是【查不出来】的，因为 XML 映射文件
+        要等运行时才被 MyBatis 解析。所以改完 mapper XML 一定要真启动一次。）
+
+      常见的解决方式是「在 Java 层做白名单，只允许几个固定的列名通过」，
+      然后拼进 ${}。但那种做法仍然有一个隐患：
+      白名单一旦写岔（比如用了 startsWith 判断），
+      或者将来有人为了「支持按销量排序」直接放开了限制，
+      注入就又回来了。
+
+      ★ 这里用的是更彻底的做法：**根本不用 ${}**。
+        用 <choose> 把每个允许的排序方式写成一个完整的分支，
+        ORDER BY 后面的内容是【写死在 XML 里的字面量】。
+        前端传来的 sort 值只参与 <when test="..."> 的【比较】，
+        永远没有机会变成 SQL 的一部分。
+
+      这样即使 DTO 里的白名单校验被误删了，注入也依然不可能 ——
+      这是「纵深防御」：两层防护，各自独立生效。
+      第二层（<choose>）不依赖第一层（Java 白名单）是否正确。
+
+      代价是每加一种排序要改两个地方（DTO 常量 + 这里的 <when>）。
+      对于一个排序选项总共就三四种的场景，这个代价完全可以接受。
+    -->
+    <sql id="shopOrderBy">
+        <choose>
+            <when test="sort == 'price_asc'">
+                ORDER BY p.price ASC, p.id DESC
+            </when>
+            <when test="sort == 'price_desc'">
+                ORDER BY p.price DESC, p.id DESC
+            </when>
+            <otherwise>
+                ORDER BY p.id DESC
+            </otherwise>
+        </choose>
+    </sql>
+
+    <!--
+      ★ 上面每个分支都带了 "p.id DESC" 作为「第二排序键」，这不是多余的。
+
+        如果只写 ORDER BY p.price ASC，价格相同的商品之间顺序是【不确定的】——
+        MySQL 不保证两次查询返回同样的顺序。
+
+        这在分页时会造成真实的 bug：
+          第 1 页查到 [A(10元), B(10元)]，第 2 页查到 [A(10元), C(10元)]
+          → A 出现了两次，而 D 被跳过了
+
+        用户看到的现象是「翻页时有的商品重复出现，有的从来没见过」。
+        这类问题在数据量小的时候几乎不会出现，等数据库大了才浮现，
+        而且很难复现。
+
+        ★ 记住这条规则：**只要用 LIMIT 分页，ORDER BY 就必须包含
+          一个唯一字段（通常是主键）作为最后的排序键。**
+          哪怕你前面已经按价格排好了。
+    -->
+
+    <!--
+      用户端商品列表。
+
+      注意 SELECT 的列少了一个 description —— 列表不查长文本，
+      详见 ShopProductVO 的类注释。这行 SQL 就是那个决定的落地处。
+    -->
+    <select id="selectShopPage" resultType="ShopProductVO">
+        SELECT
+            p.id,
+            p.category_id,
+            p.name,
+            p.price,
+            p.stock,
+            p.cover,
+            c.name AS category_name
+        FROM product p
+                 LEFT JOIN category c ON c.id = p.category_id
+        <include refid="shopQueryCondition"/>
+        <include refid="shopOrderBy"/>
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!-- 用户端列表总数。WHERE 用同一个 include，JOIN 去掉（总数不需要分类名） -->
+    <select id="countShopByQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM product p
+        <include refid="shopQueryCondition"/>
+    </select>
+
+    <!--
+      用户端商品详情。
+
+      WHERE 里同时带了 id 和 status = 1 ——
+      所以「不存在的 id」和「已下架的 id」会得到同一个结果（查不到），
+      Service 因此也没法区分，只能给出同一句「商品不存在」。
+      这正是我们要的效果，理由见 ProductMapper.selectShopById 的注释。
+    -->
+    <select id="selectShopById" resultType="ShopProductDetailVO">
+        SELECT
+            p.id,
+            p.category_id,
+            p.name,
+            p.price,
+            p.stock,
+            p.cover,
+            p.description,
+            c.name AS category_name
+        FROM product p
+                 LEFT JOIN category c ON c.id = p.category_id
+        WHERE p.id = #{id}
+          AND p.status = 1
+    </select>
+
+    <!--
+      批量查询上架商品，给购物车用。
+
+      <foreach> 是 MyBatis 处理「集合参数」的标签，几个属性都要知道：
+        collection="ids"  要遍历的集合。参数用了 @Param("ids")，
+                          所以这里写 ids；不用 @Param 的话得写 collection/list
+        item="pid"        每次遍历的元素变量名，下面 #{pid} 就是引用它
+        open="(" close=")" 整个循环外面包什么 —— 拼出 IN ( ... )
+        separator=","     元素之间用什么隔开
+
+      最终生成：WHERE p.id IN ( ? , ? , ? ) AND p.status = 1
+
+      ★ 注意即使写成 IN ( #{...} ) 用的也是 #{}，不是 ${}，
+        所以依然是预编译占位符，SQL 注入进不来。
+        很多人以为「IN 要拼字符串所以只能用 ${}」—— 那是错的，
+        MyBatis 的 <foreach> 会把每个元素都变成独立的 ? 占位符。
+
+      ★ 为什么不带 ORDER BY？
+        顺序由调用方在 Java 里决定（购物车按加入时间或 id 排），
+        SQL 只管把数据捞出来。让 SQL 少做点事、多留点在 Java 里可控，
+        这类「展现顺序」的问题尤其如此 —— 它经常变，改 SQL 比改 Java 麻烦。
+    -->
+    <select id="selectShopByIds" resultType="ShopProductVO">
+        SELECT
+            p.id,
+            p.category_id,
+            p.name,
+            p.price,
+            p.stock,
+            p.cover,
+            c.name AS category_name
+        FROM product p
+                 LEFT JOIN category c ON c.id = p.category_id
+        WHERE p.status = 1
+          AND p.id IN
+        <foreach collection="ids" item="pid" open="(" close=")" separator=",">
+            #{pid}
+        </foreach>
+    </select>
+
+    <!--
+      ★★ 扣库存：本项目里防超卖的唯一一道真正的防线。
+
+      看这条 SQL 的 WHERE 有两个条件，缺一不可：
+
+        id = #{id}            →  扣哪一行
+        stock >= #{quantity}  →  ★ 只在这个条件成立时才扣
+
+      第二个条件是全部关键。InnoDB 执行 UPDATE 时会给这一行加排他锁，
+      「检查 stock >= ?」和「stock = stock - ?」在同一次加锁中完成，
+      中间没有任何缝隙可以让别人插进来。
+
+      所以调用方不需要（也不应该）先 SELECT 一次库存再判断 ——
+      那样反而会引入竞态。**影响行数就是答案**：
+        1 行 = 扣减成功
+        0 行 = 库存不够，什么都没改，调用方抛「库存不足」
+
+      ★ 顺带说一个写法上的细节：stock = stock - #{quantity}
+        不是 stock = #{newStock}。
+        后者要求 Java 先算出"扣完是多少"，那又变成了"先查后改"——
+        查到的旧值和 UPDATE 时的真实值可能已经不一样了。
+        **让数据库基于它当下的值去算，才是安全的**
+        （这也是 SQL 里的 i++ 和 i = i + 1 之争的同一个问题）。
+
+      ⚠️ 这里【没有】status = 1 条件，是刻意的：
+        下架判定放在 Service 里做（下单前会批量查一次上架商品）。
+        如果这里也加上，那么「影响 0 行」就有两种原因
+        （库存不够 / 已下架），调用方无法区分该报哪个错。
+        这类"把判断集中在能给出好错误信息的那一层"是个常见取舍。
+    -->
+    <update id="decreaseStock">
+        UPDATE product
+        SET stock = stock - #{quantity}
+        WHERE id = #{id}
+          AND stock >= #{quantity}
+    </update>
+
+    <!--
+      归还库存（取消订单 / 订单超时自动取消时用）。
+
+      ★★ 注意这里【故意没有】任何附加条件 —— 不要为了和 decreaseStock
+         对称而加上 `AND status = 1` 或者 `AND stock >= 0` 之类的东西。
+
+         扣减要 AND stock >= #{quantity}，是因为它有一个前置条件要守：
+         「库存够不够」。归还【没有】前置条件：库存是多少都能还，
+         商品已下架也照样要还（东西本来就没发出去，凭什么不还）。
+
+         更要紧的是：归还走的是「订单取消」这条【出错路径】。
+         在出错路径上多加一个判断，就多一种「连取消都取消不掉」的可能 ——
+         订单卡在待付款、库存永远占着、用户还看得见自己的订单。
+         **条件越少，越不容易在异常路径上卡住。**
+
+      同样地，stock = stock + #{quantity} 不是 stock = #{newStock}：
+      让数据库基于它当下的值去算，不要用 Java 里查到的旧值去算。
+
+      ⚠️ 影响 0 行（商品已被硬删，order_item 故意没有外键）不算错误，
+         调用方记一条 warn 就继续，不能因此让取消失败。
+    -->
+    <update id="increaseStock">
+        UPDATE product
+        SET stock = stock + #{quantity}
+        WHERE id = #{id}
+    </update>
+
+</mapper>
