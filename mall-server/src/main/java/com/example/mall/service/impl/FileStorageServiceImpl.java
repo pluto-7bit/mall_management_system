@@ -246,7 +246,7 @@ public class FileStorageServiceImpl implements FileStorageService {
      * SVG 是 XML，可以内嵌 {@code <script>} 和事件属性 ——
      * 它是最经典的「图片 XSS」载体。浏览器直接打开一个 SVG 是会执行脚本的，
      * 而这个文件又是从我们自己的域名下提供的。
-     * 本项目里那 47 个种子图恰好全是 SVG，但它们是<b>随工程走的静态文件</b>
+     * 本项目里那 105 个种子图恰好全是 SVG，但它们是<b>随工程走的静态文件</b>
      * （由用户端的 Vite 提供），不经过这条上传通道 —— 所以不放它进白名单
      * 对现有数据没有任何影响。
      */

@@ -14,8 +14,8 @@ import lombok.EqualsAndHashCode;
  * <h3>★ 和 {@link CartOrderDTO} 唯一的区别：数量由谁提供</h3>
  *
  * <pre>
- *   购物车结算：买了哪几种 ✅ 客户端说   /  每种几件 ❌ 服务端从 Redis 读
- *   立即购买  ：买哪一个   ✅ 客户端说   /  买几件   ✅ 客户端说
+ *   购物车结算：买了哪几种规格 ✅ 客户端说   /  每种几件 ❌ 服务端从 Redis 读
+ *   立即购买  ：买哪一个规格   ✅ 客户端说   /  买几件   ✅ 客户端说
  * </pre>
  *
  * <p>为什么这里数量可以由客户端传？因为<b>「立即购买」根本不经过购物车</b>，
@@ -44,12 +44,17 @@ import lombok.EqualsAndHashCode;
 public class BuyNowDTO extends OrderBaseDTO {
 
     /**
-     * 要购买的商品 id。
+     * 要购买的 SKU id（★ 里程碑 15 阶段 4 从 {@code productId} 换成它）。
      *
      * <p>只能用 {@code @NotNull}：它是数字，不是字符串。
+     *
+     * <p>⚠️ 和购物车那条路一样：「买哪个规格」是客户端的意图，
+     * 服务端猜不出来 —— 用户在详情页选了「黑色 M」，这个选择
+     * 只存在于他的浏览器里。而<b>价格和库存都挂在这个 id 上</b>，
+     * 传 productId 的话服务端不知道该按哪一档算钱、扣哪一行的库存。
      */
-    @NotNull(message = "请选择商品")
-    private Long productId;
+    @NotNull(message = "请选择规格")
+    private Long skuId;
 
     /**
      * 购买数量。

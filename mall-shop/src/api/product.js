@@ -53,3 +53,37 @@ export function getShopProductPage(params) {
 export function getShopProductDetail(id) {
   return request.get(`/shop/products/${id}`)
 }
+
+/**
+ * 查询<b>一个规格</b>的详情（含它所属商品的名字、封面、分类）。
+ *
+ * <p>{@code GET /api/shop/skus/204}
+ *
+ * <p>★ 里程碑 15 阶段 4 新加的，只服务<b>一条路</b>：<b>立即购买</b>。
+ *
+ * <p>为什么「加入购物车」不需要它？因为加购时用户就站在商品详情页上，
+ * 商品详情接口返回的 {@code skus} 数组里已经有每行的价格和库存了，
+ * 再查一次是白跑一趟。
+ *
+ * <p>那「立即购买」为什么需要？因为<b>结算页手里只有一个 skuId</b>：
+ * 从详情页跳过来时 URL 是 {@code /checkout?skuId=204&quantity=2}，
+ * 结算页要渲染的那一行（商品名、封面、规格文字、单价）全都得靠这次请求。
+ * 这正是不把接口挂成 {@code /products/{id}/skus/{skuId}} 的理由 ——
+ * {@code URL} 上只有一个 id 的时候，接口也只该要一个 id。
+ *
+ * <p>⚠️ 和 {@link getShopProductDetail} 完全一致的两点：
+ * <ul>
+ *   <li>商品不存在<b>或已下架</b>时返回业务码 1003，Promise 被打回 rejected，
+ *       {@code request.js} 的统一提示会弹「商品不存在或已下架」</li>
+ *   <li>这两种失败原因<b>故意回同一句话</b>，不告诉外面「这个 id 存在但下架了」</li>
+ * </ul>
+ *
+ * <p>★ 返回的字段：{@code {id, specs, specText, price, stock,
+ * productId, productName, cover, categoryName}}。
+ * 结算页的「立即购买」那一行要的正好就是这些。
+ *
+ * @param {number} skuId 规格 id
+ */
+export function getShopSku(skuId) {
+  return request.get(`/shop/skus/${skuId}`)
+}

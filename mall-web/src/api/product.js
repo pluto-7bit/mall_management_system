@@ -38,6 +38,19 @@ import request from './request'
  *
  * 注意返回的直接就是 data 部分 —— 因为 request.js 的响应拦截器
  * 已经帮我们把 { code, message, data } 的外壳剥掉了。
+ *
+ * <h3>★ 里程碑 15：list 里每一行的价格和库存换了名字</h3>
+ *
+ * <p>价格和库存搬到 {@code product_sku} 上之后，商品行上的那两个数
+ * 变成了<b>汇总值</b>，而且是不同的东西：
+ * <pre>
+ *   minPrice    起售价 = MIN(sku.price)      ← 列表显示这个
+ *   totalStock  总库存 = SUM(sku.stock)      ← 列表显示这个
+ *   skuCount    有几个规格 = COUNT(*)        ← 决定要不要跟「起」字
+ * </pre>
+ * <p>⚠️ 响应里<b>仍然有</b> {@code price} / {@code stock} 两个老字段
+ * （回滚预案，见 ProductVO 的注释），它们的值和上面那三个<b>不一样</b>。
+ * 列表页必须用 minPrice / totalStock —— 用错了不会报错，只会显示一个错数字。
  */
 export function getProductList(params) {
   return request.get('/admin/products', { params })
@@ -47,17 +60,64 @@ export function getProductList(params) {
  * 查询商品详情。
  *
  * 模板字符串里的 ${id} 是 JS 的变量插值，拼出来是 /admin/products/5
+ *
+ * <h3>★ 里程碑 15：比列表多两组字段</h3>
+ *
+ * <pre>
+ *   specSchema  [{ name, values: ['黑','白'] }]        ← 规格定义，多规格才有内容
+ *   skus        [{ id, specs: [{name,value}], specText, price, stock }]
+ * </pre>
+ *
+ * <p><b>{@code skus} 是价格和库存的唯一真源</b>，商品级的 price / stock
+ * 是它们的汇总。编辑弹窗要用的是这一组。
+ *
+ * <p>⚠️ {@code specs} 的顺序是<b>按规格名排过序的</b>（后端为了去重做的），
+ * 和 {@code specSchema} 的顺序常常不一样。要把 specs 对应回规格定义，
+ * 必须<b>按 name 逐项找</b>，不能按下标对位 —— 见 ProductForm.vue 的 viOf()。
+ *
+ * <p>⚠️ 老数据（阶段 1 迁移回填的）的 {@code specSchema} 可能是 null，
+ * 界面上要兜成 {@code []}。
  */
 export function getProductDetail(id) {
   return request.get(`/admin/products/${id}`)
 }
 
-/** 新增商品 */
+/**
+ * 新增商品。
+ *
+ * <h3>★★ 里程碑 15：请求体里【不再有】 price / stock</h3>
+ *
+ * <pre>
+ *   {
+ *     categoryId, name, cover, description, status, images,
+ *     specSchema: [{ name: '颜色', values: ['黑','白'] }],
+ *     skus: [{ specs: [{ name:'颜色', value:'黑' }], price: 19.9, stock: 10 }]
+ *   }
+ * </pre>
+ *
+ * <p><b>商品的起售价和总库存由后端从 skus 算出来，不接受前端传</b> ——
+ * 一个字段只能有一个定义者。前端传了也不会被读。
+ *
+ * <p>无规格商品：{@code specSchema: []} 且 {@code skus} 恰好一条、
+ * 它的 {@code specs} 是 {@code []}（后端管它叫「默认 SKU」）。
+ *
+ * <p>⚠️ {@code skus} 是<b>整集合替换</b>语义，而且不是可选的：
+ * 提交时少了一行就等于告诉后端「这个规格没有了」，那行会被删掉。
+ * （这一点和 {@code images} 不同 —— images 传 null 表示「不改」。）
+ *
+ * @param {Object} data 见上
+ */
 export function createProduct(data) {
   return request.post('/admin/products', data)
 }
 
-/** 修改商品 */
+/**
+ * 修改商品。请求体形状和 {@link createProduct} 完全一样。
+ *
+ * <p>★ 后端会<b>按规格组合认领老的 SKU 行</b>（保住它们的 id），
+ * 而不是删光重建 —— 因为 {@code order_item.sku_id} 指着那些 id。
+ * 所以「规格没变、只改了价格库存」的一次保存，不会打断任何历史订单的链接。
+ */
 export function updateProduct(id, data) {
   return request.put(`/admin/products/${id}`, data)
 }

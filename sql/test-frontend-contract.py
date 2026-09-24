@@ -50,6 +50,7 @@ test-address.py 的区别说清楚：
 
 import datetime
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -131,6 +132,11 @@ def run_sql(sql):
     return [line.split("\t") for line in result.stdout.strip().splitlines() if line]
 
 
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
+
+
 def redis_cmd(*args):
     result = subprocess.run(
         ["docker", "exec", REDIS, "redis-cli", *args],
@@ -203,14 +209,29 @@ def admin_login():
 
 
 def make_product(name, price, stock):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "name": name, "price": price, "stock": stock,
-        "categoryId": CATEGORY_ID, "status": 1,
+        "name": name, "categoryId": CATEGORY_ID, "status": 1,
         "cover": "", "description": "",
+        "specSchema": [], "skus": [{"specs": [], "price": price, "stock": stock}],
     }, ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
     return r["data"]
+
+
+def sku_of(pid):
+    """商品 id → 默认 SKU id。
+
+    ★ 里程碑 15 阶段 4：下单和加购现在只认规格 id。
+    ⚠️ 为什么这个脚本【没有】把 make_product 的返回值整个换掉？
+      因为它这个文件里 90% 的断言在讲【商品】（详情、列表、上下架、
+      订单里的商品名），只有下单和加购那几步需要规格 id。
+      两种 id 都是自增数字，撞车是必然的 —— 所以换的时候必须一处一处
+      问「这里到底是哪一种」，而不是整体替换。
+    """
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
 
 
 def register_member():
@@ -246,6 +267,9 @@ def cleanup():
     run_sql("DELETE a FROM member_address a "
             f"JOIN member m ON m.id = a.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     redis_cmd("DEL", f"mall:cart:{MEMBER_ID}")
 
@@ -277,7 +301,14 @@ def main():
     #   下面这一条断言把那个决定【钉死】在这里：
     #   一旦有人给 VO 加上 status，这个测试会失败并提醒他
     #   "前端可能会开始依赖它，先想清楚"。
-    require_keys(detail, ["id", "name", "price", "stock", "cover",
+    # ★ 里程碑 15 阶段 6：price / stock 换成 minPrice。
+    #   这两个键不是「改名」，是【换了含义】：
+    #     price（已删）  = 这件商品的价格   —— 多规格商品根本没有这回事
+    #     minPrice       = 各规格里最低的那个 —— 「起售价」，列表上跟一个「起」字
+    #   ⚠️ 详情页刻意【没有】totalStock（列表那边才有）：
+    #     跨规格的合计库存对「我要的这个规格还有没有货」这个问题没有意义，
+    #     真正的库存按 skuId 看 detail.skus 里那一行。
+    require_keys(detail, ["id", "name", "minPrice", "cover",
                           "description", "categoryId", "categoryName"],
                  "商品详情")
     check("★ 商品详情【没有】status 字段（能查到就代表在售）",
@@ -368,8 +399,12 @@ def main():
     require_keys(page, ["list", "pageNum", "pageSize", "pages", "total"],
                  "商品列表分页")
     if page.get("list"):
+        # ★ 里程碑 15 阶段 6：price / stock 换成三个聚合字段。
+        #   totalStock 是【跨规格合计】——列表上写「N 个规格」时用它，
+        #   但**不能拿它判断「能不能买」**（合计有货不等于你要的那档有货）。
         require_keys(page["list"][0],
-                     ["id", "name", "price", "stock", "cover", "categoryName"],
+                     ["id", "name", "minPrice", "totalStock", "skuCount",
+                      "cover", "categoryName"],
                      "商品列表条目")
         # ★ 里程碑 11：列表【不该】有 images（理由见上面那段）
         check("★ 商品列表条目【没有】images（列表页不显示它）",
@@ -429,7 +464,8 @@ def main():
         require_keys(r["data"][0], ["id", "name"], "分类条目")
 
     # ---- 购物车（Cart.vue / Checkout.vue）----
-    st, r = call("POST", "/shop/cart/items", {"productId": pid, "quantity": 3}, TOKEN)
+    st, r = call("POST", "/shop/cart/items",
+                 {"skuId": sku_of(pid), "quantity": 3}, TOKEN)
     check("加入购物车 → 200", r.get("code") == 200, f"HTTP {st} / {r}")
 
     st, r = call("GET", "/shop/cart", token=TOKEN)
@@ -444,9 +480,13 @@ def main():
         #   商品能买的时候这个字段是 null，而 null 字段根本不会出现在 JSON 里。
         #   前端只有在 !available 的分支下才读它（Cart.vue 的失效商品区），
         #   那时候它一定有值 —— 见下面单独的那条断言。
+        # ★ 里程碑 15 阶段 4 新增 skuId/specText：
+        #   Cart.vue 的 :key、改数量、删除三处用的都是 item.skuId，
+        #   productId 还在但【可以为 null】（失效行查不到商品就没有它），
+        #   所以它不能当行的身份。specText 是给用户看的规格描述。
         require_keys(item,
-                     ["productId", "name", "price", "cover", "categoryName",
-                      "stock", "quantity", "subtotal", "available"],
+                     ["skuId", "productId", "specText", "name", "price", "cover",
+                      "categoryName", "stock", "quantity", "subtotal", "available"],
                      "购物车条目")
         check("★ 可用商品的 available 是布尔 true（前端按 true/false 判断）",
               item.get("available") is True,
@@ -521,7 +561,7 @@ def main():
     check(f"（准备）用真的 UUID 当幂等键：{key1}", len(key1) == 36)
 
     st, r = call("POST", "/shop/orders", {
-        "productIds": [pid],
+        "skuIds": [sku_of(pid)],
         "addressId": address_id,
         "idempotencyKey": key1,
         # ★ 前端在没有备注时传的是【空字符串】，不是 null、不是不传。
@@ -586,7 +626,7 @@ def main():
     # 所以下面的第二次请求用的还是 key1 —— 这正是刷新后的行为。
 
     st, r = call("POST", "/shop/orders", {
-        "productIds": [pid], "addressId": address_id,
+        "skuIds": [sku_of(pid)], "addressId": address_id,
         "idempotencyKey": key1, "remark": "",
     }, TOKEN)
     check("★★ 同一个键再提交一次 → 200（不是报错）",
@@ -609,6 +649,95 @@ def main():
           int(items[0][0]) == 1, f"实际 {items[0][0]} 行")
 
     # ==================================================================
+    section("3b. ★★★ 换了规格就必须换幂等键 —— 这是本轮最贵的一条")
+    #
+    # ★★ 背景：幂等键是 (会员, 键) 唯一的。用户改了规格但没改键，
+    #    后端【认不出这是另一件事】—— 它只会把上一笔订单原样返回。
+    #    症状：下单"成功"、跳转"成功"、金额和商品名都对，
+    #          只是买的是【上一次那个规格】。全程没有一个地方报错。
+    #
+    #    所以修法只能在【前端】：签名里必须带上 skuId。
+    #    下面先证明「后端确实分不出来」，再检查「前端确实算了 skuId」。
+
+    # ---- ① 后端视角：同一个键 + 不同规格 → 只会有一笔订单 ----
+    st, r = call("POST", "/admin/products", {
+        "name": f"{PREFIX}两规格", "categoryId": CATEGORY_ID, "status": 1,
+        "cover": "", "description": "",
+        "specSchema": [{"name": "颜色", "values": ["黑", "白"]}],
+        "skus": [
+            {"specs": [{"name": "颜色", "value": "黑"}], "price": "1.00", "stock": 10},
+            {"specs": [{"name": "颜色", "value": "白"}], "price": "2.00", "stock": 10},
+        ],
+    }, ADMIN_TOKEN)
+    check("（准备）建一件两规格商品 → 200", r.get("code") == 200, f"HTTP {st} / {r}")
+    two = (r.get("data") if r.get("code") == 200 else None)
+    if not two:
+        return
+    black = int(scalar(f"SELECT id FROM product_sku WHERE product_id = {two} "
+                       f"AND spec_json LIKE '%黑%'"))
+    white = int(scalar(f"SELECT id FROM product_sku WHERE product_id = {two} "
+                       f"AND spec_json LIKE '%白%'"))
+    check("（准备）拿到两个规格的 id", black and white and black != white,
+          f"黑={black} 白={white}")
+
+    key_spec = new_uuid()
+    st, r = call("POST", "/shop/orders/buy-now", {
+        "skuId": black, "quantity": 1, "addressId": address_id,
+        "idempotencyKey": key_spec, "remark": "",
+    }, TOKEN)
+    check("（准备）用「黑」下一单 → 200", r.get("code") == 200, f"HTTP {st} / {r}")
+    first_no = (r.get("data") or {}).get("orderNo")
+
+    st, r = call("POST", "/shop/orders/buy-now", {
+        "skuId": white, "quantity": 1, "addressId": address_id,
+        "idempotencyKey": key_spec, "remark": "",
+    }, TOKEN)
+    reused_no = (r.get("data") or {}).get("orderNo")
+    n_with_key = int(scalar(
+        f"SELECT COUNT(*) FROM orders WHERE member_id = {MEMBER_ID} "
+        f"AND idempotency_key = '{key_spec}'"))
+    check("★★★ 同一个键换成「白」再提交 → 后端【分不出来】，只建了一笔订单",
+          n_with_key == 1,
+          f"建了 {n_with_key} 笔 —— 后端按理应该只认 (会员, 键)，"
+          f"出现 2 笔说明幂等约束被放松了")
+    check("★★★ 而且它返回的是【上一笔】订单 —— 用户买到的还是「黑」",
+          reused_no == first_no,
+          f"{first_no} vs {reused_no} —— 这就是 checkoutIntent.js 必须"
+          f"把 skuId 算进签名的【全部理由】：后端没有别的办法知道"
+          f"用户改过规格")
+
+    # ---- ② 前端视角：签名里到底算了什么 ----
+    #
+    # ★ 这是一条【静态断言】：读前端源码，检查 signatureOf 的原料。
+    #   为什么不跑 JS？因为这里没有 Node 环境，而这条规则的本质是
+    #   「签名由哪几个字段构成」—— 那是一个关于源码的事实，
+    #   读源码比搭一个 JS 运行时更直接、更不容易假绿。
+    #   代价：它只证明【写了 skuId】，不证明逻辑对。所以上面①那条
+    #   （后端确实分不出来）必须同时在，两条合起来才是完整的论证。
+    intent_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "mall-shop", "src", "utils", "checkoutIntent.js")
+    if not os.path.exists(intent_path):
+        check("★ checkoutIntent.js 存在", False, f"找不到 {intent_path}")
+    else:
+        with open(intent_path, encoding="utf-8") as f:
+            intent_src = f.read()
+        body = intent_src.split("export function signatureOf", 1)[-1]
+        body = body.split("\n}", 1)[0]
+        check("★★★ 前端签名里算了 skuId（不算的话改规格会复用同一个幂等键）",
+              "skuId" in body,
+              f"signatureOf 的实现里没看到 skuId：{body.strip()[:200]}")
+        check("★ 而且它【没有】按 productId 算签名（那是 15 阶段 4 之前的写法）",
+              "productId" not in body,
+              f"signatureOf 里还有 productId：{body.strip()[:200]}")
+
+    # 用完就删，别影响后面几节对「库里有多少笔订单」的断言
+    run_sql(f"DELETE oi FROM order_item oi JOIN orders o ON o.id = oi.order_id "
+            f"WHERE o.member_id = {MEMBER_ID} AND o.idempotency_key = '{key_spec}'")
+    run_sql(f"DELETE FROM orders WHERE member_id = {MEMBER_ID} "
+            f"AND idempotency_key = '{key_spec}'")
+
+    # ==================================================================
     section("4. 用户【真的想再买一份】时必须能买")
 
     # ★ 这一节测的是幂等保护的【反面】，同样重要：
@@ -618,7 +747,7 @@ def main():
     #   所以这里用一个【新键】模拟那个场景。
     key2 = new_uuid()
     st, r = call("POST", "/shop/orders/buy-now", {
-        "productId": pid,
+        "skuId": sku_of(pid),
         "quantity": 2,
         "addressId": address_id,
         "idempotencyKey": key2,
@@ -651,12 +780,17 @@ def main():
     #   如果这里失败，现象是：购物车里出现一条灰掉的商品，
     #   但是「为什么灰」那一行是空的 —— 用户只能反复重试。
     pid2 = make_product(f"{PREFIX}待失效商品", "5.00", 10)
-    call("POST", "/shop/cart/items", {"productId": pid2, "quantity": 1}, TOKEN)
+    call("POST", "/shop/cart/items", {"skuId": sku_of(pid2), "quantity": 1}, TOKEN)
     run_sql(f"UPDATE product SET status = 0 WHERE id = {pid2}")
 
     st, r = call("GET", "/shop/cart", token=TOKEN)
     cart = r.get("data") or {}
-    bad = next((i for i in (cart.get("items") or []) if i.get("productId") == pid2), None)
+    # ★★ 这里必须按 skuId 找，不能按 productId。
+    #   失效行的 productId 是【null】（商品查不到就没有它），
+    #   按 productId 找会永远返回 None —— 而 None 会让下面的断言
+    #   以「失效行不见了」的形式失败，看起来像是后端的问题。
+    #   见 CartItemVO 里 productId 的注释。
+    bad = next((i for i in (cart.get("items") or []) if i.get("skuId") == sku_of(pid2)), None)
     check("（准备）下架的那件商品还在购物车里、且 available 为 false",
           bad is not None and bad.get("available") is False,
           f"找到的条目是 {bad}")
@@ -670,7 +804,9 @@ def main():
               True if bad is not None else False, "")
 
     # 把它清出购物车，免得影响下面的断言
-    call("DELETE", f"/shop/cart/items/{pid2}", token=TOKEN)
+    call("DELETE", f"/shop/cart/items/{sku_of(pid2)}", token=TOKEN)
+    # ★ 里程碑 15：直接改库绕过了 Service 的级联，SKU 行要自己删。
+    run_sql(f"DELETE FROM product_sku WHERE product_id = {pid2}")
     run_sql(f"DELETE FROM product WHERE id = {pid2}")
 
     # ==================================================================
@@ -680,7 +816,7 @@ def main():
     # 而第 4 节的立即购买【不碰购物车】。
     keys_now = redis_cmd("HKEYS", f"mall:cart:{MEMBER_ID}")
     check("★ 购物车结算把那件商品清掉了（前端要据此刷新角标）",
-          str(pid) not in (keys_now or []),
+          str(sku_of(pid)) not in (keys_now or []),
           f"车里还有 {keys_now}")
 
     st, r = call("GET", "/shop/cart/count", token=TOKEN)
@@ -774,8 +910,12 @@ def main():
     # ---- 取消：同样必须是完整订单 ----
     # 用第 2 节购物车结算出来的 order1（还是待付款）
     st, r = call("GET", f"/shop/orders/{order1.get('orderNo')}", token=TOKEN)
+    # ★ 里程碑 15 阶段 4：读 product_sku.stock，不是 product.stock。
+    #   product.stock 在阶段 2~5 期间还在（回滚预案），但下单扣的是 sku 行，
+    #   所以读那列会拿到一个【永远不动的数字】—— 断言会以「库存没归还」
+    #   的形式失败，而实际归还得好好的。
     before_stock = int(run_sql(
-        f"SELECT stock FROM product WHERE id = {pid}")[0][0])
+        f"SELECT stock FROM product_sku WHERE id = {sku_of(pid)}")[0][0])
     qty1 = (r.get("data") or {}).get("items", [{}])[0].get("quantity")
     check("（准备）拿到 order1 的商品件数", isinstance(qty1, int) and qty1 > 0,
           f"拿到 {qty1!r}")
@@ -804,7 +944,8 @@ def main():
     # 库存归还。★ 归还的【件数】从上一次查询里读，不硬编码 ——
     # 硬编码就等于在测试脚本里再抄一份"这一单买了几件"，
     # 哪天上面的用例改了数量，这里会以一个看不懂的方式失败
-    after_stock = int(run_sql(f"SELECT stock FROM product WHERE id = {pid}")[0][0])
+    after_stock = int(run_sql(
+        f"SELECT stock FROM product_sku WHERE id = {sku_of(pid)}")[0][0])
     check(f"★★ 取消后库存归还了 {qty1} 件（{before_stock} → {after_stock}）",
           after_stock == before_stock + qty1,
           f"{before_stock} → {after_stock}，期望 +{qty1}")
@@ -866,7 +1007,13 @@ def main():
         #   这一条就是那句「被省掉的字段要拿回来，就该把当初省掉它的理由
         #   一起改掉」的回归测试。
         item0 = (row.get("items") or [{}])[0]
-        require_keys(item0, ["orderId", "productId", "productName",
+        # ★ 里程碑 15 阶段 4 新增 skuId/skuSpec：Orders.vue 在商品名后面
+        #   显示 it.skuSpec。⚠️ 但这两个字段的 null 规则【不一样】，别记混：
+        #     skuSpec 永远是字符串（可能是空串 ''）
+        #     skuId   可能是 null → 那个 key 会整个消失（历史/孤儿明细）
+        #   所以 skuSpec 可以进 require_keys，skuId 不能 ——
+        #   require_keys 断言的是「这个 key 一定在」，而 skuId 不一定在。
+        require_keys(item0, ["orderId", "productId", "productName", "skuSpec",
                              "price", "quantity", "subtotal"],
                      "列表里的订单明细（★ orderId 是里程碑 10 新加回来的）")
         check("★★ 明细的 orderId 就是它所在订单的 id（前端靠它分组）",
@@ -883,7 +1030,7 @@ def main():
 
     # ---- 发货 + 确认收货：走一遍完整流程，验证两个响应形状 ----
     st, r = call("POST", "/shop/orders/buy-now", {
-        "productId": pid, "quantity": 1, "addressId": address_id,
+        "skuId": sku_of(pid), "quantity": 1, "addressId": address_id,
         "idempotencyKey": f"k{RUN}fc10a",
     }, TOKEN)
     check("（准备）新建一笔订单用于发货流程", r.get("code") == 200, f"HTTP {st} / {r}")
@@ -976,7 +1123,7 @@ def main():
     items = done.get("items") or []
     check("（准备）已完成订单里有明细", len(items) > 0, f"拿到 {len(items)} 条")
     item = items[0]
-    require_keys(item, ["id", "orderId", "productId", "productName",
+    require_keys(item, ["id", "orderId", "productId", "productName", "skuSpec",
                         "price", "quantity", "subtotal"], "订单明细")
     check("★★ 订单明细【有】id（前端拿它当 orderItemId 传回去）",
           isinstance(item.get("id"), int),

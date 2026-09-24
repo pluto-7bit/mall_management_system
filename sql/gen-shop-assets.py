@@ -5,16 +5,23 @@
 运行：
     /d/python/python.exe sql/gen-shop-assets.py
 
-产出三样东西：
+产出四样东西：
 
   1. mall-shop/public/images/*.svg   每件商品一张图 + logo.svg + favicon.svg
-  2. sql/migration-08c-shop-catalog.sql
-       增量迁移：新增商品、给现有 12 件补封面和描述
+  2. sql/migration-08d-shop-catalog-2.sql
+       增量迁移：第二批新增的 58 件商品
+       ★ migration-08c-shop-catalog.sql（第一批 30 件）已经跑过，【已冻结】——
+         本脚本不再重写它，见 write_migration() 和 NEW_MIGRATIONS 的说明。
+       ★ 08d 现在【也冻结了】（2026-09-23 应用到线上库）——
+         两份都在 FROZEN_MIGRATIONS 里，NEW_MIGRATIONS 目前是空的。
+         也就是说：本脚本现在只重出图片，不再产出任何迁移。
   3. sql/generated-mall-seed.sql
        可直接粘进 mall.sql 的 seed 片段（全量脚本也要跟着改，见下）
+       ★ 这个片段是【全量】的：100 件商品全在里面，
+         所以它跟着 sync-mall-seed.py 走一次，mall.sql 就对齐了。
 
-★ 为什么让【脚本生成 SQL】，而不是手抄 44 行 INSERT？
-  因为「文件名」和「cover 字段里的路径」必须严格对应，手抄 44 次必然错一两个。
+★ 为什么让【脚本生成 SQL】，而不是手抄 100 行 INSERT？
+  因为「文件名」和「cover 字段里的路径」必须严格对应，手抄 100 次必然错一两个。
   而错的表现是：那张图【静默】变成占位图（ProductImage 组件会兜底），
   页面看起来完全正常，你会以为「这件商品本来就没图」。
   让同一个 dict 同时决定文件和 SQL 两边，就不存在对不上的可能。
@@ -33,11 +40,11 @@
   从来不显示成图片，所以这个相对路径在那边也无害。
 
 ⚠️ 上面这一段是【历史记录】，里程碑 11 之后它有一半不再成立，
-   保留在这里是因为它解释了「这 47 个 SVG 为什么是这个形状」：
+   保留在这里是因为它解释了「这 105 个 SVG 为什么是这个形状」：
 
   · 「后端一行都不用改」—— 不再成立。里程碑 11 加了
     WebMvcConfig.addResourceHandlers，后端现在提供 /uploads/** 了
-    （运营上传的图片走那条路，和这 47 个 SVG 是两条独立的通道）。
+    （运营上传的图片走那条路，和这 105 个 SVG 是两条独立的通道）。
   · 「管理端从来不显示成图片」—— 不再成立，而且方向反了。
     里程碑 11 给管理端列表加了封面缩略图列、给表单加了预览图，
     于是这些 /images/*.svg 【在 mall-web 下必然 404】——
@@ -46,7 +53,7 @@
   ⚠️ 这个不一致是【刻意不修的】，因为它只在开发环境存在：
     生产环境里 /images 和 /uploads 由同一个 nginx 托管，两个前端
     拿到的是同一份静态文件，不存在这个问题。修它要么往
-    mall-web/public/ 复制 47 个文件（重复且会漂移），
+    mall-web/public/ 复制 105 个文件（重复且会漂移），
     要么配一条 /images → localhost:5174 的跨工程代理
     （生产环境根本没有 5174 这个端口）。
     症状是管理端看到占位块而不是碎图 —— 靠 el-image 的 #error 兜底，
@@ -54,6 +61,7 @@
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -657,13 +665,28 @@ CAT_VAR = {
 # ===========================================================================
 # 四、商品数据 —— 唯一的一份真相
 #
-# 下面的 PRODUCTS / EXISTING 决定了：生成哪些图片、图片叫什么名字、
+# 下面三份清单决定了：生成哪些图片、图片叫什么名字、
 # SQL 里 cover 字段写什么、描述写什么。
 # 两边由同一个 dict 推导，所以不可能对不上。
+#
+# ★ 分三份，是按【批次】分的，不是按「新/旧」分的：
+#
+#     PRODUCTS_BATCH_1  里程碑 8 收尾那 30 件，已经由 migration-08c 灌进库里了
+#     EXISTING          库里本来就有、只补封面和描述的 12 件
+#     PRODUCTS_BATCH_2  这次新增的 58 件，由 migration-08d 灌进库里
+#
+# ★★ 三份在文件里的【先后顺序】和 build_catalog() 遍历它们的顺序【必须一致】，
+#     即 BATCH_1 → EXISTING → BATCH_2。这不是排版偏好，是正确性要求 ——
+#     图片文件名（phone-01、phone-02…）是按遍历顺序编号的，而编号已经写进了
+#     库里的 cover 字段。把 BATCH_2 挪到前面，phone-01 就会从「华为 Mate 70 Pro」
+#     变成别的商品，而【库里那一行不会跟着改】（migration 的 UPDATE 带
+#     「cover 为空才写」的守卫）—— 表现是「图还是那张图，但它画的是别人」。
+#     这个错误不会报错、不会崩，只会静默地显示错图。
+#     FROZEN_SLUGS + build_catalog() 里那条断言就是为了把这件事变成一次报错。
 # ===========================================================================
 
-# 新增商品：(分类, 名称, 价格, 库存, 图形, 描述行)
-PRODUCTS = [
+# 批次 1 新增商品：(分类, 名称, 价格, 库存, 图形, 描述行)
+PRODUCTS_BATCH_1 = [
     # ---------------- 手机数码 ----------------
     ("手机数码", "华为 Mate 70 Pro", "6499.00", 80, "phone", [
         "6.8 英寸 OLED 曲面屏，1-120Hz 自适应刷新率",
@@ -938,6 +961,388 @@ EXISTING = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 批次 2 新增商品：(分类, 名称, 价格, 库存, 图形, 描述行)
+#
+# ★ 这一份【必须放在 EXISTING 后面】，理由见本文件第五节开头那段。
+#   简单说：图片编号是按遍历顺序发的，BATCH_1 和 EXISTING 的编号已经
+#   写进了线上库的 cover 字段，所以新的只能接在最后。
+#
+# 内容定位：和批次 1 一样，是【演示用的仿真商品】——
+#   价格、库存、描述都是编的，但对得上真实品类和量级，
+#   为的是让列表页、分页、搜索、详情页有足够的样本可看。
+#   它们不是任何真实商品，也不该被当成真实数据引用。
+#
+# 分布（6 个分类，共 58 件）：
+#   手机数码 10 / 电脑办公 12 / 家用电器 12 / 服饰鞋包 10 / 休闲零食 7 / 床上用品 7
+#
+# 图形名必须来自 ART 那个 dict（写错会当场 KeyError，是好事）。
+# 同一个图形被多件商品用是正常的，靠 variant 序号在色系里做出差异，
+# 所以这里【不需要】为每件商品都找一个专属图形。
+# ---------------------------------------------------------------------------
+PRODUCTS_BATCH_2 = [
+    # ---------------- 手机数码（10 件） ----------------
+    ("手机数码", "三星 Galaxy S25 Ultra", "9699.00", 45, "phone", [
+        "6.9 英寸动态 AMOLED 2X 屏，1-120Hz 自适应刷新",
+        "2 亿像素主摄，支持 5 倍光学变焦",
+        "内置 S Pen，随手记笔记很方便",
+        "钛金属边框，支持 IP68 防水",
+    ]),
+    ("手机数码", "OPPO Find X8 Pro", "5299.00", 70, "phone", [
+        "6.78 英寸 1.5K 曲面屏，峰值亮度 4500 尼特",
+        "双潜望长焦，人像和远景都拿手",
+        "5910mAh 电池，80W 有线闪充",
+        "支持无线充电与红外遥控",
+    ]),
+    ("手机数码", "vivo X200 Pro", "5499.00", 65, "phone", [
+        "蔡司 2 亿像素长焦，远摄解析力强",
+        "6000mAh 蓝海电池，重度用一天无压力",
+        "旗舰平台，游戏帧率稳定",
+        "支持 IP69 防尘防水",
+    ]),
+    ("手机数码", "红米 K80 Pro", "2999.00", 150, "phone", [
+        "第二代 2K 直屏，支持全亮度 DC 调光",
+        "骁龙旗舰平台，性能释放激进",
+        "6000mAh 电池 + 120W 秒充",
+        "超声波指纹，湿手也能解锁",
+    ]),
+    ("手机数码", "一加 13", "4499.00", 80, "phone", [
+        "6.82 英寸 2K 东方屏，护眼认证齐全",
+        "哈苏影像系统，人像色彩自然",
+        "6000mAh 冰川电池，100W 有线快充",
+        "支持 50W 无线闪充",
+    ]),
+    ("手机数码", "华为 MatePad Pro 13.2", "4999.00", 40, "tablet", [
+        "13.2 英寸柔性 OLED 屏，屏占比 94%",
+        "支持星闪手写笔，书写延迟低",
+        "重量 580g，同尺寸里属于轻的一档",
+        "可与手机、耳机多设备协同",
+    ]),
+    ("手机数码", "小米手环 9 Pro", "399.00", 300, "watch", [
+        "1.74 英寸大屏，亮度提升到 1200 尼特",
+        "支持全天心率、血氧与睡眠监测",
+        "内置 GPS，跑步不用带手机",
+        "续航最长 21 天",
+    ]),
+    ("手机数码", "索尼 WF-1000XM5 真无线降噪耳机", "1699.00", 90, "headphones", [
+        "双处理器降噪，通勤地铁里效果明显",
+        "8.4mm 驱动单元，低频有力",
+        "单次续航 8 小时，配充电盒共 24 小时",
+        "支持 LDAC 高解析音频",
+    ]),
+    ("手机数码", "Bose QuietComfort 45 头戴式耳机", "1499.00", 55, "headphones", [
+        "经典主动降噪，四麦克风阵列",
+        "三档降噪模式，室内室外都能用",
+        "续航 24 小时，快充 15 分钟用 3 小时",
+        "可折叠收纳，附带硬壳包",
+    ]),
+    ("手机数码", "佳能 EOS R50 微单套机", "4799.00", 30, "camera", [
+        "2420 万像素 APS-C 画幅传感器",
+        "支持 4K 30P 无裁切视频录制",
+        "双像素对焦，人物眼睛自动追踪",
+        "机身约 375g，适合入门和旅拍",
+    ]),
+
+    # ---------------- 电脑办公（12 件） ----------------
+    ("电脑办公", "联想小新 Pro 16 2025", "5299.00", 60, "laptop", [
+        "16 英寸 2.5K 高刷屏，100% sRGB",
+        "标压处理器 + 独显，办公剪辑都够用",
+        "84Wh 大电池，续航约 10 小时",
+        "全功能 Type-C 接口，支持 PD 充电",
+    ]),
+    ("电脑办公", "华硕 ROG 魔霸新锐", "8999.00", 25, "laptop", [
+        "16 英寸 2.5K 240Hz 电竞屏",
+        "满血独显，支持独显直连",
+        "冰川散热架构，长时间游戏不降频",
+        "RGB 背光键盘，键程 1.7mm",
+    ]),
+    ("电脑办公", "华为 MateBook 14", "5999.00", 45, "laptop", [
+        "14.2 英寸 2.8K 触控屏，3:2 显示比例",
+        "重量 1.31kg，金属机身",
+        "超级终端，与华为手机一碰互传",
+        "隐藏式摄像头，保护隐私",
+    ]),
+    ("电脑办公", "宏碁 掠夺者 擎 Neo", "7499.00", 30, "laptop", [
+        "16 英寸 2.5K 165Hz 高刷屏",
+        "双风扇四热管，散热余量充足",
+        "内存与硬盘均可自行扩展",
+        "带独立数字小键盘，录入方便",
+    ]),
+    ("电脑办公", "明基 GW2790 27 英寸护眼显示器", "1099.00", 70, "monitor", [
+        "27 英寸 IPS 屏，三面窄边框",
+        "硬件级低蓝光，长时间办公更舒服",
+        "支持 100Hz 刷新率，滚动更顺滑",
+        "内置音箱，桌面更简洁",
+    ]),
+    ("电脑办公", "AOC 24G2 24 英寸电竞显示器", "899.00", 85, "monitor", [
+        "24 英寸 165Hz 电竞屏，1ms 响应",
+        "支持 FreeSync 防撕裂",
+        "可升降旋转支架，竖屏看代码方便",
+        "双 HDMI + DP 接口",
+    ]),
+    ("电脑办公", "雷蛇 黑寡妇蜘蛛 V4 键盘", "999.00", 60, "keyboard", [
+        "机械轴体，段落感清晰",
+        "独立多媒体控制键与旋钮",
+        "支持 RGB 灯效自定义",
+        "附带磁吸式手托",
+    ]),
+    ("电脑办公", "罗技 G502 Hero 游戏鼠标", "349.00", 200, "mouse", [
+        "25600 DPI HERO 传感器",
+        "11 个可编程按键",
+        "可调配重块，手感自己调",
+        "支持板载内存保存配置",
+    ]),
+    ("电脑办公", "微软 Surface 精准鼠标", "599.00", 90, "mouse", [
+        "蓝影技术，玻璃桌面也能用",
+        "三档按键力度可调",
+        "支持同时配对三台设备",
+        "续航约 3 个月",
+    ]),
+    ("电脑办公", "闪迪 1TB 移动固态硬盘", "699.00", 130, "usb", [
+        "读取速度最高 1050MB/s",
+        "金属外壳，抗冲击防跌落",
+        "Type-C 与 USB-A 双接口",
+        "附带加密软件，保护隐私",
+    ]),
+    ("电脑办公", "爱普生 L3253 墨仓式一体机", "899.00", 40, "printer", [
+        "打印、复印、扫描三合一",
+        "墨仓式设计，单页成本低",
+        "支持无线打印与小程序打印",
+        "黑白彩色同速，每分钟 10 页",
+    ]),
+    ("电脑办公", "得力 5 级保密碎纸机", "499.00", 35, "box", [
+        "5 级保密等级，碎纸尺寸 2×12mm",
+        "单次可碎 8 张 A4 纸",
+        "连续工作 30 分钟不卡纸",
+        "静音设计，办公室用不吵",
+    ]),
+
+    # ---------------- 家用电器（12 件） ----------------
+    ("家用电器", "美的 1.5 匹酷省电空调", "2399.00", 35, "ac", [
+        "新一级能效，省电模式下更省",
+        "56℃ 高温自清洁，出风更干净",
+        "独立除湿模式，梅雨季实用",
+        "适用面积 16~20 平方米",
+    ]),
+    ("家用电器", "松下 506L 多门冰箱", "6999.00", 15, "fridge", [
+        "多门分区，冷藏冷冻独立控温",
+        "风冷无霜，无需手动除冰",
+        "一级能效，日耗电约 0.9 度",
+        "纳诺怡除菌，蔬果保鲜更久",
+    ]),
+    ("家用电器", "西门子 10 公斤洗烘一体机", "4599.00", 20, "washer", [
+        "10 公斤大容量，被套一次洗完",
+        "洗烘一体，阴雨天不用晾",
+        "变频电机，运行安静",
+        "高温筒自洁，减少异味",
+    ]),
+    ("家用电器", "九阳 破壁料理机", "599.00", 110, "blender", [
+        "高转速破壁，豆浆细腻少渣",
+        "可做米糊、果汁、辅食",
+        "预约功能，早上起来就能喝",
+        "杯体可拆洗，不易藏污",
+    ]),
+    ("家用电器", "苏泊尔 IH 电饭煲 5L", "699.00", 95, "rice_cooker", [
+        "5L 容量，适合 4~6 人家庭",
+        "IH 电磁加热，受热更均匀",
+        "支持 24 小时预约",
+        "内胆可拆卸，清洗方便",
+    ]),
+    ("家用电器", "莱克 立式吸尘器", "1899.00", 45, "vacuum", [
+        "立式设计，推着走不费腰",
+        "大吸力电机，地毯深处的灰也能吸",
+        "多档吸力，按地面材质切换",
+        "集尘盒可水洗，不用买耗材",
+    ]),
+    ("家用电器", "飞利浦 声波电动牙刷", "299.00", 220, "toothbrush", [
+        "声波震动清洁，牙缝刷得更干净",
+        "三种模式，敏感牙龈也能用",
+        "两分钟计时，分区提醒换区",
+        "一次充电用约 14 天",
+    ]),
+    ("家用电器", "米家 空气净化器 Ultra", "2499.00", 40, "purifier", [
+        "CADR 值高，大客厅也能带动",
+        "高效滤芯，可过滤 PM2.5 与甲醛",
+        "自动模式按空气质量调节风量",
+        "支持手机 App 查看滤芯寿命",
+    ]),
+    ("家用电器", "格兰仕 微波炉 20L", "399.00", 140, "box", [
+        "20L 容量，日常加热够用",
+        "机械旋钮，老人也会用",
+        "解冻、加热两档火力",
+        "内胆易擦洗，不留油渍",
+    ]),
+    ("家用电器", "摩飞 便携榨汁杯", "199.00", 260, "blender", [
+        "杯机一体，榨完直接喝",
+        "充电式设计，出门也能用",
+        "一次可榨一杯，约 300ml",
+        "杯体可拆下水洗",
+    ]),
+    ("家用电器", "追觅 扫地机器人", "3499.00", 22, "vacuum", [
+        "激光导航，自动规划清扫路线",
+        "扫拖一体，边扫边拖",
+        "自动集尘，一个月不用倒垃圾",
+        "支持 App 划区清扫与禁扫区",
+    ]),
+    ("家用电器", "海尔 60 升电热水器", "1299.00", 30, "box", [
+        "60 升容量，够两三个人连续洗",
+        "3000W 加热，等待时间短",
+        "防电墙技术，用电更安心",
+        "可预约加热，避开用电高峰",
+    ]),
+
+    # ---------------- 服饰鞋包（10 件） ----------------
+    ("服饰鞋包", "优衣库 摇粒绒外套", "249.00", 300, "jacket", [
+        "摇粒绒面料，保暖又轻",
+        "立领设计，脖子不进风",
+        "两侧口袋带拉链，不怕掉东西",
+        "可机洗，打理省事",
+    ]),
+    ("服饰鞋包", "耐克 Air Force 1 板鞋", "799.00", 120, "shoe", [
+        "经典低帮板鞋，百搭不挑裤型",
+        "头层皮鞋面，耐穿易清洁",
+        "气垫缓震，久站也舒服",
+        "橡胶大底，防滑耐磨",
+    ]),
+    ("服饰鞋包", "阿迪达斯 三条纹运动裤", "329.00", 180, "pants", [
+        "经典三条纹设计，运动休闲都能穿",
+        "针织面料带弹力，活动不受限",
+        "收口裤脚，显腿长",
+        "侧边口袋带拉链",
+    ]),
+    ("服饰鞋包", "安踏 冠军跑鞋", "459.00", 160, "shoe", [
+        "缓震中底，落地冲击小",
+        "网布鞋面透气，夏天不闷脚",
+        "后跟稳定片，长距离支撑好",
+        "重量轻，适合日常训练",
+    ]),
+    ("服饰鞋包", "太平鸟 男士休闲夹克", "599.00", 90, "jacket", [
+        "翻领设计，通勤休闲都合适",
+        "面料挺括，不易起皱",
+        "内里加薄绒，春秋能穿",
+        "两侧斜插口袋，放手机方便",
+    ]),
+    ("服饰鞋包", "海澜之家 纯棉长袖衬衫", "199.00", 220, "tshirt", [
+        "100% 纯棉，贴身不扎",
+        "免烫处理，洗完挂着就平整",
+        "标准版型，塞进裤腰不臃肿",
+        "多色可选，适合日常通勤",
+    ]),
+    ("服饰鞋包", "波司登 轻薄羽绒马甲", "499.00", 110, "jacket", [
+        "轻薄羽绒马甲，室内外都好搭",
+        "90% 绒子含量，保暖效率高",
+        "可收纳进随身小袋",
+        "外穿内搭都不显臃肿",
+    ]),
+    ("服饰鞋包", "李宁 运动双肩包", "269.00", 150, "bag", [
+        "大容量主袋，可放 15.6 英寸笔记本",
+        "独立鞋仓，健身换鞋分开放",
+        "透气背垫，夏天背着不闷",
+        "侧袋可放水杯和雨伞",
+    ]),
+    ("服饰鞋包", "迪卡侬 20L 徒步背包", "149.00", 240, "bag", [
+        "20L 容量，一日徒步刚好",
+        "背部通风设计，出汗少",
+        "腰带分担重量，走久了肩膀不酸",
+        "自带防雨罩，突然下雨也不怕",
+    ]),
+    ("服饰鞋包", "优衣库 高腰直筒牛仔裤", "299.00", 200, "pants", [
+        "高腰直筒版型，显腿直",
+        "弹力牛仔面料，蹲坐不勒",
+        "水洗工艺，颜色自然不假",
+        "四季都能穿的厚度",
+    ]),
+
+    # ---------------- 休闲零食（7 件） ----------------
+    ("休闲零食", "卫龙 魔芋爽 20 包", "29.90", 500, "snack_bag", [
+        "酸辣爽脆，口感弹牙",
+        "独立小包装，一次一包不脏手",
+        "低热量解馋，追剧好搭档",
+        "整盒 20 包，办公室囤货合适",
+    ]),
+    ("休闲零食", "洽洽 每日坚果 30 包", "99.00", 260, "pouch", [
+        "混合坚果与果干，一天一包",
+        "独立分装，随手带出门",
+        "低温烘焙，不额外油炸",
+        "整箱 30 包，一个月的量",
+    ]),
+    ("休闲零食", "旺旺 雪饼整箱", "39.90", 400, "snack_bag", [
+        "经典米饼，咸甜适口",
+        "蓬松酥脆，一咬就化",
+        "整箱装，家里来客人不慌",
+        "独立小包，受潮也不怕",
+    ]),
+    ("休闲零食", "奥利奥 夹心饼干分享装", "25.90", 450, "box", [
+        "经典可可饼干配奶油夹心",
+        "分享装分量足，聚会合适",
+        "泡牛奶吃更香",
+        "密封包装，开封后不易受潮",
+    ]),
+    ("休闲零食", "农夫山泉 天然水 550ml×24", "45.00", 300, "bottle", [
+        "天然水源，入口甘冽",
+        "550ml 常规瓶型，一次喝完不浪费",
+        "整箱 24 瓶，办公室常备",
+        "瓶身可回收，环保包装",
+    ]),
+    ("休闲零食", "蒙牛 特仑苏纯牛奶 250ml×16", "79.00", 280, "bottle", [
+        "每 100ml 含 3.6g 优质蛋白",
+        "250ml 利乐包，早餐一盒刚好",
+        "整箱 16 盒，常温存放",
+        "不添加防腐剂，开盒尽快喝完",
+    ]),
+    ("休闲零食", "好想你 红枣夹核桃 500g", "59.90", 220, "pouch", [
+        "红枣去核夹核桃仁，一口两样",
+        "独立小包，随身带着补能量",
+        "选料饱满，甜度自然",
+        "500g 袋装，办公室常备",
+    ]),
+
+    # ---------------- 床上用品（7 件） ----------------
+    ("床上用品", "富安娜 全棉四件套 1.5 米", "499.00", 100, "bedding", [
+        "100% 全棉，亲肤透气",
+        "被套床单枕套四件齐备",
+        "活性印染，不易掉色",
+        "适合 1.5 米床",
+    ]),
+    ("床上用品", "罗莱 抗菌纤维被", "429.00", 90, "quilt", [
+        "填充纤维带抗菌处理，潮季更安心",
+        "重量适中，春秋冬都能用",
+        "被芯可整体水洗，不用送干洗",
+        "四角带固定带，不跑被",
+    ]),
+    ("床上用品", "网易严选 乳胶记忆枕", "249.00", 160, "pillow", [
+        "乳胶与记忆棉复合，回弹刚好",
+        "贴合颈部曲线，早上起来脖子不酸",
+        "透气孔设计，夏天不闷",
+        "枕套可拆洗，内芯不用水洗",
+    ]),
+    ("床上用品", "恒源祥 羊毛被", "899.00", 60, "quilt", [
+        "羊毛填充，保暖且透气",
+        "重量轻，压在身上不闷",
+        "被面纯棉，贴身不扎",
+        "适合冬季或空调房使用",
+    ]),
+    ("床上用品", "水星 全棉床笠 1.8 米", "139.00", 220, "bedding", [
+        "全棉面料，柔软亲肤",
+        "松紧包边，套上不滑动",
+        "深度 25cm，厚床垫也能包住",
+        "适合 1.8 米床",
+    ]),
+    ("床上用品", "梦洁 记忆棉护颈枕", "199.00", 180, "pillow", [
+        "慢回弹记忆棉，承托颈部",
+        "中间低两侧高的护颈造型",
+        "枕套可拆洗，机洗不变形",
+        "适合侧睡与仰睡",
+    ]),
+    ("床上用品", "南极人 加厚床垫 1.5 米", "599.00", 70, "mattress", [
+        "加厚填充，软硬适中",
+        "底面防滑颗粒，不易移位",
+        "可直接铺在旧床垫上翻新",
+        "适合 1.5 米床",
+    ]),
+]
+
+
 # ===========================================================================
 # 五、生成
 # ===========================================================================
@@ -946,33 +1351,346 @@ def slugify(art, n):
     return f"{art}-{n:02d}"
 
 
+# ===========================================================================
+# 冻结的图片编号 —— 这个 dict 不是数据来源，是【报警器】
+#
+# 真正决定文件名的是 build_catalog() 的遍历顺序。这张表记录的是
+# 「已经写进线上库 cover 字段的那批编号」，一一对应，用来在顺序被改动时
+# 当场报错，而不是静默地显示错图。
+#
+# ★ 为什么值得单独立一张表：
+#   库里的 cover 是【写死的字符串】（'/images/phone-03.svg'），
+#   migration 的 UPDATE 又带「cover 为空才写」的守卫 —— 所以遍历顺序一变，
+#   库里不会跟着变，它只会指向另一件商品的图。
+#   表现是：页面正常、控制台无报错、图也确实加载出来了，只是画的是别人。
+#   除非你记得每件商品原本长什么样，否则看不出来。这是本项目里
+#   最难靠肉眼发现的一类错误，所以宁可用一张表把它换成一次明确的报错。
+#
+# ★ 批次 2 的 58 件现在【也在这张表里】了，但补进来的时机很关键：
+#   它们的编号是 08d 跑【之前】由本脚本算出来的，那时候补进来毫无意义 ——
+#   把「刚刚算出来的值」抄成「本应如此的期望值」，这个断言就只是在重复
+#   实现，什么都证明不了。
+#   所以顺序是：先跑 08d 把编号写进线上库 → 再拿线上库的 cover 和脚本算出的
+#   映射【逐条 diff】（58/58 一致）→ 确认无误之后才抄进这张表。
+#   这时候表里的值来自【库】，不来自【脚本】，它才真的能报警。
+#   下面 58 行因此是核对过的结果，不是计算结果。
+# ===========================================================================
+FROZEN_SLUGS = {
+    # ---- 批次 1（30 件），migration-08c 灌进去的 ----
+    "华为 Mate 70 Pro": "phone-01",
+    "荣耀 Magic7": "phone-02",
+    "小米平板 7": "tablet-01",
+    "索尼 WH-1000XM5 头戴式耳机": "headphones-01",
+    "Apple Watch Series 10 智能手表": "watch-01",
+    "大疆 Osmo Action 5 Pro 运动相机": "camera-01",
+    "MacBook Air 13 英寸 M4": "laptop-01",
+    "戴尔 U2723QE 27 英寸 4K 显示器": "monitor-01",
+    "罗技 K380 多设备无线键盘": "keyboard-01",
+    "惠普 LaserJet 无线激光打印机": "printer-01",
+    "金士顿 128G 金属 U 盘": "usb-01",
+    "格力 1.5 匹变频挂机空调": "ac-01",
+    "海尔 465L 十字对开门冰箱": "fridge-01",
+    "小天鹅 10 公斤滚筒洗衣机": "washer-01",
+    "小米空气净化器 4": "purifier-01",
+    "优衣库全棉圆领 T 恤": "tshirt-01",
+    "李宁䨻科技跑鞋": "shoe-01",
+    "李维斯 511 修身牛仔裤": "pants-01",
+    "新秀丽商务双肩背包": "bag-01",
+    "波司登中长款羽绒服": "jacket-01",
+    "三只松鼠每日坚果 750g": "pouch-01",
+    "良品铺子猪肉脯 200g": "snack_bag-01",
+    "乐事薯片家庭分享装": "snack_bag-02",
+    "伊利金典纯牛奶 250ml×12": "bottle-01",
+    "费列罗榛果威化巧克力 24 粒": "box-01",
+    "泰国天然乳胶枕": "pillow-01",
+    "水星家纺蚕丝被": "quilt-01",
+    "全棉四件套 1.8 米床": "bedding-01",
+    "珊瑚绒加厚盖毯": "quilt-02",
+    "记忆棉床垫 1.8 米": "mattress-01",
+
+    # ---- 库里本来就有、只补了封面描述的 12 件 ----
+    # 前 8 件是 mall.sql 种子自带的，后 4 件是用户在管理端手输的。
+    # ★ 「iPhone duo」这类名字有大小写和空格上的随意性，是用户自己起的 ——
+    #   这张表按【名称】匹配，所以名字必须和库里一模一样。
+    "小米 15 Pro 手机": "phone-03",
+    "iPad Air 11 英寸": "tablet-02",
+    "联想 ThinkPad X1 Carbon": "laptop-02",
+    "罗技 MX Master 3S 鼠标": "mouse-01",
+    "戴森 V12 吸尘器": "vacuum-01",
+    "美的电饭煲 4L": "rice_cooker-01",
+    "优衣库轻型羽绒服": "jacket-02",
+    "iPhone duo": "phone-04",
+    "iPhone 18 pro 256G": "phone-05",
+    "联想拯救者Y9000P": "laptop-03",
+    "卫龙辣条": "snack_bag-03",
+    "床单": "bedding-02",
+
+    # ---- 批次 2（58 件），migration-08d 灌进去的 ----
+    # 顺序和 PRODUCTS_BATCH_2 的分类顺序一致：手机数码 → 电脑办公 → 家用电器
+    # → 服饰鞋包 → 休闲零食 → 床上用品。
+    # ★ 每一行都是拿线上库的 product.cover 反查出来的（见上面那段说明）。
+    "三星 Galaxy S25 Ultra": "phone-06",
+    "OPPO Find X8 Pro": "phone-07",
+    "vivo X200 Pro": "phone-08",
+    "红米 K80 Pro": "phone-09",
+    "一加 13": "phone-10",
+    "华为 MatePad Pro 13.2": "tablet-03",
+    "小米手环 9 Pro": "watch-02",
+    "索尼 WF-1000XM5 真无线降噪耳机": "headphones-02",
+    "Bose QuietComfort 45 头戴式耳机": "headphones-03",
+    "佳能 EOS R50 微单套机": "camera-02",
+    "联想小新 Pro 16 2025": "laptop-04",
+    "华硕 ROG 魔霸新锐": "laptop-05",
+    "华为 MateBook 14": "laptop-06",
+    "宏碁 掠夺者 擎 Neo": "laptop-07",
+    "明基 GW2790 27 英寸护眼显示器": "monitor-02",
+    "AOC 24G2 24 英寸电竞显示器": "monitor-03",
+    "雷蛇 黑寡妇蜘蛛 V4 键盘": "keyboard-02",
+    "罗技 G502 Hero 游戏鼠标": "mouse-02",
+    "微软 Surface 精准鼠标": "mouse-03",
+    "闪迪 1TB 移动固态硬盘": "usb-02",
+    "爱普生 L3253 墨仓式一体机": "printer-02",
+    "得力 5 级保密碎纸机": "box-02",
+    "美的 1.5 匹酷省电空调": "ac-02",
+    "松下 506L 多门冰箱": "fridge-02",
+    "西门子 10 公斤洗烘一体机": "washer-02",
+    "九阳 破壁料理机": "blender-01",
+    "苏泊尔 IH 电饭煲 5L": "rice_cooker-02",
+    "莱克 立式吸尘器": "vacuum-02",
+    "飞利浦 声波电动牙刷": "toothbrush-01",
+    "米家 空气净化器 Ultra": "purifier-02",
+    "格兰仕 微波炉 20L": "box-03",
+    "摩飞 便携榨汁杯": "blender-02",
+    "追觅 扫地机器人": "vacuum-03",
+    "海尔 60 升电热水器": "box-04",
+    "优衣库 摇粒绒外套": "jacket-03",
+    "耐克 Air Force 1 板鞋": "shoe-02",
+    "阿迪达斯 三条纹运动裤": "pants-02",
+    "安踏 冠军跑鞋": "shoe-03",
+    "太平鸟 男士休闲夹克": "jacket-04",
+    "海澜之家 纯棉长袖衬衫": "tshirt-02",
+    "波司登 轻薄羽绒马甲": "jacket-05",
+    "李宁 运动双肩包": "bag-02",
+    "迪卡侬 20L 徒步背包": "bag-03",
+    "优衣库 高腰直筒牛仔裤": "pants-03",
+    "卫龙 魔芋爽 20 包": "snack_bag-04",
+    "洽洽 每日坚果 30 包": "pouch-02",
+    "旺旺 雪饼整箱": "snack_bag-05",
+    "奥利奥 夹心饼干分享装": "box-05",
+    "农夫山泉 天然水 550ml×24": "bottle-02",
+    "蒙牛 特仑苏纯牛奶 250ml×16": "bottle-03",
+    "好想你 红枣夹核桃 500g": "pouch-03",
+    "富安娜 全棉四件套 1.5 米": "bedding-03",
+    "罗莱 抗菌纤维被": "quilt-03",
+    "网易严选 乳胶记忆枕": "pillow-02",
+    "恒源祥 羊毛被": "quilt-04",
+    "水星 全棉床笠 1.8 米": "bedding-04",
+    "梦洁 记忆棉护颈枕": "pillow-03",
+    "南极人 加厚床垫 1.5 米": "mattress-02",
+}
+
+
 def build_catalog():
     """
-    把 PRODUCTS 和 EXISTING 合成一张统一的目录表，给每件商品分配图片文件名。
+    把三份清单合成一张统一的目录表，给每件商品分配图片文件名。
 
     文件名 = {图形名}-{该图形出现序号:02d}，例如 phone-01、phone-02。
-    序号按商品在文件里出现的顺序累加 —— 所以【调整商品顺序会改变文件名】。
-    这不影响正确性（SQL 是同一次生成的），但意味着这个脚本不该反复跑
-    去「改」已有商品的封面（那边的 UPDATE 带 `cover 为空才写` 的守卫，
-    所以重复跑也不会覆盖）。
+    序号按【下面三个循环的顺序】累加 —— 所以调整商品顺序会改变文件名。
+
+    ★★ 顺序是 BATCH_1 → EXISTING → BATCH_2，和它们在文件里的先后一致。
+       这个顺序不能动，理由见第五节开头那段：BATCH_1 和 EXISTING 的编号
+       已经写进线上库的 cover 了。末尾那条 FROZEN_SLUGS 断言就是守它的。
+
+    ★ 返回的每一项都带 batch 字段（"08c" / "08d" / None）——
+       write_migration() 靠它决定「这件商品归哪个迁移脚本」，
+       write_mall_seed() 靠 is_new 决定「这行的分类怎么写」
+       （老的走 EXISTING_CATEGORY 表，新的自带 category）。
+       ⚠️ 里程碑 15 阶段 6 之前它还用 is_new 决定「要不要写价格和库存」——
+          那个用途随着 product 表上那两列一起没有了。
+          **price / stock 在这里的归宿现在只有一处：product_sku 的种子段。**
     """
     counters = {}
     catalog = []
-    for cat, name, price, stock, art, desc in PRODUCTS:
+
+    def add(cat, name, price, stock, art, desc, batch):
         counters[art] = counters.get(art, 0) + 1
         catalog.append(dict(
             category=cat, name=name, price=price, stock=stock,
             art=art, desc=desc, cover=f"/images/{slugify(art, counters[art])}.svg",
-            is_new=True, variant=counters[art] - 1,
+            is_new=cat is not None, batch=batch, variant=counters[art] - 1,
         ))
+
+    for cat, name, price, stock, art, desc in PRODUCTS_BATCH_1:
+        add(cat, name, price, stock, art, desc, "08c")
     for name, art, desc in EXISTING:
-        counters[art] = counters.get(art, 0) + 1
-        catalog.append(dict(
-            category=None, name=name, price=None, stock=None,
-            art=art, desc=desc, cover=f"/images/{slugify(art, counters[art])}.svg",
-            is_new=False, variant=counters[art] - 1,
-        ))
+        add(None, name, None, None, art, desc, None)
+    for cat, name, price, stock, art, desc in PRODUCTS_BATCH_2:
+        add(cat, name, price, stock, art, desc, "08d")
+
+    # ---- 自检 1：编号不能重复（同一个文件名不能发给两件商品）----
+    seen = {}
+    for item in catalog:
+        if item["cover"] in seen:
+            raise SystemExit(
+                f"✗ {item['cover']} 同时发给了「{seen[item['cover']]}」和"
+                f"「{item['name']}」—— 后一幅图会覆盖前一幅。"
+            )
+        seen[item["cover"]] = item["name"]
+
+    # ---- 自检 2：编号不能漂移（见 FROZEN_SLUGS 那段）----
+    #
+    # ★ 只有【漂移】才是错误：冻结表记着 A 商品是 phone-03，现在跑成了 phone-06。
+    #   「不在冻结表里」不是错误 —— 那些是本批新分配编号的商品，
+    #   此刻还没有任何东西依赖它们的编号。等这批迁移跑过之后，
+    #   它们也会写进线上库，那时候再补进冻结表才有意义。
+    drifted, unlisted = [], []
+    for item in catalog:
+        want = FROZEN_SLUGS.get(item["name"])
+        got = item["cover"].rsplit("/", 1)[-1][:-4]
+        if want is None:
+            unlisted.append(f"{item['name']}({got})")
+        elif want != got:
+            drifted.append(f"  {item['name']}：冻结表写的是 {want}，实际跑成了 {got}")
+    if drifted:
+        raise SystemExit(
+            "✗ 图片编号和冻结表对不上。\n"
+            "  库里的 cover 是写死的字符串，不会跟着编号一起改 ——\n"
+            "  继续下去会让某些商品的封面指向【别人的图】，而且不报错。\n"
+            + "\n".join(drifted)
+            + "\n\n  如果确实是想改编号：确认过「线上库的 cover 会一起更新」之后，\n"
+              "  先把 FROZEN_SLUGS 改对，再跑这个脚本。"
+        )
+    if unlisted:
+        print(f"  · 另有 {len(unlisted)} 件是新分配编号的（不在冻结表里，正常）")
+        print(f"    跑完 migration-08d 之后，把它们的编号补进 FROZEN_SLUGS。")
+
     return catalog
+
+
+# 列定义的上限，抄自 mall.sql 的 CREATE TABLE product。
+# ★ 这两个数字【必须和建表语句一致】。写大了，超长的值会在 INSERT 时
+#   让【整条多行 INSERT 一起失败】（严格模式下）——
+#   而 58 件商品是一条 INSERT 语句，一行有问题全批都进不去。
+NAME_MAX = 100      # name varchar(100)
+DESC_MAX = 500      # description varchar(500)
+PRICE_RE = re.compile(r"^\d+\.\d{2}$")
+
+
+def validate_catalog(catalog):
+    """
+    在写任何文件之前，先把整张目录表查一遍。
+
+    ★ 为什么要在这里拦，而不是等 SQL 报错：
+      58 件商品是【一条】多行 INSERT。其中任何一行超长，MySQL 严格模式下
+      会让整条语句失败 —— 报错信息指向的是整条语句，而不是那一行，
+      得手工二分才能定位。在这里拦，报错能直接点名是哪件商品的哪个字段。
+    """
+    problems = []
+
+    for item in catalog:
+        n = item["name"]
+        where = f"「{n}」"
+
+        if not n or len(n) > NAME_MAX:
+            problems.append(f"{where} 名字为空或超过 {NAME_MAX} 字符（实际 {len(n)}）")
+        if n != n.strip():
+            # 库里 08c 的补图是 TRIM(name) 匹配的，但 INSERT 存的是原样。
+            # 名字首尾带空格会让「同一件商品」在两个脚本里对不上。
+            problems.append(f"{where} 名字首尾有空格 —— 会让按名称匹配的语句对不上")
+
+        if item["is_new"]:
+            if not PRICE_RE.match(item["price"]):
+                problems.append(f"{where} 价格 {item['price']!r} 不是 '数字.两位小数' 的格式")
+            if not isinstance(item["stock"], int) or item["stock"] < 0:
+                problems.append(f"{where} 库存 {item['stock']!r} 不是非负整数")
+            if item["category"] not in CAT_VAR:
+                problems.append(f"{where} 分类 {item['category']!r} 不在 CAT_VAR 里")
+
+        if item["art"] not in ART:
+            problems.append(f"{where} 图形 {item['art']!r} 不在 ART 里")
+
+        text = "\n".join(item["desc"])
+        if len(text) > DESC_MAX:
+            problems.append(
+                f"{where} 描述拼起来 {len(text)} 字符，超过 description 的 {DESC_MAX} 上限"
+            )
+        if len(item["desc"]) != 4:
+            # 不是硬性要求，但 4 行是这个项目的排版约定，少一行多半是漏写
+            problems.append(f"{where} 描述有 {len(item['desc'])} 行，约定是 4 行")
+
+    # 名称全局唯一：重名会让 08c 那两条 TRIM(name) 的 UPDATE 同时命中两行，
+    # 也会让「按名字找商品」这件事失去意义。
+    names = [i["name"] for i in catalog]
+    dup = sorted({x for x in names if names.count(x) > 1})
+    if dup:
+        problems.append(f"重名商品：{dup}")
+
+    if problems:
+        raise SystemExit(
+            "✗ 商品数据有问题，没有生成任何文件：\n"
+            + "\n".join(f"  · {p}" for p in problems)
+        )
+
+
+def check_batch_in_db(names):
+    """
+    跑之前先查一遍线上库有没有同名的商品，按命中数【分三种情况】说话。
+
+    ★ 为什么是三种，而不是「有命中就报错」：
+      这个检查最早的版本把「库里已有同名」一律当致命错误。那在 08d 跑之前
+      是对的（那时库里不该有它们）。但 08d 一跑完，同样的检查就变成了
+      「生成器从此再也跑不了」—— 而生成器的本职是重出图片，
+      那件事和迁移跑没跑过【毫无关系】，不能因为库已经是最新就把工具锁死。
+      ★ 一句能记住的话：**一个只在「第一次」成立的前置条件，
+        跑完第一次之后就会变成故障。** 它不是写错了，是生命周期结束了。
+
+      所以现在区分：
+        命中 0 件   → 全新批次，可以插入
+        命中全部    → 这就是 08d 已经应用之后的稳定态，正常，继续跑
+        命中一部分  → ★ 这才是真问题（跑了一半 / 有人手工加过几件），报错
+
+    ★ 检查本身仍然要留着，因为它拦的是「migration-08d 被跑了两次」：
+      product 表【没有】name 唯一索引，重复执行不会报错，
+      只会静默地多出 58 行同名商品 —— SQL 层面拦不住，只能在这里提醒。
+
+    ⚠️ 查不到数据库时【不报错】，只跳过 —— 因为生成图片和 SQL 这件事
+       本来就不需要连数据库（换台机器也应该能跑）。
+    """
+    if not names:
+        return
+    sql = (
+        "SELECT TRIM(name) FROM product WHERE TRIM(name) IN ("
+        + ",".join(sql_str(n) for n in names) + ");"
+    )
+    r = subprocess.run(
+        [MYSQL, "-u", "root", "-p123456", "--default-character-set=utf8mb4",
+         "-N", "-B", "-e", sql, "mall"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        print("  （查不到线上库，跳过重名检查）")
+        return
+    raw = r.stdout.decode("utf-8", "replace")
+    hits = [ln.rstrip("\r") for ln in raw.split("\n") if ln.strip()]
+
+    if not hits:
+        print(f"  ✓ 这 {len(names)} 件在库里都不存在，可以插入")
+        return
+
+    if len(hits) == len(names):
+        print(f"  · 这 {len(names)} 件已经在库里了 —— 说明本批迁移已经跑过。")
+        print("    这是正常状态，不影响重新生成图片；但别再跑一次那个迁移，")
+        print("    会插出同名商品（product 表没有 name 唯一索引，不会拦你）。")
+        return
+
+    raise SystemExit(
+        f"✗ 这批 {len(names)} 件里只有 {len(hits)} 件在库里，"
+        f"另外 {len(names) - len(hits)} 件不在：\n"
+        + "\n".join(f"  · 已在库：{h}" for h in hits)
+        + "\n\n  一半在、一半不在，只有两种可能：迁移跑了一半就中断了，"
+          "或者有人手工加过其中几件。\n"
+          "  两种都不该直接往下跑 —— 先查清楚缺的那几件是什么情况。"
+    )
 
 
 def write_banners():
@@ -1169,52 +1887,24 @@ def sql_str(text):
     return "'" + text.replace("\\", "\\\\").replace("'", "''").replace("\n", "\\n") + "'"
 
 
-def write_migration(catalog):
-    new_items = [i for i in catalog if i["is_new"]]
-    old_items = [i for i in catalog if not i["is_new"]]
+def write_migration(filename, new_items, old_items, header_lines):
+    """
+    写一个批次的增量迁移脚本。
 
+    ★ header_lines 由调用方传进来，而不是「写死在 .sql 里再手工维护」——
+      因为这个函数会重写文件，手写在文件里的说明下次生成就没了。
+      和商品数据同一个道理：文字和数据都得由脚本产出，否则两边会分叉。
+
+    ★★ 已经【跑过】的批次不再重写。migration-08c 就是这种情况 ——
+       它是历史记录（「当时的库被改成了什么样」的证据），
+       不是「现在的库应该长什么样」的声明。生成器只写还没跑过的批次，
+       见 main() 里的 MIGRATIONS。
+    """
     lines = []
     a = lines.append
     a("-- " + "=" * 74)
-    a(f"--  迁移脚本 08c：补齐用户端商品"
-      f"（新增 {len(new_items)} 件 + 现有 {len(old_items)} 件补图补描述）")
-    a("--")
-    a("--  ⚠️ 只跑一次。这是增量迁移，不是初始化脚本。")
-    a("--  这个文件由 sql/gen-shop-assets.py 生成，不要手工编辑 ——")
-    a("--  改了下次重新生成就没了。要改商品，改那个脚本里的 PRODUCTS / EXISTING。")
-    a("--")
-    a("--  【为什么叫 08c 而不是 09？】")
-    a("--  命名跟着里程碑走（migration-08-order.sql 是里程碑 8 的）。")
-    a("--  这个任务是里程碑 8 之后的收尾补齐，09 要留给「模拟支付」。")
-    a("--")
-    a("--  【这个脚本做了什么】")
-    a(f"--    1. 新增 {len(new_items)} 件商品（价格、库存、封面、描述）")
-    a(f"--    2. 给现有 {len(old_items)} 件商品补封面和描述")
-    a("--")
-    a("--  【为什么补描述是安全的】")
-    a("--  跑之前查过：现有 12 件的 description 长度分别是")
-    a("--  11/10/10/10/6/7/12/9/0/0/0/0 个字符 —— 全是占位级别的碎片，")
-    a("--  没有一条是你认真写过的。所以用 CHAR_LENGTH < 20 作为门槛，")
-    a("--  【不会覆盖任何一条有实质内容的描述】。")
-    a("--")
-    a("--  【两处「不覆盖」的防线，缺一不可】")
-    a("--  UPDATE 的 WHERE 里带着 `cover IS NULL OR cover = ''`，")
-    a("--  让「不覆盖非空值」成为【数据库层面的约束】，而不是靠脚本自觉。")
-    a("--  代价是：重复跑这个脚本是安全的，但也不会更新已填过的值。")
-    a("--")
-    a("--  【为什么分类 id 用变量取，不写死】")
-    a("--  category 的 AUTO_INCREMENT 已经到 62、product 到 75 ——")
-    a("--  5~8 和 11~61 这些 id 都被测试烧掉了。写死 id 的脚本")
-    a("--  换一台机器（或者换一次测试）就插到错误的分类里去了。")
-    a("--  用 SET @var = (SELECT ...) 取 id，取不到时变量是 NULL，")
-    a("--  INSERT 会直接报「Column 'category_id' cannot be null」而中断 ——")
-    a("--  这是好事：迁移脚本报错比静默插错地方安全得多。")
-    a("--")
-    a("--  执行方式：")
-    a('--    "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe" -u root -p123456 \\')
-    a("--      --default-character-set=utf8mb4 mall < migration-08c-shop-catalog.sql")
-    a("--")
-    a("--  执行后验证：脚本末尾自带几个 SELECT，会打印商品总数和封面覆盖情况。")
+    for line in header_lines:
+        a(line)
     a("-- " + "=" * 74)
     a("")
     a("SET NAMES utf8mb4;")
@@ -1252,21 +1942,22 @@ def write_migration(catalog):
     a(",\n".join(rows) + ";")
     a("")
 
-    # ---- 3. 现有商品补图补描述 ----
-    a("-- ---------------------------------------------------------------------------")
-    a(f"-- 3. 现有 {len(old_items)} 件商品：补封面和描述")
-    a("--")
-    a("--    ★ 两条 UPDATE 都带「原值为空/过短才写」的守卫。")
-    a("--    ★ 按 TRIM(name) 匹配而不是按 id。")
-    a("-- ---------------------------------------------------------------------------")
-    for i in old_items:
-        nm = sql_str(i["name"].strip())
-        a(f"-- {i['name']}")
-        a(f"UPDATE product SET cover = {sql_str(i['cover'])}")
-        a(f" WHERE TRIM(name) = {nm} AND (cover IS NULL OR cover = '');")
-        a(f"UPDATE product SET description = {sql_str(chr(10).join(i['desc']))}")
-        a(f" WHERE TRIM(name) = {nm} AND (description IS NULL OR CHAR_LENGTH(description) < 20);")
-        a("")
+    # ---- 3. 现有商品补图补描述（只有 08c 那一批有）----
+    if old_items:
+        a("-- ---------------------------------------------------------------------------")
+        a(f"-- 3. 现有 {len(old_items)} 件商品：补封面和描述")
+        a("--")
+        a("--    ★ 两条 UPDATE 都带「原值为空/过短才写」的守卫。")
+        a("--    ★ 按 TRIM(name) 匹配而不是按 id。")
+        a("-- ---------------------------------------------------------------------------")
+        for i in old_items:
+            nm = sql_str(i["name"].strip())
+            a(f"-- {i['name']}")
+            a(f"UPDATE product SET cover = {sql_str(i['cover'])}")
+            a(f" WHERE TRIM(name) = {nm} AND (cover IS NULL OR cover = '');")
+            a(f"UPDATE product SET description = {sql_str(chr(10).join(i['desc']))}")
+            a(f" WHERE TRIM(name) = {nm} AND (description IS NULL OR CHAR_LENGTH(description) < 20);")
+            a("")
 
     # ---- 4. 验证 ----
     a("-- ---------------------------------------------------------------------------")
@@ -1274,15 +1965,21 @@ def write_migration(catalog):
     a("--")
     a("--    ⚠️ 这几个是【整个库】的统计，不是本次改动的统计 ——")
     a("--       真正要确认的是「没有封面的商品数」必须是 0。")
+    a("--")
+    a("--    ★ 最后那条「重名商品」必须为空。product 表【没有】name 唯一索引，")
+    a("--      所以这个脚本重复执行不会报错，只会静默地插出同名商品 ——")
+    a("--      这三条 SELECT 是唯一能发现那件事的地方。")
     a("-- ---------------------------------------------------------------------------")
     a("SELECT COUNT(*) AS '商品总数' FROM product;")
     a("SELECT COUNT(*) AS '有封面的商品数' FROM product WHERE cover IS NOT NULL AND cover <> '';")
     a("SELECT COUNT(*) AS '★ 没有封面的商品数（应为 0）'")
     a("  FROM product WHERE cover IS NULL OR cover = '';")
+    a("SELECT TRIM(name) AS '★ 重名商品（应为空）', COUNT(*) AS '件数'")
+    a("  FROM product GROUP BY TRIM(name) HAVING COUNT(*) > 1;")
     a("SELECT LEFT(cover, 36) AS '封面路径示例', COUNT(*) AS '件数'")
     a("  FROM product GROUP BY LEFT(cover, 36) ORDER BY 件数 DESC LIMIT 5;")
 
-    path = os.path.join(HERE, "migration-08c-shop-catalog.sql")
+    path = os.path.join(HERE, filename)
     with open(path, "w", encoding="utf-8", newline="\n") as fp:
         fp.write("\n".join(lines) + "\n")
     return path
@@ -1318,12 +2015,29 @@ def write_mall_seed(catalog):
         for nm, st in MALL_SEED_STOCK_OVERRIDE.items():
             a(f"-- ⚠️ '{nm}' 的库存是故意写成 {st} 的（不是线上值 {OLD_PRICE_STOCK[nm][1]}）："
               f"这是全新装库时用来手动验「已售罄」的夹具。见 MALL_SEED_STOCK_OVERRIDE。")
-    a("INSERT INTO product (category_id, name, price, stock, cover, description, status) VALUES")
+    # ★★ 里程碑 15 阶段 6：商品行里【不再有 price / stock】。
+    #   价格和库存全都由下面那段 product_sku 的种子承载
+    #   （值还是从同一批变量来，见下面的 sku_rows）。
+    #   ⚠️ 别把这两列加回来「方便读」：product 表上已经没有它们了，
+    #      加了这段就在 mall.sql 里变成一句跑不通的 SQL。
+    a("INSERT INTO product (category_id, name, cover, description, status) VALUES")
     rows = []
-    # ★ 现有商品排在【前面】，新增的 30 件跟在后面。
+    # SKU 段的行，和上面的商品行【在同一次遍历里收】——
+    # 价格和库存必须来自同一批变量，抄第二遍就会分叉。
+    # ★ 阶段 6 之后这批变量【只有 SKU 段在用】了，但「同一次遍历里收」
+    #   这条规矩不能松：商品行虽然不写价格了，SKU 行仍然要靠
+    #   和它同一个 i 取到价格和库存 —— 分两次遍历去对名字，
+    #   就是「按名字匹配」那种静默挂错商品的老问题。
+    sku_rows = []
+    # ★ 现有商品排在【前面】，两批新增的跟在后面（批次 1 在前、批次 2 在后）。
     #   顺序不影响执行结果，纯粹为了人读：mall.sql 原来那段就是这 7 件，
     #   把新商品接在尾巴上，diff 一眼能看出「加了什么」，
     #   而不是「整段都变了」。
+    #   ⚠️ 注意这里的顺序和 build_catalog() 的遍历顺序【不同】——
+    #      那边是 BATCH_1 → EXISTING → BATCH_2（为了让图片编号稳定），
+    #      这边是 EXISTING → BATCH_1 → BATCH_2（为了让 diff 好看）。
+    #      两者互不影响：图片编号在 build_catalog() 里就定死了，
+    #      这个函数只负责挑顺序写行。
     for i in old_items:
         cat = EXISTING_CATEGORY[i["name"]]
         price, stock = OLD_PRICE_STOCK[i["name"]]
@@ -1331,17 +2045,46 @@ def write_mall_seed(catalog):
         stock = MALL_SEED_STOCK_OVERRIDE.get(i["name"], stock)
         rows.append(
             f"  ((SELECT id FROM category WHERE name = {sql_str(cat)}), "
-            f"{sql_str(i['name'])}, {price}, "
-            f"{stock}, {sql_str(i['cover'])}, "
+            f"{sql_str(i['name'])}, "
+            f"{sql_str(i['cover'])}, "
             f"{sql_str(chr(10).join(i['desc']))}, 1)"
         )
+        sku_rows.append((i["name"], price, stock))
     for i in new_items:
         rows.append(
             f"  ((SELECT id FROM category WHERE name = {sql_str(i['category'])}), "
-            f"{sql_str(i['name'])}, {i['price']}, {i['stock']}, "
+            f"{sql_str(i['name'])}, "
             f"{sql_str(i['cover'])}, {sql_str(chr(10).join(i['desc']))}, 1)"
         )
+        sku_rows.append((i["name"], i["price"], i["stock"]))
     a(",\n".join(rows) + ";")
+    a("")
+
+    # ★ 商品 SKU 段。每一件商品都至少一条 —— 没有规格的也有，
+    #   它的 spec_json 是 '[]'（默认 SKU）。**代码里只有一条路径**，
+    #   不需要到处判断「这件商品有没有规格」。
+    #
+    # ★ 为什么 product_id 用 (SELECT id FROM product WHERE name = ...) 而不是写死数字：
+    #   商品行的插入顺序就是 id 的分配顺序（本文件上面那段 ★ 注释会调整顺序），
+    #   写死数字的话，哪天有人挪动了一行，SKU 就会【静默地】挂到另一件商品上 ——
+    #   价格和库存全对，只是挂在错的商品下面，页面上看不出来。
+    #   按名字找没有这个问题：找不到会当场报「子查询返回了 0 行」。
+    #   而且这和上面 category 用的 (SELECT id FROM category WHERE name = ...)
+    #   是同一个写法，读的人不用重新理解一遍。
+    #
+    # ★ 为什么价格和库存要在这里【再写一遍字面量】，不写成
+    #   `INSERT INTO product_sku ... SELECT id, '[]', price, stock FROM product`：
+    #   因为 migration-13b 之后 product 上就没有 price/stock 这两列了
+    #   （它们是「价格与库存的唯一真源是 product_sku」这句话要删掉的东西）。
+    #   而 mall.sql 必须在那之后照样能一键建库 ——
+    #   所以这段只能自己带值，不能引用那两列。
+    #   两条语句的值来自同一个 sku_rows，所以不会对不上。
+    a("-- 商品 SKU（每一件商品都至少一条；'[]' = 默认 SKU，也就是「这件商品没有规格」）")
+    a("INSERT INTO product_sku (product_id, spec_json, price, stock) VALUES")
+    a(",\n".join(
+        f"  ((SELECT id FROM product WHERE name = {sql_str(nm)}), '[]', {price}, {stock})"
+        for nm, price, stock in sku_rows
+    ) + ";")
     a("")
 
     path = os.path.join(HERE, "generated-mall-seed.sql")
@@ -1456,13 +2199,57 @@ def show_current():
             print("      —— 脚本里的名字和库里的对不上，这条的图和描述【不会生效】。")
 
 
+# ---------------------------------------------------------------------------
+# 还没跑过的批次 —— 只有这些会被 write_migration() 重写
+#
+# ★★ 现在是【空的】。08c 和 08d 都已经跑过，两份都冻结了。
+#
+# ★ 跑过的批次【故意不在这里】。它是历史记录，生成器不再改写它。
+#   它头部那句「由本脚本生成」要理解成「它曾经由本脚本生成，现在已经冻结」。
+#
+# ★★ 为什么冻结之后要把它的头部说明也从这里删掉，而不是留着「备查」：
+#    那段头部是逐字写进文件的（见 write_migration()）。文件冻结之后，
+#    这段字面量再也不会被写出去 —— 它就从「生成源」变成了「文件的第二份副本」，
+#    而第二份副本唯一确定的下场是和第一份分岔。这个项目对这件事的态度
+#    写在 FileTransferService.requireUploadedImages 的搬迁理由里，是同一个道理。
+#    要看那段说明，看 migration-08d-shop-catalog-2.sql 本身。
+#
+# ★ 要改商品数据，改本文件的 PRODUCTS_BATCH_1 / EXISTING / PRODUCTS_BATCH_2 ——
+#   但现在这三份全都是【只读】的：改任何一个都会让线上库和全新安装的库分叉
+#   （已跑过的迁移不会重跑，mall.sql 却会跟着变）。真要加商品，是开一个新批次，
+#   照 PRODUCTS_BATCH_2 的样子加一份 PRODUCTS_BATCH_3 + 一个新迁移。
+#
+# 每项：(文件名, 批次号, 商品变量名, 头部说明)
+# 头部说明逐字写进文件，所以它必须由脚本产出 —— 见 write_migration() 的注释。
+# ---------------------------------------------------------------------------
+NEW_MIGRATIONS = []
+
+# 已经跑过、因此不再重写的迁移。写在这里只是为了在跑生成器时【说出来】，
+# 让「这次没有重写哪个文件」是一句明示，而不是靠沉默去推断。
+FROZEN_MIGRATIONS = [
+    "migration-08c-shop-catalog.sql",
+    "migration-08d-shop-catalog-2.sql",
+]
+
+
 def main():
     catalog = build_catalog()
+    validate_catalog(catalog)
+
     print("=" * 68)
     print("生成用户端商品资源")
     print("=" * 68)
-    print(f"  新增商品 {sum(1 for i in catalog if i['is_new'])} 件，"
-          f"现有商品 {sum(1 for i in catalog if not i['is_new'])} 件")
+    for batch in ("08c", "08d"):
+        n = sum(1 for i in catalog if i["batch"] == batch)
+        note = "已跑过，不再重写" if batch == "08c" else "本次要跑"
+        print(f"  批次 {batch} 商品 {n:>3} 件（{note}）")
+    print(f"  现有商品（只补封面描述）"
+          f"{sum(1 for i in catalog if i['batch'] is None):>3} 件")
+    print(f"  合计 {len(catalog)} 件")
+
+    print()
+    print("  跑之前先查一遍线上库有没有同名商品：")
+    check_batch_in_db([i["name"] for i in catalog if i["batch"] == "08d"])
 
     print()
     show_current()
@@ -1473,19 +2260,32 @@ def main():
     b = write_banners()
     print(f"  ✓ 生成 {b} 张首页横幅")
 
-    mig = write_migration(catalog)
-    print(f"  ✓ 迁移脚本 → {mig}")
+    for filename, batch, var_name, header in NEW_MIGRATIONS:
+        items = [i for i in catalog if i["batch"] == batch]
+        mig = write_migration(filename, items, [], header)
+        print(f"  ✓ 迁移脚本（批次 {batch}，{len(items)} 件）→ {mig}")
+    for frozen in FROZEN_MIGRATIONS:
+        print(f"  · {frozen} 已冻结，没有重写")
 
     seed = write_mall_seed(catalog)
     print(f"  ✓ mall.sql 的 seed 片段 → {seed}")
 
     print()
-    print("  接下来：")
-    print("    1. mysqldump -u root -p123456 mall > sql/backup-mall-<时间戳>.sql")
-    print('    2. "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe" '
-          "-u root -p123456 \\")
-    print("         --default-character-set=utf8mb4 mall < sql/migration-08c-shop-catalog.sql")
-    print("    3. 把 generated-mall-seed.sql 的内容替换进 mall.sql 的 seed 段")
+    if NEW_MIGRATIONS:
+        print("  接下来：")
+        print("    1. mysqldump -u root -p123456 mall > sql/backup-mall-<时间戳>.sql")
+        print('    2. "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe" '
+              "-u root -p123456 \\")
+        print(f"         --default-character-set=utf8mb4 mall < "
+              f"sql/{NEW_MIGRATIONS[0][0]}")
+        print("    3. /d/python/python.exe sql/sync-mall-seed.py   "
+              "（把 seed 同步进 mall.sql）")
+        print("    4. 重建 mall-shop/dist（新图不在旧 dist 里，会全部 404）")
+    else:
+        # 没有新批次时，别再打印「接下来跑迁移」——那四步在一个空批次上
+        # 全是无意义的，而且第 2 步会让人去重跑一个已经跑过的迁移。
+        print("  没有待跑的新批次（所有迁移都已冻结），本次只重新生成了图片。")
+        print("  图片是幂等的：内容没改过的话，上面那些 .svg 一个字节都没变。")
 
 
 if __name__ == "__main__":

@@ -277,21 +277,55 @@ onMounted(() => {
 
         <el-table-column prop="categoryName" label="分类" width="110" align="center" />
 
-        <el-table-column prop="price" label="价格" width="110" align="right">
+        <!--
+          价格（里程碑 15 改造）。
+
+          ★ 数据源从 row.price 换成了 row.minPrice ——
+            价格不再挂在这件商品上，而是挂在每一行 SKU 上，
+            列表显示的是【起售价】= MIN(sku.price)，由后端 join 出来。
+
+          ★ 多规格时跟一个「起」字。不跟的话会有一个安静的误导：
+            运营看到「¥4999」，以为这就是售价，而它其实是 6 个规格里最便宜那个。
+
+          ⚠️ 不能写成 row.price —— 阶段 2~5 期间后端还有一个同名的字段
+            （派生汇总，回滚预案），它会取到一个和这里【不同】的数字，
+            而且两个都不报错。这是本轮最容易被后人改回去的一处。
+          ★ 阶段 6 之后 row.price 已经彻底不存在了（列都删了），
+            所以写错会当场渲染成一片空白 —— 从「静默的错」变成了
+            「一眼看得见的错」。**这就是删列值不值得做的判据之一。**
+        -->
+        <el-table-column prop="minPrice" label="价格" width="130" align="right">
           <!--
             用插槽自定义单元格显示。 #default="{ row }" 解构出当前行的数据。
             这种写法可以在单元格里做任意格式化，比 prop 直接显示灵活得多
           -->
           <template #default="{ row }">
-            <span class="price">¥{{ Number(row.price).toFixed(2) }}</span>
+            <span class="price">
+              ¥{{ Number(row.minPrice).toFixed(2) }}<i v-if="row.skuCount > 1" class="from">起</i>
+            </span>
           </template>
         </el-table-column>
 
-        <el-table-column prop="stock" label="库存" width="90" align="center">
+        <!--
+          库存（里程碑 15 改造）。
+
+          ★ 数据源从 row.stock 换成了 row.totalStock —— SUM(sku.stock)，
+            而且后端对它做了 COALESCE(..., 0)（skuCount 是 COUNT(*)，
+            所以它天然是 0 而不是 null）。
+
+          ⚠️ 这里显示的是【所有规格加起来】的件数。它作为「大概还有没有货」
+            的信号是够用的，但它【不是】任何一个规格的真实库存 ——
+            4 个规格各 10 件显示 40，而用户其实一个规格最多只能买 10 件。
+            用户端必须按所选规格显示库存，不能拿这个数（见 ProductDetail.vue）。
+        -->
+        <el-table-column prop="totalStock" label="库存" width="110" align="center">
           <template #default="{ row }">
-            <!-- 库存为 0 时标红，让运营一眼看到需要补货的商品 -->
-            <el-tag v-if="row.stock === 0" type="danger" size="small">缺货</el-tag>
-            <span v-else>{{ row.stock }}</span>
+            <!-- 总库存为 0 时标红，让运营一眼看到需要补货的商品 -->
+            <el-tag v-if="row.totalStock === 0" type="danger" size="small">缺货</el-tag>
+            <span v-else>
+              {{ row.totalStock }}
+              <i v-if="row.skuCount > 1" class="from">{{ row.skuCount }} 规格</i>
+            </span>
           </template>
         </el-table-column>
 
@@ -368,6 +402,19 @@ onMounted(() => {
 .price {
   color: #f56c6c;
   font-weight: 600;
+}
+
+/* 「起」和「N 规格」这两个小尾巴（里程碑 15）。
+   ★ 用 <i> 而不是 <span> 是为了【不被 price 的 font-weight: 600 继承】——
+     i 默认是斜体，这里显式 normal 覆盖掉；同时字号调小、颜色变灰，
+     让它是价格旁边的注释而不是价格的一部分。
+   ⚠️ 不改成 <b> 之类的：那样看起来像「起」也是金额的一部分。 */
+.from {
+  font-style: normal;
+  font-weight: 400;
+  font-size: 11px;
+  color: #909399;
+  margin-left: 2px;
 }
 
 /* ---------------- 里程碑 11：封面缩略图 ---------------- */

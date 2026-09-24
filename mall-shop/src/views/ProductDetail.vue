@@ -8,6 +8,7 @@ import ProductImage from '@/components/ProductImage.vue'
 import { useCartStore } from '@/stores/cart'
 import { useUserStore } from '@/stores/user'
 import { MAX_QUANTITY_PER_ITEM } from '@/utils/constants'
+import { formatAmount } from '@/utils/format'
 
 /**
  * 商品详情页。
@@ -44,8 +45,15 @@ const notFound = ref(false)
 /** 网络 / 服务端出错 */
 const loadFailed = ref(false)
 
-/** 库存为 0 时按钮要变灰 —— 但后端下单时【仍然会再查一次】 */
-const soldOut = computed(() => (product.value?.stock ?? 0) <= 0)
+// ★ 里程碑 15 阶段 3：「商品还有没有货」这个判断从这里【搬走了】。
+//
+//   它原来只是一句话：product.stock <= 0。
+//   有了 SKU 之后「有没有货」不再是商品级的属性 —— 它属于
+//   「用户当前选中的那个组合」，而商品级只剩一个跨规格的合计。
+//   所以判断搬到了下面的规格选择器那一块（见 blockReason）。
+//
+//   ⚠️ 这一段留着是为了让「soldOut 去哪了」有个答案：
+//      它没有消失，是【换了主语】。
 
 /**
  * 数量选择器。
@@ -109,10 +117,110 @@ function selectImage(index) {
   currentIndex.value = index
 }
 
+// ---------------------------------------------------------------------------
+// 规格选择器（★ 里程碑 15 阶段 3）
+// ---------------------------------------------------------------------------
+//
+// ★★ 这一页之前的每一个显示都建立在「一件商品有一个价格、一个库存」上。
+//    里程碑 15 之后那句话不再成立：product 表上已经没有价格也没有库存了，
+//    价格和库存住在 product_sku 的每一行上。
+//
+//    所以下面这些 computed 回答的问题从「这件商品多少钱、还有几件」
+//    变成了「用户【当前选中的那个组合】多少钱、还有几件」。
+//
+// ⚠️ 而「当前选中哪个组合」是一个【用户可能还没回答】的问题。
+//    页面必须能诚实地表达「还没有答案」，不能用一个个差不多的数
+//    （最低价、总库存）去充当答案 —— 那些数在界面上长得和真答案
+//    一模一样，而它们是错的。
+
+/** 规格定义，形如 {@code [{name:'颜色',values:['黑','白']}]}；无规格商品是空数组 */
+const specGroups = computed(() => product.value?.specSchema ?? [])
+
 /**
- * 数量选择器的上限：库存和单件上限<b>取小的那个</b>。
+ * 用户选了哪些值，形如 {@code { 颜色: '黑', 尺码: 'S' }}。
  *
- * <p>只绑库存是不够的。库存 500 的商品，用户能一路选到 200，
+ * ★ 换商品时【必须重置】（见 loadProduct），理由和 quantity / currentIndex 一样，
+ *   而且这一处的症状最像「系统坏了」：组件被复用之后，
+ *   A 商品选的「颜色: 黑」会跟着到 B 商品 —— 如果 B 恰好也有
+ *   「颜色」这一维、也有「黑」这个值，用户就会看到一个自己从没点过的
+ *   选项亮着，而下面的价格是那个组合的价格。
+ */
+const selected = ref({})
+
+/** 全部规格行。用 ?? [] 兜住字段缺失（后端配了 non_null，空数组正常返回、null 才整个消失） */
+const skuList = computed(() => product.value?.skus ?? [])
+
+/**
+ * 每一维是不是都选过了。
+ *
+ * <p>⚠️ <b>无规格商品恒为 {@code true}</b> —— 它没有任何维度，
+ * 而「空集合上的每一维都选过」为真。这不是一个需要特判的边界，
+ * 而是让下面的逻辑统一的那一块基石：无规格商品走的是和
+ * 「已经选好了规格」完全相同的那条路，所以价格、库存、数量上限
+ * <b>都不需要写第二份</b>。这就是「统一模型」在前端的落点。
+ */
+const selectedComplete = computed(() =>
+  specGroups.value.every((g) => selected.value[g.name]),
+)
+
+/**
+ * 当前选中的那一条 SKU；还没选全、或那个组合不存在时是 null。
+ *
+ * <h3>★★ 匹配用的是【逐项比较】，不是「把规格拼成一个字符串再比」</h3>
+ *
+ * <p>拼字符串的写法更短，而且看起来顺手就能对上：
+ * <pre>
+ *   const key = Object.entries(selected).sort().map(([k, v]) =&gt; `${k}=${v}`).join('&amp;')
+ *   const sku = skuList.value.find((s) =&gt; s.specKey === key)
+ * </pre>
+ * 后端的 {@code SpecJson.canonical()} 恰好就是这么拼的，所以让后者
+ * 也吐一个 {@code specKey} 出来，「两端约定好怎么拼」似乎就成立了。
+ *
+ * <p><b>但它有一个致命的坏处：点击顺序会变成结果的一部分。</b>
+ * 「先点颜色再点尺码」和「先点尺码再点颜色」拼出两个不同的字符串
+ * （除非每一处都记得 sort，而那只把问题推到了「谁忘了 sort」）。
+ *
+ * <p>⚠️ 而对不上时的症状是<b>完全静默</b>的：选择器永远匹配不到任何 SKU，
+ * 价格显示成起售价、按钮一直灰着、<b>没有任何报错、也没有任何请求发出</b>。
+ * 用户只会觉得「这个商品坏了」，而开发者看到的是一片正常。
+ *
+ * <p>★ 逐项比较天然与顺序无关：它比的是「每个规格名的值对不对」，
+ * 而不是「这个对象被序列化成了什么」。
+ */
+const currentSku = computed(() => {
+  if (!selectedComplete.value) {
+    return null
+  }
+  if (!specGroups.value.length) {
+    // 无规格商品：恰好一条 spec_json = '[]' 的默认 SKU，直接就是它
+    return skuList.value.length === 1 ? skuList.value[0] : null
+  }
+  return (
+    skuList.value.find(
+      (sku) =>
+        sku.specs.length === specGroups.value.length &&
+        sku.specs.every((x) => selected.value[x.name] === x.value),
+    ) ?? null
+  )
+})
+
+/**
+ * 所选规格的库存。
+ *
+ * <p>⚠️⚠️ <b>【必须】用所选 SKU 的库存，不能用列表接口那个 totalStock。</b>
+ * 它是跨规格的合计，回答的是「这件商品一共还剩几件」——
+ * 而那不是一个用户买得到的数量：总库存 10 件分散在 4 个规格上、
+ * 每个规格 2~3 件，用户选哪一档都买不到 10 件。
+ * 拿它当数量上限，用户能选到一个加购必然失败的数字。
+ *
+ * <p>没选规格时是 0；下面 {@code maxQuantity} 的兜底会把它抬到 1。
+ */
+const skuStock = computed(() => currentSku.value?.stock ?? 0)
+
+/**
+ * 数量选择器的上限：<b>所选规格的库存</b>和单件上限取小的那个。
+ *
+ * <p>只绑库存是不够的。库存 500 的规格，用户能一路选到 200，
  * 然后加购被后端压到 99（业务码 1008）、立即购买直接报
  * 「最多购买 99 件」—— 用户看着库存写着 500，会以为系统坏了。
  *
@@ -120,23 +228,180 @@ function selectImage(index) {
  */
 const maxQuantity = computed(() =>
   Math.max(
-    Math.min(product.value?.stock ?? 0, MAX_QUANTITY_PER_ITEM),
+    Math.min(skuStock.value, MAX_QUANTITY_PER_ITEM),
     1, // ⚠️ 兜底成 1：库存 0 时 el-input-number 的 max 是 0，
        //   而 min 是 1，min > max 会让组件行为变得奇怪。
        //   按钮那时本来就是禁用的，所以这个 1 不会被用到
   ),
 )
 
-async function loadProduct() {
+/**
+ * ★★ 换规格之后，把数量夹回新规格的库存以内。
+ *
+ * <p>这条 watch 守的是一条不变量：<b>{@code quantity &lt;= maxQuantity} 恒成立。</b>
+ *
+ * <p>不守会怎样（<b>实测过</b>，不是推演）：在「黑/S，库存 5」那一档把数量加到 5，
+ * 然后切换到「黑/M，库存 2」——数量<b>还是 5</b>，而页面上写着「库存 2 件」，
+ * 「加入购物车」也是亮着的。用户点下去，请求带着 5 件发出去。
+ *
+ * <p>⚠️ 为什么 {@code el-input-number} 自己没兜住？因为它<b>只在
+ * modelValue 和 precision 变化时</b>重新校验，而 {@code max} 变了它不管 ——
+ * 所以「上限调小」这件事不会触发任何夹取。上限调小时加号会变灰
+ * （这一点组件是对的），但<b>已经填进去的那个数会留在原地</b>。
+ *
+ * <p>★ 为什么用 watch 而不是在 {@code addToCart} 里夹一下？
+ * 因为在提交前夹，用户看到的那个数是错的 —— 页面写着 5、实际买 2，
+ * 是「能选、能点、加不进去」的典型症状。修复的位置必须让
+ * <b>显示</b>也跟着对，所以它只能发生在数量被渲染出来之前。
+ *
+ * <p>★ 夹取（而不是重置成 1）：用户表达了「我要 5 件」这个意图，
+ * 新规格只买得到 2 件时，把意图保留到上限比丢弃它更接近他的意思。
+ * 购物车那边也是这个口径（数量超限时压到上限而不是清零）。
+ */
+watch(maxQuantity, (max) => {
+  if (quantity.value > max) {
+    quantity.value = max
+  }
+})
+
+/**
+ * 价格区显示的那个数。
+ *
+ * <p>★ 选中了规格 → 那个规格的确切价格；还没选 → 起售价（所有规格里最低的）。
+ *
+ * <p>「还没选的时候显示什么」有一个错误答案和一个正确答案：
+ * <pre>
+ *   错误：随便挑一个规格的价格 → 用户会以为那就是他要买的价格
+ *   正确：起售价 + 一个「起」字 → 明确告诉用户这只是个下界
+ * </pre>
+ * 后端给这个字段起名 {@code minPrice} 而不是 {@code price}，
+ * 就是为了让上面这个区分在代码里也看得见。
+ */
+const priceValue = computed(() => currentSku.value?.price ?? product.value?.minPrice ?? null)
+
+/**
+ * 要不要在价格后面跟一个「起」字。
+ *
+ * <p>★ 判据是「<b>所有规格的价格不全一样</b>」，不是「规格数 &gt; 1」——
+ * 4 个规格都卖 10 元时写「¥10.00 起」是在暗示还有更贵的，而实际上没有。
+ * <b>一个永远为真的修饰语等于没有信息</b>，和模板里
+ * 「库存超过 99 才提示单次限购」是同一个判断。
+ *
+ * <p>⚠️ 选中规格之后<b>不再显示</b>「起」：那时显示的是确定的价格。
+ */
+const priceIsFrom = computed(() => {
+  const skus = skuList.value
+  if (!skus.length) {
+    return false
+  }
+  let min = null
+  let max = null
+  for (const s of skus) {
+    const p = Number(s.price)
+    if (min === null || p < min) {
+      min = p
+    }
+    if (max === null || p > max) {
+      max = p
+    }
+  }
+  return min !== max
+})
+
+const showFrom = computed(() => !currentSku.value && priceIsFrom.value)
+
+/**
+ * 按钮为什么不能点；空串表示可以买。
+ *
+ * <h3>★★ 这里刻意分成三句话，而不是一句「暂时无法购买」</h3>
+ *
+ * <pre>
+ *   还没选规格        → 「请选择规格」        —— 用户【能做点什么】
+ *   选了但那个规格没货 → 「该规格暂时缺货」    —— 用户【可以换一个规格】
+ *   无规格商品没货    → 「该商品暂时缺货」    —— 用户【什么也做不了】
+ * </pre>
+ *
+ * <p>「商品级售罄」和「规格级缺货」是两种不同的状态。
+ * 把它们混成一句话，最直接的损失是：<b>用户在「换个规格就能买」的时候
+ * 直接离开了</b> —— 界面上告诉他这件商品没了，而它其实还在卖。
+ *
+ * <p>★ 同时也是这一页「按钮为什么禁用」的<b>唯一</b>判据：
+ * 三个按钮和数量选择器全都读它，所以不存在
+ * 「按钮灰着但提示说的是另一件事」这种不一致。
+ */
+const blockReason = computed(() => {
+  if (!selectedComplete.value) {
+    return '请选择规格'
+  }
+  if (skuStock.value <= 0) {
+    return specGroups.value.length ? '该规格暂时缺货' : '该商品暂时缺货'
+  }
+  return ''
+})
+
+/** 选一个规格值。再点一次当前值不用做什么 —— 赋值是幂等的 */
+function selectSpec(name, value) {
+  if (!isValueAvailable(name, value)) {
+    return
+  }
+  selected.value = { ...selected.value, [name]: value }
+}
+
+/**
+ * 某个规格值在当前数据下是不是【可选】的。
+ *
+ * <p>★ 只做<b>静态</b>可选性：这个值在任何一条 SKU 里都没出现过 → 标灰。
+ * 「动态可选性」（选完颜色之后某些尺码跟着变灰）明确不做，理由见下。
+ *
+ * <p>⚠️ <b>诚实地说：靠管理端保存出来的数据不会触发这个判断。</b>
+ * Service 有一条规则「skus 的条数必须等于各维取值数之积」，
+ * 所以每一个声明过的值都必然出现在某条 SKU 里。
+ * 它守着的是数据<b>漂移</b> —— 比如将来有人写了另一条路径去改
+ * {@code spec_schema} 却没有同步 SKU 行。那时候用户至少能看出
+ * 「这个值点了没用」，而不是点进去发现价格和库存全是空的。
+ *
+ * <p>★ 为什么不做动态可选性：那要在每次点击时重算
+ * 「剩下每一维还有哪些值能凑出一个真实存在的组合」，
+ * 也就是在这个函数里再跑一次叉乘。以本案的规格规模
+ * （≤3 维 × ≤10 值 × ≤60 组合）算得动，但它引入的是一个
+ * <b>新的交互约定</b>（点了一个值之后别的值会变），
+ * 而这一轮的目标是让「一件商品多个规格」这件事先正确地存在。
+ * 记在这里，不顺手做。
+ */
+function isValueAvailable(name, value) {
+  return skuList.value.some((sku) =>
+    sku.specs.some((x) => x.name === name && x.value === value),
+  )
+}
+
+/**
+ * 拉商品详情。
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.keepSelection] 保留用户已经选好的规格和数量。
+ *   <b>只有</b>「加购失败之后刷新库存」那一条路会传它 ——
+ *   见 addToCart 里的说明。换商品时<b>必须</b>走默认的「全部重置」。
+ */
+async function loadProduct({ keepSelection = false } = {}) {
   loading.value = true
   notFound.value = false
   loadFailed.value = false
-  // 换商品时把数量重置回 1，否则从 A 商品带过来的数量会跟着到 B 商品
-  quantity.value = 1
-  // ★ 主图索引也必须重置，理由同上而且后果更隐蔽 ——
-  //   不重置会索引越界，主图变成「暂无图片」，且不会有任何报错。
-  //   见 currentIndex 的注释。
-  currentIndex.value = 0
+
+  // ★★ 换商品时要重置三样东西：数量、主图索引、选中的规格。
+  //
+  //   三样的理由是同一条（组件会被复用，A 商品的状态跟着到 B 商品），
+  //   但后果一种比一种隐蔽：
+  //     数量     → 用户看到数量是 3 而不是 1，一眼就知道不对劲
+  //     主图索引 → 索引越界，主图安静地退回「暂无图片」（见 currentIndex）
+  //     选中的规格 → 更安静：只要 B 商品也有「颜色」这一维、
+  //                  也有「黑」这个值，那个选项就会亮着，
+  //                  而价格显示的是那个组合的价格 ——
+  //                  【页面上没有任何一处看起来是错的】
+  if (!keepSelection) {
+    quantity.value = 1
+    currentIndex.value = 0
+    selected.value = {}
+  }
 
   const id = route.params.id
 
@@ -389,8 +654,29 @@ async function addToCart() {
   if (!requireLogin('加入购物车')) {
     return
   }
+  // 按钮本来就是按 blockReason 禁用的，走到这里说明状态刚好变了
+  // （比如存货在这几秒里被别人买走）。拦一道只是少发一个注定失败的请求。
+  if (blockReason.value) {
+    ElMessage.warning(blockReason.value)
+    return
+  }
 
-  const ok = await cartStore.add(product.value.id, quantity.value)
+  // ★★ 里程碑 15 阶段 4：这一行从 product.value.id 换成了 currentSku.value.id。
+  //
+  //   阶段 3 结束时这里还写着 product.value.id，注释里留了一句
+  //   「属于阶段 4，那时这里会变成 cartStore.add(currentSku.value.id, ...)」——
+  //   这就是那一句的兑现。
+  //
+  //   ⚠️ 为什么必须换：后端购物车的 field 现在是 skuId。
+  //     传 productId 不会报错，它会【静默地加错行】——
+  //     productId 撞上另一个商品的 skuId 时，用户车里会多出一件
+  //     他根本没选的东西；撞不上时后端查不到这个规格，
+  //     返回「商品不存在或已下架」，而用户明明看着商品好好的。
+  //
+  //   ★ currentSku.value 在这里【一定不为 null】：
+  //     上面 blockReason 那一关已经拦掉了「还没选规格」的情况
+  //     （blockReason 为真时函数早就 return 了）。
+  const ok = await cartStore.add(currentSku.value.id, quantity.value)
   if (!ok) {
     // 失败的原因可能是库存不够、商品刚好被下架、或者数量超限。
     // 具体原因 request.js 已经弹出提示了，这里不重复弹。
@@ -398,7 +684,14 @@ async function addToCart() {
     // ★ 但要刷新一下商品详情 —— 如果失败的原因是「库存变了」，
     //   页面上显示的库存还是旧的，用户会不明白为什么失败。
     //   拉一次最新的，让「看到的」和「真实的」重新对上。
-    await loadProduct()
+    //
+    // ★ keepSelection：刷新【不重置用户的选择】。这两件事必须分开 ——
+    //   重置是给「换商品」用的（另一个商品不该继承这个商品的选择），
+    //   而这里是同一个商品，用户刚点了「黑/M」，把选择清空
+    //   只会让他再点一遍。更糟的是：如果他选的正是那个刚卖完的规格，
+    //   清空选择之后页面显示的是起售价和「请选择规格」，
+    //   而真正该告诉他的是「你选的那个规格没货了」。
+    await loadProduct({ keepSelection: true })
     return
   }
 
@@ -439,9 +732,9 @@ function requireLogin(action) {
 /**
  * 立即购买 —— 不经过购物车，直接去结算页。
  *
- * <p>★ 跳转时只带<b>商品 id 和数量</b>，而且数量是放进 URL 的：
+ * <p>★ 跳转时只带<b>规格 id 和数量</b>，而且数量是放进 URL 的：
  * <pre>
- *   /checkout?productId=5&amp;quantity=2
+ *   /checkout?skuId=204&amp;quantity=2
  * </pre>
  *
  * <p>为什么数量可以放 URL，而购物车结算那边连数量都不传？
@@ -451,6 +744,11 @@ function requireLogin(action) {
  *   立即购买    数量是用户刚在数量选择器上决定的，服务端没有 → 只能传
  * </pre>
  * 详见 {@code api/order.js} 里 createOrderByBuyNow 的注释。
+ *
+ * <p>★ 里程碑 15 阶段 4：带的是 {@code skuId}。结算页会拿它去
+ * {@code GET /api/shop/skus/{skuId}} 把这行商品的名字、封面、
+ * 规格文字、单价取回来 —— 那条链接上只有这一个 id，
+ * <b>所以它必须指向「一样可买的货」，也就是规格</b>。
  *
  * <p>⚠️ 数量放进 URL 意味着用户能随手改（{@code ?quantity=99999}）。
  * 这<b>不是安全问题</b> —— 后端 {@code BuyNowDTO} 上有 {@code @Min(1) @Max(999)}，
@@ -467,17 +765,29 @@ function buyNow() {
   if (!requireLogin('购买')) {
     return
   }
-  // 库存为 0 时按钮本来就是禁用的，但"正常不会"不等于"一定不会"：
+  // 按钮本来就是按 blockReason 禁用的，但"正常不会"不等于"一定不会"：
   // 页面上的库存可能是几分钟前拉的，早被人买走了。
-  // 这里拦一道只是少一次注定失败的请求，真正的判定在后端
-  if (soldOut.value) {
-    ElMessage.warning('这件商品已经卖完了')
+  // 这里拦一道只是少一次注定失败的请求，真正的判定在后端。
+  //
+  // ★ 提示文案直接用 blockReason（「请选择规格」/「该规格暂时缺货」），
+  //   不另写一句 —— 否则同一件事会有两种说法，而且总会有一处忘了改。
+  if (blockReason.value) {
+    ElMessage.warning(blockReason.value)
     return
   }
+  // ★ 里程碑 15 阶段 4：带的是 currentSku.value.id（规格），不是商品 id。
+  //   结算页的立即购买分支会用它调 GET /api/shop/skus/{skuId}。
+  //   ⚠️ 传 productId 的后果在这里【尤其难查】：结算页去查
+  //     /shop/skus/<某个商品id>，那个 id 很可能【真的是一条 SKU】
+  //     （两张表都是自增，撞号是常态）—— 于是页面正常渲染，
+  //     只是显示的是【另一件商品】的某个规格。用户点提交，买错了东西。
+  //
+  //   ★ 和 addToCart 一样，currentSku 在这里一定不为 null ——
+  //     blockReason 那一关已经拦在前面了。
   router.push({
     path: '/checkout',
     query: {
-      productId: product.value.id,
+      skuId: currentSku.value.id,
       quantity: quantity.value,
     },
   })
@@ -531,7 +841,16 @@ function buyNow() {
         sub-title="网络或服务端出了点问题，请稍后重试"
       >
         <template #extra>
-          <el-button type="primary" @click="loadProduct">重新加载</el-button>
+          <!--
+            ⚠️ 括号不能省。写成 @click="loadProduct" 的话，Vue 会把
+               MouseEvent 当成第一个参数传进去（loadProduct(event)），
+               而它期待的是一个 { keepSelection } 对象 ——
+               现在恰好不会出错（event 上没有 keepSelection 这个属性，
+               解构出来是 undefined → 走默认的 false），
+               但那是【碰巧】。这种"靠参数形状恰好对得上"的写法，
+               会在下一次给这个函数加参数时变成 bug。
+          -->
+          <el-button type="primary" @click="loadProduct()">重新加载</el-button>
         </template>
       </el-result>
 
@@ -595,7 +914,54 @@ function buyNow() {
 
           <div class="price-box">
             <span class="label">价格</span>
-            <span class="price">¥{{ product.price }}</span>
+            <span class="price">¥{{ formatAmount(priceValue) }}</span>
+            <!--
+              ★ 「起」写在 {{ }} 【外面】，是这一行的注解，不是价格的一部分。
+                放进去的话 formatAmount 的返回值会被拼成一个非数字字符串，
+                任何拿它当数用的地方都会跟着出问题。
+                （sql/test-frontend-format.py 的规则 2 就盯着这一条。）
+
+              ★ 有规格但还没选时显示「起」；选中之后显示的是确定的价格，
+                不再跟「起」—— 一个已经确定的数后面跟「起」是自相矛盾的。
+            -->
+            <span v-if="showFrom" class="price-from">起</span>
+          </div>
+
+          <!--
+            ★★ 规格选择器（里程碑 15 阶段 3）。
+
+            ⚠️ 它整个由 v-if="specGroups.length" 保护，所以
+              【库里现有 100 件商品一件都看不到这块】——
+              它们的 spec_schema 是 NULL，后端返回空数组。
+              这不是"没做完"，而是「无规格的商品本来就没有规格可选」。
+
+            ⚠️ 每一维是一行（.spec-group），不是一列 —— 维度最多 3 个，
+              横着一行放得下，纵着排会把「价格」挤到看不见的地方。
+          -->
+          <div v-if="specGroups.length" class="meta-row spec-row">
+            <span class="label">规格</span>
+            <div class="spec-groups">
+              <div v-for="g in specGroups" :key="g.name" class="spec-group">
+                <span class="spec-name">{{ g.name }}</span>
+                <!--
+                  :class 里的 disabled 是【静态】可选性：这个值在任何一条
+                  SKU 里都没出现过 → 标灰。正常情况下不会触发，
+                  理由见 isValueAvailable 的注释。
+                -->
+                <span
+                  v-for="v in g.values"
+                  :key="v"
+                  class="spec-value"
+                  :class="{
+                    active: selected[g.name] === v,
+                    disabled: !isValueAvailable(g.name, v),
+                  }"
+                  @click="selectSpec(g.name, v)"
+                >
+                  {{ v }}
+                </span>
+              </div>
+            </div>
           </div>
 
           <div class="meta-row">
@@ -605,8 +971,22 @@ function buyNow() {
 
           <div class="meta-row">
             <span class="label">库存</span>
-            <span :class="{ 'stock-warn': soldOut }">
-              {{ soldOut ? '暂时缺货' : `${product.stock} 件` }}
+            <!--
+              ★★ 三种状态，而不是两种。
+
+              还没选规格时【不显示任何库存数字】。可选的做法有两种，
+              都不如留白诚实：
+                显示总库存 → 那个数用户买不到（详见 skuStock 的注释）
+                显示某个规格的 → 那是替用户选了他没选的规格
+              「还没选规格」本身就是一个信息，把它说出来。
+
+              ★ 顺便注意无规格商品【不会】走到上面那一支：
+                它没有维度，selectedComplete 恒为真，
+                所以它照旧直接显示「N 件」——和这一轮之前一模一样。
+            -->
+            <span v-if="!selectedComplete" class="stock-hint">选择规格后显示</span>
+            <span v-else :class="{ 'stock-warn': skuStock <= 0 }">
+              {{ skuStock <= 0 ? '暂时缺货' : `${skuStock} 件` }}
             </span>
           </div>
 
@@ -617,14 +997,16 @@ function buyNow() {
                 v-model="quantity"
                 :min="1"
                 :max="maxQuantity"
-                :disabled="soldOut"
+                :disabled="!!blockReason"
               />
               <!--
-                ★ 库存超过 99 时才提示。库存本来就只有 5 件的商品
+                ★ 库存超过 99 时才提示。库存本来就只有 5 件的规格
                   不需要看这句废话 —— 「提示要有信息量」，
-                  一条永远为真的提示等于没有提示
-              -->
-              <div v-if="product.stock > MAX_QUANTITY_PER_ITEM" class="qty-hint">
+                  一条永远为真的提示等于没有提示。
+
+                ⚠️ 比较的是【所选规格】的库存，不是商品的总库存。
+            -->
+              <div v-if="skuStock > MAX_QUANTITY_PER_ITEM" class="qty-hint">
                 单次最多购买 {{ MAX_QUANTITY_PER_ITEM }} 件
               </div>
             </div>
@@ -640,11 +1022,16 @@ function buyNow() {
                 而不是灰色 —— 这是 Element Plus 的固有行为，
                 要真灰色得写 5 个 class 去盖 .is-disabled:hover，不值得。
             -->
+            <!--
+              ★ 两个按钮的禁用条件是同一句话：blockReason。
+                「请选择规格」和「该规格暂时缺货」都会让它们变灰，
+                但下面那行提示会说明是哪一种（见 blockReason 的注释）。
+            -->
             <el-button
               type="primary"
               plain
               size="large"
-              :disabled="soldOut"
+              :disabled="!!blockReason"
               :loading="cartStore.loading"
               @click="addToCart"
             >
@@ -653,12 +1040,13 @@ function buyNow() {
             <el-button
               type="danger"
               size="large"
-              :disabled="soldOut"
+              :disabled="!!blockReason"
               @click="buyNow"
             >
               立即购买
             </el-button>
-            <span v-if="soldOut" class="sold-out-tip">该商品暂时无法购买</span>
+            <!-- 提示文案就是 blockReason 本身，不另写一句 —— 见 blockReason 的注释 -->
+            <span v-if="blockReason" class="sold-out-tip">{{ blockReason }}</span>
           </div>
         </div>
       </div>
@@ -1010,6 +1398,101 @@ function buyNow() {
   width: 42px;
   color: #909399;
   flex-shrink: 0;
+}
+
+/* 「起」—— 跟在价格后面那个字。
+   ★ 比价格小得多、颜色也不是价格那种红：它是【注解】不是数字本身。
+     写成和价格一样大，用户会把它读成价格的一部分 */
+.price-from {
+  font-size: 14px;
+  color: #909399;
+}
+
+/* ---------------- 里程碑 15：规格选择器 ---------------- */
+
+/* 规格那一行可能是两三行（每一维一行），顶部对齐比垂直居中好看 ——
+   否则「规格」两个字会飘在整块的中间，和任何一维都对不起 */
+.spec-row {
+  align-items: flex-start;
+}
+
+/* 把「规格」两个字和第一行的按钮对齐。
+   .meta-row .label 没有定行高，而 .spec-value 有 24px 高，
+   不补这一句的话标签会比第一行按钮高一点点 */
+.spec-row .label {
+  line-height: 24px;
+}
+
+.spec-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.spec-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.spec-name {
+  font-size: 13px;
+  color: #909399;
+  min-width: 36px;
+}
+
+/* 一个规格值。
+   ★ 边框常驻（透明）而不是 hover 时才加 —— 和缩略图条 .thumb-item
+     是同一条理由：选中时加边框会让整体尺寸变一下，一排按钮跟着抖 */
+.spec-value {
+  padding: 3px 12px;
+  font-size: 13px;
+  line-height: 18px;
+  color: #303133;
+  background-color: #fff;
+  border: 1px solid var(--jd-border-light);
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+
+.spec-value:hover {
+  border-color: var(--jd-red);
+  color: var(--jd-red);
+}
+
+/* 选中态：红描边 + 红字 + 一层极浅红底，和首页的分类选中保持一致 */
+.spec-value.active {
+  border-color: var(--jd-red);
+  color: var(--jd-red);
+  background-color: var(--jd-red-bg);
+  font-weight: 600;
+}
+
+/* 静态不可选（这个值在任何一条 SKU 里都不存在）。
+   ⚠️ 这里【必须】把 cursor 改回去 —— 一个灰色的按钮配着 pointer 光标，
+   用户会一直点它，然后以为页面卡住了 */
+.spec-value.disabled {
+  color: #c0c4cc;
+  border-color: #ebeef5;
+  background-color: #fafafa;
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+
+.spec-value.disabled:hover {
+  border-color: #ebeef5;
+  color: #c0c4cc;
+}
+
+/* 还没选规格时库存那一格显示的提示，比正文浅，表示「这里暂时没有数」 */
+.stock-hint {
+  color: #a8abb2;
+  font-size: 13px;
 }
 
 .stock-warn {

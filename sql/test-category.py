@@ -228,8 +228,11 @@ section("4. 分类：删除的业务规则（自给自足，不依赖库里的�
 
 # 先造一个「有商品的分类」，用完自己清掉
 biz_cat = make_category("自检-有商品的分类", 9905)
+# 里程碑 15：价格和库存搬到了 product_sku 上，建商品时必须显式给一条「默认 SKU」
+# （specs 为空数组）。这个商品没有规格，所以 specSchema 是空数组、skus 恰好一条。
 st, r = call("POST", "/admin/products",
-             {"categoryId": biz_cat, "name": "自检-占位商品", "price": 1.00, "stock": 1, "status": 1})
+             {"categoryId": biz_cat, "name": "自检-占位商品", "status": 1,
+              "specSchema": [], "skus": [{"specs": [], "price": 1.00, "stock": 1}]})
 product_id = r.get("data")
 check("成功在该分类下建了一个商品", isinstance(product_id, int), r)
 if isinstance(product_id, int):

@@ -3,17 +3,22 @@ package com.example.mall.service.impl;
 import com.example.mall.common.BusinessException;
 import com.example.mall.common.PageResult;
 import com.example.mall.common.ResultCode;
+import com.example.mall.common.SpecGroup;
 import com.example.mall.dto.ShopProductQueryDTO;
 import com.example.mall.mapper.ProductImageMapper;
 import com.example.mall.mapper.ProductMapper;
 import com.example.mall.service.ProductReviewService;
 import com.example.mall.service.ShopProductService;
+import com.example.mall.service.ShopSkuService;
+import com.example.mall.util.SpecJson;
 import com.example.mall.vo.ShopProductDetailVO;
 import com.example.mall.vo.ShopProductVO;
+import com.example.mall.vo.SkuVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -42,6 +47,17 @@ public class ShopProductServiceImpl implements ShopProductService {
      * <b>判据不是「跨域调用该用 Service 还是 Mapper」，而是「这次调用有没有绕过规则」。</b>
      */
     private final ProductReviewService reviewService;
+
+    /**
+     * 取一件商品的全部规格（★ 里程碑 15 阶段 3 起）。
+     *
+     * <p>★ 这里注入的是 <b>Service 而不是 Mapper</b>，判据和上面注入
+     * {@code reviewService} 时是同一个：<b>「这次调用有没有绕过规则」。</b>
+     * 「一个商品有哪些规格」这件事有自己的规则（不筛缺货的、
+     * 按 spec_schema 的顺序渲染 specText），那些规则住在
+     * {@code ShopSkuService} 里，绕过去直接用 Mapper 就等于绕过它们。
+     */
+    private final ShopSkuService shopSkuService;
 
     /**
      * 分页浏览商品。
@@ -146,6 +162,75 @@ public class ShopProductServiceImpl implements ShopProductService {
         //      两者的形状和调用时机都不同 —— 列表还会被单独翻页。
         product.setReviewSummary(reviewService.summary(id));
 
+        // ★★ 里程碑 15 阶段 3：规格定义 + 全部规格。
+        //
+        //   ★ 这两块【没有】加进 selectShopById 那条 SQL ——
+        //     这是本文件里第三次做同一个决定了，理由一字不差
+        //     （前两次是 images 和 reviewSummary，完整的论证在
+        //     ShopProductDetailVO.images 的注释里）：
+        //
+        //     那条 SQL 被 CartServiceImpl.requireAvailableProduct 复用
+        //     （「加入购物车」和「改数量」两个接口都在走），而那边只需要
+        //     price 和 stock。给它加上 skuAggregate 那个派生表，
+        //     就等于【让每次加入购物车都把整个 product_sku 分组一遍】——
+        //     而且 MySQL 的派生条件下推对带 GROUP BY 的派生表不生效，
+        //     所以这不是「优化器会处理掉」的小事。
+        //
+        //   ★ 加字段的代价不取决于字段本身，而取决于读它的那条 SQL 还有谁在用。
+        //
+        //   ⚠️ 而且 skus 根本没法靠那条 SQL 带出来：它的类型是
+        //     List<SkuVO>，数据库那边是 VARCHAR(500) 的 JSON 文本，
+        //     MyBatis 没有现成的 TypeHandler 做这个转换 ——
+        //     和 spec_schema 那一列撞的是同一堵墙（见 selectSpecSchema 的注释）。
+        List<SkuVO> skus = shopSkuService.listByProductId(id);
+        product.setSkus(skus);
+        // ★ skuCount 和 minPrice 都是【从这个列表里算出来的】，不是再查一次数据库。
+        //
+        //   为什么不走 SQL 聚合（像列表接口那样）？
+        //   因为要渲染规格选择器就必须先把整批 SKU 查出来，顺便算一下是零成本的，
+        //   而再去数据库聚合一次就多一次往返。
+        //
+        //   ★★ 而且这样它们三个【永远不会分叉】：同一份数据、同一次计算。
+        //      如果 minPrice 改回由 SQL 提供，就会出现「选择器上是 4 档、
+        //      起售价却按 3 档算」这种只在某个商品上出现的诡异现象 ——
+        //      而两个来源都各自「正确」，没有任何地方会报错。
+        product.setSkuCount(skus.size());
+        product.setMinPrice(minPriceOf(skus));
+
+        // ★ spec_schema 单独查一次（只有一列，主键命中）。
+        //
+        //   ⚠️ 这里和 shopSkuService.listByProductId 内部那次查重了 ——
+        //     代价是一次主键命中的单列查询（微秒级），换来的是
+        //     ShopSkuService 的接口不必为了「把已查到的 schema 传回去」
+        //     而多出一个返回值。**这个交换是划算的，但它是刻意的，不是没想到。**
+        List<SpecGroup> schema = SpecJson.schemaOf(productMapper.selectSpecSchema(id));
+        product.setSpecSchema(schema);
+
         return product;
+    }
+
+    /**
+     * 起售价 = 所有规格里最便宜的那个。
+     *
+     * <p>⚠️ 规格列表为空时返回 <b>null</b>，不是 0 ——
+     * 空集合上的最小值没有答案，而 0 在价格这个语境里是一个
+     * 强烈得多的陈述（「免费」）。前端拿到 null 会显示成「—」。
+     *
+     * <p>★ 用 {@code BigDecimal.compareTo} 而不是 {@code Math.min}：
+     * 后者只对基本类型有效；也不能用 {@code <} 运算符比较两个 BigDecimal
+     * （它们重写了 equals 但运算符比的是引用）。这类金额比较的坑
+     * 在 {@code Product.price} 的注释里也提过。
+     */
+    private BigDecimal minPriceOf(List<SkuVO> skus) {
+        BigDecimal min = null;
+        for (SkuVO sku : skus) {
+            if (sku.getPrice() == null) {
+                continue;
+            }
+            if (min == null || sku.getPrice().compareTo(min) < 0) {
+                min = sku.getPrice();
+            }
+        }
+        return min;
     }
 }

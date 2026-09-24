@@ -9,7 +9,7 @@ import lombok.Data;
  * 「加入购物车」的请求体。
  *
  * <p>{@code POST /api/shop/cart/items}
- * <pre>{ "productId": 5, "quantity": 2 }</pre>
+ * <pre>{ "skuId": 204, "quantity": 2 }</pre>
  *
  * <h3>★ 注意这里<b>没有</b> price 字段，这是刻意的</h3>
  *
@@ -26,18 +26,25 @@ import lombok.Data;
 public class CartAddDTO {
 
     /**
-     * 商品 id。
+     * SKU id（★ 里程碑 15 阶段 4 从 {@code productId} 换成它）。
      *
      * <p>{@code @NotNull} 是必须的 —— 不传的话 Service 里就是 null，
      * 后面查库、拼 Redis key 都会出问题。
      *
      * <p>注意这里<b>没有</b> {@code @Min(1)}。因为「id 是不是正整数」
-     * 和「这个商品存不存在、有没有上架」是两件事，
+     * 和「这个 SKU 存不存在、它所属商品有没有下架」是两件事，
      * 而后者只能查库才知道。与其在校验注解里做一半，
      * 不如统一交给 Service 的查询结果来判定 —— 反正都要查库。
+     *
+     * <p><b>★ 为什么是 SKU 而不是商品</b>：因为「买哪一件」这件事，
+     * 光有商品 id 是<b>答不完的</b>。同一件 T 恤有黑/白 × S/M 四档，
+     * 价格和库存都不同 —— 只传商品 id，加购就不知道按哪个价格、
+     * 扣哪一行的库存。而且购物车的 Redis field 就是这个 id，
+     * 用商品 id 的话「黑白各加一件」会被合并成一行「数量 2」，
+     * 下单时也说不清买的是哪个规格。
      */
-    @NotNull(message = "商品不能为空")
-    private Long productId;
+    @NotNull(message = "规格不能为空")
+    private Long skuId;
 
     /**
      * 要加入的数量。
@@ -50,8 +57,11 @@ public class CartAddDTO {
      * <p>{@code @Max(999)} 是<b>防呆</b>，不是业务上限。
      * 它挡的是「quantity: 999999999」这种明显在乱填的请求 ——
      * 这种值会让 {@code quantity × price} 变成一个天文数字。
-     * 真正的「一个商品最多买 99 件」在
-     * {@code CartServiceImpl.MAX_QUANTITY_PER_ITEM}，返回业务码 1008。
+     * 真正的「一个规格最多买 99 件」在
+     * {@code BusinessRules.MAX_QUANTITY_PER_ITEM}，返回业务码 1008。
+     * （★ 里程碑 15 阶段 4 把这个常量从 {@code CartServiceImpl} 收了上去 ——
+     * 它当时在 Service 里另有一份私有副本，而 {@code BusinessRules}
+     * 的注释里却写着"只剩一处"，是一句已经不成立的话。）
      *
      * <p>为什么这里不直接写 {@code @Max(99)}？见
      * {@link CartQuantityDTO#quantity} 的注释 —— 简单说就是

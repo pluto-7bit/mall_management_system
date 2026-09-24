@@ -28,8 +28,11 @@ import java.util.Map;
  *       把这些「噪音数据」写进 MySQL，商品表的磁盘和索引都会被拖累。</li>
  *
  *   <li><b>数据是天然的键值结构。</b>
- *       一个用户一个购物车，里面是「商品 id → 数量」。
- *       这不用 Redis 的 Hash 用什么？</li>
+ *       一个用户一个购物车，里面是「skuId → 数量」。
+ *       这不用 Redis 的 Hash 用什么？
+ *       ★ 注意是 skuId 不是 productId（里程碑 15 阶段 4 换的）——
+ *         同一件商品的「黑色 S」和「白色 M」必须是两个 field，
+ *         否则它们会被合并成一行、下单时也说不清买的是哪个规格。</li>
  * </ol>
  *
  * <p><b>★ 但 Redis 有个必须接受的代价：它可能丢数据。</b>
@@ -49,10 +52,12 @@ public interface CartService {
      *
      * <p>会做这几项检查（任何一项不过就抛业务异常）：
      * <ul>
-     *   <li>商品存在且已上架</li>
-     *   <li>累加后的数量不超过 99</li>
-     *   <li>累加后的数量不超过当前库存</li>
+     *   <li>规格存在，且它所属的商品已上架</li>
+     *   <li>累加后的数量不超过 {@code BusinessRules.MAX_QUANTITY_PER_ITEM}</li>
+     *   <li>累加后的数量不超过<b>这个规格</b>的库存</li>
      * </ul>
+     * ★ 里程碑 15 阶段 4：上面三项里的「商品」全部换成了「规格」。
+     * 这正是 SKU 化的意义 —— 库存和价格挂在规格上，检查自然也要挂在那儿。
      *
      * <p><b>⚠️ 这里的库存检查是「尽力而为」，不是保证。</b>
      * 查库存和写 Redis 之间没有任何锁，理论上这中间库存可能被别人买走。
@@ -70,20 +75,23 @@ public interface CartService {
     void add(CartAddDTO dto);
 
     /**
-     * 把购物车里某个商品的数量<b>改成一个确定的值</b>。
+     * 把购物车里某个<b>规格</b>的数量<b>改成一个确定的值</b>。
      *
      * <p>和 {@link #add} 的区别见 {@code CartQuantityDTO} 的注释：
      * 这里是「改成 N 件」，不是「再加 N 件」。
      *
-     * <p>如果车里根本没有这个商品，<b>会抛异常而不是静默创建</b> ——
+     * <p>如果车里根本没有这个规格，<b>会抛异常而不是静默创建</b> ——
      * 用 PUT 去做「新增」是接口语义混乱的开始。
+     *
+     * @param skuId 购物车里的 field。★ 里程碑 15 阶段 4 起是 SKU 不是商品 ——
+     *              改「黑色 S」的数量不该动到「白色 M」
      */
-    void updateQuantity(Long productId, CartQuantityDTO dto);
+    void updateQuantity(Long skuId, CartQuantityDTO dto);
 
     /**
-     * 从购物车移除某个商品。
+     * 从购物车移除某个<b>规格</b>。
      *
-     * <p><b>移除一个本来就不在车里的商品不算错误</b>（不抛异常）。
+     * <p><b>移除一个本来就不在车里的规格不算错误</b>（不抛异常）。
      * 这是刻意选择的「幂等」语义：用户连点两次删除按钮、
      * 或者在两个标签页里都点了删除，第二次应该安静地成功，
      * 而不是弹一个「该商品不在购物车中」的红色提示 ——
@@ -91,7 +99,7 @@ public interface CartService {
      *
      * <p><b>「目标状态已经达成」就不该报错</b>，这是设计幂等接口的通用原则。
      */
-    void remove(Long productId);
+    void remove(Long skuId);
 
     /** 清空购物车 */
     void clear();
@@ -103,6 +111,11 @@ public interface CartService {
      * 它们会被标记 {@code available = false}，但不计入合计金额。
      * 为什么不是直接过滤掉？见 {@code CartItemVO.available} 的注释 ——
      * 静默消失的商品会让用户以为「我明明加过」。
+     *
+     * <p>⚠️ 失效条目上<b>只有 {@code skuId} 和 {@code quantity} 两个字段有值</b>
+     * （商品名、价格、规格文本全是 null）—— 因为它们来自 Redis，
+     * 而「商品信息和规格文本」要靠商品查询才拿得到，
+     * 那条查询又把下架商品排除在外了。理由见 {@code CartItemVO.specText}。
      */
     CartVO getCart();
 
@@ -160,24 +173,32 @@ public interface CartService {
      * 如果这里直接抛异常，第二种场景就没法复用了。
      * <b>「判断事实」和「决定怎么办」分开，方法才能被多处复用。</b>
      *
-     * @param productIds 要查的商品 id。<b>调用方保证非空</b>
-     * @return 商品 id → 数量。只包含在车里的那些，可能为空 Map（不会是 null）
+     * @param skuIds 要查的 SKU id。<b>调用方保证非空</b>
+     * @return skuId → 数量。只包含在车里的那些，可能为空 Map（不会是 null）
      */
-    Map<Long, Integer> readQuantities(List<Long> productIds);
+    Map<Long, Integer> readQuantities(List<Long> skuIds);
 
     /**
-     * 从购物车里移除指定的商品，供下单成功后清理用。
+     * 从购物车里移除指定的<b>规格</b>，供下单成功后清理用。
      *
      * <p>和 {@link #remove} 是同一个语义，只是支持一次删多个 ——
-     * 结算 5 种商品后要删 5 个字段，逐个调 {@code HDEL} 就是 5 次网络往返。
+     * 结算 5 种规格后要删 5 个字段，逐个调 {@code HDEL} 就是 5 次网络往返。
      *
      * <p>⚠️ <b>调用时机的纪律：必须在订单事务提交之后调用。</b>
      * 理由见 {@code OrderServiceImpl} —— 如果提交前就把购物车清了，
      * 而事务后来回滚了，用户的购物车就凭空空了，订单却没生成。
      *
-     * <p>幂等：删一个已经不在车里的商品不报错（和 {@link #remove} 一致）。
+     * <p>幂等：删一个已经不在车里的规格不报错（和 {@link #remove} 一致）。
      *
-     * @param productIds 要移除的商品 id。空集合时直接返回（不报错）
+     * <p>★★ <b>里程碑 15 阶段 4 最容易静默出错的调用点，就是这里。</b>
+     * 它原来的参数是 productIds，而车里现在的 field 是 skuId ——
+     * 传错的下场不只是「什么都没删掉」，而是
+     * <b>productId 撞上别人的 skuId，把用户车里另一行删掉</b>。
+     * 更糟的是它是在订单事务提交后的回调里被调的，
+     * 那里抛的异常只打一条日志（见 {@code OrderServiceImpl}），
+     * 所以<b>没有任何一层会报错</b>。
+     *
+     * @param skuIds 要移除的 SKU id。空集合时直接返回（不报错）
      */
-    void removeItems(List<Long> productIds);
+    void removeItems(List<Long> skuIds);
 }

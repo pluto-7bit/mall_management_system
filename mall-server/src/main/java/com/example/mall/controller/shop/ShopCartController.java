@@ -103,10 +103,13 @@ public class ShopCartController {
     /**
      * 加入购物车。
      *
-     * <p>{@code POST /api/shop/cart/items}，body {@code {"productId":5,"quantity":2}}
+     * <p>{@code POST /api/shop/cart/items}，body {@code {"skuId":204,"quantity":2}}
      *
      * <p>{@code quantity} 是<b>增量</b>：车里已有 2 件时再加 3 件 → 5 件。
      * 「点两次加入购物车 = 加两次」是用户预期，所以用 POST 而不是 PUT。
+     *
+     * <p>★ 里程碑 15 阶段 4：body 里的是 {@code skuId}（规格）不是 {@code productId}（商品）。
+     * 同一件 T 恤的「黑色 S」和「白色 M」是两个 skuId，加购会得到<b>两条</b>记录。
      *
      * <p>返回体是空的（{@code Result<Void>}），前端不需要拿到什么 ——
      * 加完之后它会重新拉一次购物车。为什么不直接返回最新的购物车？
@@ -121,46 +124,51 @@ public class ShopCartController {
     }
 
     /**
-     * 修改购物车里某个商品的数量。
+     * 修改购物车里某个<b>规格</b>的数量。
      *
-     * <p>{@code PUT /api/shop/cart/items/5}，body {@code {"quantity":3}}
+     * <p>{@code PUT /api/shop/cart/items/204}，body {@code {"quantity":3}}
      *
-     * <p>⚠️ 商品 id 在 <b>URL 里</b>，数量在 <b>body 里</b> —— 为什么这么分？
+     * <p>⚠️ 规格 id 在 <b>URL 里</b>，数量在 <b>body 里</b> —— 为什么这么分？
      *
      * <p>因为 URL 标识的是<b>「改哪个东西」</b>（资源），
      * body 是<b>「改成什么样」</b>（新状态）。
-     * {@code PUT /cart/items/5} 读起来就是「把 5 号商品这条记录，
+     * {@code PUT /cart/items/204} 读起来就是「把 204 号规格这条记录，
      * 置成 body 描述的那个状态」。这正是 REST 里 PUT 的标准用法。
      *
-     * <p>如果反过来写成 {@code PUT /cart/items} + body {@code {productId, quantity}}，
+     * <p>如果反过来写成 {@code PUT /cart/items} + body {@code {skuId, quantity}}，
      * 也能用，但就丢掉了「URL 指向一个具体资源」这层含义，
      * 而且和 POST {@code /cart/items} 长得一模一样，只靠方法名区分，
      * 容易看错。
      *
-     * <p><b>顺带一个安全细节：</b>这里的 {@code productId} 来自 URL，
-     * 而 {@code CartQuantityDTO} 上<b>没有</b> productId 字段 ——
-     * 所以 body 里就算写了 {@code productId: 999} 也会被忽略。
+     * <p><b>顺带一个安全细节：</b>这里的 {@code skuId} 来自 URL，
+     * 而 {@code CartQuantityDTO} 上<b>没有</b> skuId 字段 ——
+     * 所以 body 里就算写了 {@code skuId: 999} 也会被忽略。
      * 这叫<b>参数白名单</b>，详情见 {@code CartQuantityDTO} 的类注释。
      */
-    @PutMapping("/items/{productId}")
-    public Result<Void> updateQuantity(@PathVariable Long productId,
+    @PutMapping("/items/{skuId}")
+    public Result<Void> updateQuantity(@PathVariable Long skuId,
                                        @Valid @RequestBody CartQuantityDTO dto) {
-        cartService.updateQuantity(productId, dto);
+        cartService.updateQuantity(skuId, dto);
         return Result.success();
     }
 
     /**
-     * 从购物车移除一个商品。
+     * 从购物车移除一个<b>规格</b>。
      *
-     * <p>{@code DELETE /api/shop/cart/items/5}
+     * <p>{@code DELETE /api/shop/cart/items/204}
      *
-     * <p>商品<b>本来就不在车里时也返回成功</b>（幂等）——
+     * <p>规格<b>本来就不在车里时也返回成功</b>（幂等）——
      * 理由见 {@code CartService.remove} 的注释。
      * 用户在两个标签页里各点了一次删除，第二次不该看到红色报错。
+     *
+     * <p>★ 里程碑 15 阶段 4：路径变量从 {@code {productId}} 改成 {@code {skuId}}。
+     * <b>路径的字符串形状一个字都没变</b>（都还是 {@code /items/{数字}}），
+     * 变的只是那个数字现在指什么 —— 这是本轮最容易被忽略的一类改动：
+     * 前端不改、后端不改，接口照样返回 200，只是改错了行。
      */
-    @DeleteMapping("/items/{productId}")
-    public Result<Void> remove(@PathVariable Long productId) {
-        cartService.remove(productId);
+    @DeleteMapping("/items/{skuId}")
+    public Result<Void> remove(@PathVariable Long skuId) {
+        cartService.remove(skuId);
         return Result.success();
     }
 
@@ -170,8 +178,8 @@ public class ShopCartController {
      * <p>{@code DELETE /api/shop/cart}
      *
      * <p>注意和上面那个的路径差别：这个删的是<b>整个购物车</b>（资源本身），
-     * 上面那个删的是<b>购物车里的一个商品</b>（子资源）。
-     * {@code DELETE /cart} vs {@code DELETE /cart/items/5} ——
+     * 上面那个删的是<b>购物车里的一个规格</b>（子资源）。
+     * {@code DELETE /cart} vs {@code DELETE /cart/items/204} ——
      * REST 的路径层级天然表达了「操作的范围」，不用额外写文档说明。
      *
      * <p>前端做这个操作前<b>必须弹二次确认</b>：清空购物车是不可撤销的，

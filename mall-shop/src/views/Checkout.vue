@@ -5,10 +5,11 @@ import { ElMessage } from 'element-plus'
 import { getCart } from '@/api/cart'
 import { listAddresses } from '@/api/address'
 import { createOrderByBuyNow, createOrderFromCart } from '@/api/order'
-import { getShopProductDetail } from '@/api/product'
+import { getShopSku } from '@/api/product'
 import { useCartStore } from '@/stores/cart'
 import { clearIntent, getIntentKey } from '@/utils/checkoutIntent'
 import { MAX_QUANTITY_PER_ITEM } from '@/utils/constants'
+import { formatAmount } from '@/utils/format'
 import AddressFormDialog from '@/components/AddressFormDialog.vue'
 import ProductImage from '@/components/ProductImage.vue'
 
@@ -19,9 +20,15 @@ import ProductImage from '@/components/ProductImage.vue'
  *
  * <p>两种下单方式在 URL 上这样区分：
  * <pre>
- *   购物车结算   /checkout?ids=3,7
- *   立即购买     /checkout?productId=5&amp;quantity=2
+ *   购物车结算   /checkout?ids=204,311
+ *   立即购买     /checkout?skuId=204&amp;quantity=2
  * </pre>
+ *
+ * <p>★ 里程碑 15 阶段 4：两组 URL 参数里的数字都从商品换成了<b>规格</b>。
+ * 参数名 {@code ids} 保持不动（它本来就是中性的），
+ * 但 {@code productId} 换成了 {@code skuId} —— 因为立即购买那条路上
+ * 服务端就是按 skuId 查的（{@code GET /api/shop/skus/{skuId}}），
+ * 名字不改的话下一个人会以为这个数字是商品 id。
  *
  * <p>这里没有写成两个页面（{@code CartCheckout.vue} / {@code BuyNowCheckout.vue}），
  * 因为<b>两个页面的界面几乎完全一样</b>：都是"收货地址 + 商品清单 +
@@ -75,11 +82,11 @@ const cartStore = useCartStore()
  */
 const source = ref('cart')
 
-/** 购物车结算：勾选的商品 id */
-const selectedIds = ref([])
+/** 购物车结算：勾选的<b>规格</b> id（来自 URL 的 ids 参数） */
+const selectedSkuIds = ref([])
 
-/** 立即购买：单个商品和数量 */
-const buyNowProductId = ref(null)
+/** 立即购买：单个<b>规格</b>和数量 */
+const buyNowSkuId = ref(null)
 const buyNowQuantity = ref(1)
 
 /** 结算的商品行（含服务端给的名称、单价、可用性） */
@@ -108,12 +115,18 @@ const items = computed(() => lines.value)
 /** 有任何一个商品现在买不了 → 不允许提交 */
 const hasUnavailable = computed(() => items.value.some((l) => !l.available))
 
-/** 后端算的合计，前端只是把它加起来显示（最终金额以后端为准） */
+/**
+ * 后端算的合计，前端只是把它加起来显示（最终金额以后端为准）。
+ *
+ * <p>★ 里程碑 14：返回<b>数字</b>而不是格式化好的字符串 ——
+ * 「保留两位小数」在模板里由 {@code formatAmount} 做。
+ * 理由和 {@code Cart.vue} 的 {@code selectedAmount} 是同一条
+ * （「谁该知道这是一笔钱」），完整论证见 {@code utils/format.js} 开头。
+ */
 const estimateTotal = computed(() =>
   items.value
     .filter((l) => l.available)
-    .reduce((sum, l) => sum + Number(l.subtotal || 0), 0)
-    .toFixed(2),
+    .reduce((sum, l) => sum + Number(l.subtotal || 0), 0),
 )
 
 const selectedAddress = computed(
@@ -157,18 +170,32 @@ async function loadLines() {
     //   这正是"前端传得越少越安全"的好处。
     const cart = await getCart()
     const all = cart.items || []
-    const map = new Map(all.map((i) => [i.productId, i]))
+    // ★★ 里程碑 15 阶段 4：这把钥匙从 productId 换成了 skuId。
+    //    不换的话，「黑色 S」和「白色 M」在 Map 里会互相覆盖 ——
+    //    只剩最后一条，用户勾的两行变成一行，而且是<b>错的那一行</b>。
+    //    症状：结算页少了一件商品、金额不对，但一路没有任何报错。
+    const map = new Map(all.map((i) => [i.skuId, i]))
 
     // ⚠️ 勾选的商品可能已经不在购物车里了（用户在别处删了，
     //    或者刚刚下过单被清掉了）。这些 id 直接跳过，
     //    下面 items 为空时会有一个专门的空状态
-    lines.value = selectedIds.value
+    lines.value = selectedSkuIds.value
       .map((id) => map.get(id))
       .filter(Boolean)
       .map(toLine)
   } else {
-    // 立即购买：服务端没有别的真相来源，只能查商品详情
-    const p = await getShopProductDetail(buyNowProductId.value)
+    // 立即购买：服务端没有别的真相来源，只能查这个规格
+    //
+    // ★★ 里程碑 15 阶段 4：这里从 getShopProductDetail 换成了 getShopSku。
+    //    为什么不能继续用商品详情？因为【URL 上只有一个 skuId】，
+    //    而商品详情接口要的是 productId —— 拿 skuId 去查商品，
+    //    查到的要么是 404，要么（更糟）是<b>另一个商品的详情</b>
+    //    （skuId 和 productId 都是自增数字，撞号是必然的）。
+    //
+    //    ★ 这也解释了为什么后端的接口挂在 /shop/skus/{skuId} 而不是
+    //      /shop/products/{id}/skus/{skuId}：调用方手里只有一个 id，
+    //      接口就只该要一个 id。
+    const p = await getShopSku(buyNowSkuId.value)
     const qty = buyNowQuantity.value
     const stock = p.stock ?? 0
 
@@ -188,21 +215,36 @@ async function loadLines() {
 
     lines.value = [
       {
-        productId: p.id,
-        name: p.name,
+        // ★ 这一行的身份是 skuId（来自 URL）。
+        //   ⚠️ ShopSkuVO 里也有 productId，这里【故意不要它】——
+        //   结算页是这条链路的最后一屏，用户此刻要做的事是「确认然后提交」，
+        //   不是「回商品页逛逛」。加一个能点出去、结果丢掉当前勾选的链接，
+        //   只会让人误点。（Cart.vue 那边有这个链接，因为它是购物车。）
+        //   **一个字段该不该出现在这一行，看的是这一屏有没有人读它。**
+        skuId: p.id,
+        name: p.productName,
+        // ★ 规格文本。【这一行】必须带上：结算页上用户要核对
+        //   「我买的是黑色还是白色」，而立即购买这条路上
+        //   这个信息只存在于接口返回里
+        specText: p.specText,
         price: p.price,
         quantity: qty,
         // ⚠️ 前端自己乘出来的小计，只用于显示。
-        //    JS 的浮点乘法会有误差（0.1 * 3 = 0.30000000000000004），
-        //    下面 formatAmount 会处理显示；
+        //    JS 的浮点乘法会有误差（9.90 * 3 = 29.700000000000003），
+        //    显示时由 formatAmount 收成两位小数 —— 它在 utils/format.js，
+        //    里程碑 14 起【这个文件里不再有第二份】；
         //    真正的金额始终由后端用 BigDecimal 算
         subtotal: Number(p.price) * qty,
 
         // ★★ 这里只判断库存，为什么【不判断 status（是否下架）】？
         //
-        //   因为用户端商品详情的 SQL 里已经带了 `AND p.status = 1`，
-        //   而且 ShopProductDetailVO 里【根本没有 status 字段】——
+        //   因为这条查询本身已经带了 `AND p.status = 1`，
+        //   而且 ShopSkuVO 里【根本没有 status 字段】——
         //   查询本身就保证了"能查到 ⇒ 在售"。
+        //   ★ 里程碑 15 阶段 4：换了接口（getShopProductDetail → getShopSku），
+        //     但这条推理一个字都不用改 —— 两个 VO 都没有 status 字段，
+        //     两条 SQL 都带 status = 1。这正是「规则只定义一次」的好处：
+        //     换的是取数的方式，不是规则本身。
         //   既然服务端已经把这件事挡在外面了，这里再查一遍就是
         //   在一个不可能为假的条件上做判断。
         //
@@ -237,16 +279,23 @@ async function loadLines() {
 
 function toLine(item) {
   return {
-    productId: item.productId,
+    // ★★ 里程碑 15 阶段 4：这个白名单里【新增了 skuId 和 specText】两个字段。
+    //
+    //   白名单的好处是"加字段要显式写一行"，坏处是
+    //   "忘了写就静默丢掉"—— 加一行就补上了，而且下面
+    //   cover 的注释里已经记过一次同样的教训（那次漏的是 cover，
+    //   症状是结算页只有一行行文字，而数据一直在接口的返回里）。
+    //
+    //   ⚠️ specText 漏掉的症状更隐蔽：同一件商品的两个规格
+    //   在结算页上看起来【一模一样】—— 用户核对的正是这一屏，
+    //   而他没有别的办法知道自己选的是黑色还是白色。
+    skuId: item.skuId,
+    specText: item.specText,
     name: item.name,
     price: item.price,
     quantity: item.quantity,
     subtotal: item.subtotal,
     // ★ 从购物车过来时也要带上缩略图。
-    //   这里是个【白名单】：只拷贝列出来的字段。
-    //   白名单的好处是"加字段要显式写一行"，坏处是
-    //   "忘了写就静默丢掉"—— 这个 cover 就是漏掉的那个，
-    //   症状是结算页只有一行行文字，而数据一直在接口的返回里。
     cover: item.cover,
     // ★ available / unavailableReason 都是【后端算好给的】，
     //   前端只负责显示，不在前端猜"为什么不能买"。
@@ -306,8 +355,14 @@ async function submit() {
     //   传进去的 lines（签名），而不是调用时机。
     //   刷新页面后再提交，算出来的签名一样，拿到的就是【同一个键】。
     //   详见 utils/checkoutIntent.js
+    // ★★ 里程碑 15 阶段 4：签名里带上的是 skuId，不是 productId。
+    //    这是本轮第二隐蔽的一处改动，完整场景见
+    //    utils/checkoutIntent.js 的 signatureOf —— 简单说：
+    //    只带 productId 的话，「黑色/128G」改成「白色/256G」而数量不变
+    //    → 签名不变 → 复用幂等键 → 后端把上一单原样返回。
+    //    下单"成功"、跳转"成功"，只是买错了规格。
     const linesForSign = items.value.map((l) => ({
-      productId: l.productId,
+      skuId: l.skuId,
       quantity: l.quantity,
     }))
     const key = getIntentKey(linesForSign)
@@ -315,13 +370,16 @@ async function submit() {
     const order =
       source.value === 'cart'
         ? await createOrderFromCart(
-            linesForSign.map((l) => l.productId),
+            // ⚠️⚠️ 这里传的是 skuIds。传成 productId 的后果不是
+            //   "什么都没删掉"，而是清理购物车时【删掉用户车里另一行】
+            //   —— 详见 api/order.js 里那段说明
+            linesForSign.map((l) => l.skuId),
             selectedAddressId.value,
             key,
             remark.value.trim(),
           )
         : await createOrderByBuyNow(
-            buyNowProductId.value,
+            buyNowSkuId.value,
             buyNowQuantity.value,
             selectedAddressId.value,
             key,
@@ -436,30 +494,32 @@ function goPay() {
   router.push('/pay/' + result.value.orderNo)
 }
 
-function formatAmount(v) {
-  // ★ 浮点数会算出 0.30000000000000004 这种值。
-  //   显示时必须格式化 —— 这不是"好看一点"的问题，
-  //   用户在金额上看到一长串小数会怀疑整个系统算错了。
-  //   （真正的金额是后端 BigDecimal 算的，这里只是显示）
-  return Number(v || 0).toFixed(2)
-}
+// ★ 里程碑 14：这里原来有一个本地的 formatAmount 函数，已经删掉了 ——
+//   它和 utils/format.js 那份逐字相同，改成从那里 import（见文件顶部的 import）。
+//   为什么当时留了一份、后来又是怎么还的，完整写在 utils/format.js 的开头。
 
 onMounted(() => {
   // 解析来源。放在 onMounted 里而不是写在顶层，
   // 是为了和"加载"在同一个时机完成，避免渲染时用的还是旧值
-  if (route.query.productId) {
+  //
+  // ★ 里程碑 15 阶段 4：判据参数名从 productId 换成 skuId。
+  //   这里【必须】跟着改 —— 不改的话立即购买会静默地退化成
+  //   「购物车结算」分支（因为 route.query.productId 是 undefined），
+  //   然后拿 ids 去购物车里找，一条都找不到，页面显示「没有要结算的商品」。
+  //   用户刚点了「立即购买」，看到这句话只会以为系统坏了。
+  if (route.query.skuId) {
     source.value = 'buyNow'
-    buyNowProductId.value = Number(route.query.productId)
+    buyNowSkuId.value = Number(route.query.skuId)
     buyNowQuantity.value = Number(route.query.quantity) || 1
     // ⚠️ 数量也得挡一道。URL 是能随手改的，
-    //   /checkout?productId=5&quantity=-3 不该让页面算出个负数金额。
+    //   /checkout?skuId=204&quantity=-3 不该让页面算出个负数金额。
     //   后端 BuyNowDTO 上有 @Min(1) @Max(999)，这里只是让界面别太难看
     if (!Number.isInteger(buyNowQuantity.value) || buyNowQuantity.value < 1) {
       buyNowQuantity.value = 1
     }
   } else {
     source.value = 'cart'
-    selectedIds.value = parseIds()
+    selectedSkuIds.value = parseIds()
   }
 
   load()
@@ -604,7 +664,15 @@ onMounted(() => {
             <span class="block-title">商品清单</span>
           </template>
 
-          <div v-for="l in items" :key="l.productId" class="line">
+          <!--
+            ★★ 里程碑 15 阶段 4：:key 从 l.productId 换成了 l.skuId。
+                这既是为了正确性（同一商品的两行不会互相复用 DOM），
+                也是【必须的】：失效行的 productId 是 null，
+                而 Vue 的 :key 不允许 undefined —— 多行 key 相同会让
+                列表的 DOM 复用错乱，改一行显示的是另一行的内容。
+                skuId 一定有值（它来自 Redis），见 CartItemVO.skuId 的注释。
+          -->
+          <div v-for="l in items" :key="l.skuId" class="line">
             <!--
               ★ 缩略图。加它不只是「好看」——
                 纯文字的订单清单在结算前这一屏上很难核对：
@@ -616,6 +684,17 @@ onMounted(() => {
             </div>
             <div class="line-name">
               {{ l.name }}
+              <!--
+                ★ 规格文本。里程碑 15 阶段 4 新增。
+                  【这一屏尤其需要它】：用户点「提交订单」之前
+                  唯一能核对的依据就是这里，而同一件商品的两个规格
+                  在名字上是完全一样的（都叫「某某 T 恤」）。
+
+                ⚠️ 用 v-if="l.specText"（宽松真值）覆盖两种"没有规格"：
+                  无规格商品是空串，失效行是 null 且 key 消失。
+                  两种都不该显示这一行。
+              -->
+              <div v-if="l.specText" class="line-spec">{{ l.specText }}</div>
               <!-- ★ 买不了的商品【照样列出来】并写明原因，
                    不是悄悄从清单里去掉。理由同 Cart.vue -->
               <div v-if="!l.available" class="line-reason">
@@ -628,8 +707,15 @@ onMounted(() => {
           </div>
 
           <div class="total-row">
-            共 <b>{{ items.length }}</b> 种商品，合计：
-            <span class="amount">¥{{ estimateTotal }}</span>
+            <!--
+              ★ 里程碑 15 阶段 4：量词从「种商品」改成了「项」。
+                因为 items 现在是【规格行】不是商品行 ——
+                一件 T 恤的「黑色 S」和「白色 M」算两项，
+                说成「共 2 种商品」是错的（只有一种商品）。
+                ★ 量词错了不是小事：它会让用户以为自己买重了。
+            -->
+            共 <b>{{ items.length }}</b> 项，合计：
+            <span class="amount">¥{{ formatAmount(estimateTotal) }}</span>
           </div>
         </el-card>
 
@@ -662,7 +748,7 @@ onMounted(() => {
 
           <div class="submit-right">
             <div class="total">
-              应付：<span class="amount">¥{{ estimateTotal }}</span>
+              应付：<span class="amount">¥{{ formatAmount(estimateTotal) }}</span>
             </div>
             <el-button
               type="danger"
@@ -813,6 +899,17 @@ onMounted(() => {
   font-size: 14px;
   color: #303133;
   line-height: 1.5;
+}
+
+/* ★ 规格文本。和 Cart.vue 的 .row-spec 同一套配色与截断策略 ——
+   两个页面在用户眼里是"同一条流程的两步"，样式不该各走各的 */
+.line-spec {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #909399;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .line-reason {

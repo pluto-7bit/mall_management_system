@@ -505,7 +505,32 @@ watch(() => route.query, load, { immediate: true })
             ⚠️ 「这次数据没重排」不是理由 —— 重排与否由后端决定。
           -->
           <li v-for="it in o.items" :key="it.id" class="item-row">
-            <span class="item-name">{{ it.productName }}</span>
+            <span class="item-name">
+              {{ it.productName }}
+              <!--
+                ★ 规格文本（{@code sku_spec} 的快照）。里程碑 15 阶段 4 新增。
+
+                ★ 为什么订单里要显示它？因为下单时同一件商品可能占了
+                  【两行明细】（「黑色 M」和「白色 L」），
+                  只显示商品名的话这两行长得一模一样 ——
+                  用户根本没法核对自己到底买的是哪个规格、
+                  该评价的是哪一行。
+
+                ⚠️ 这里用 {@code v-if="it.skuSpec"} 而不是判断 null：
+                  {@code sku_spec} 是 NOT NULL DEFAULT '' 的列，
+                  无规格商品和历史订单都是【空串】—— 空串和缺值在这里
+                  是同一件事（都没规格可显示），一个宽松真值判断就够了。
+
+                ⚠️ 顺带对比一下同一个对象里的其他字段，三者的 null 规则
+                  完全不同，别记混了（完整版见 OrderItemVO 的注释）：
+                    it.skuSpec → 一定是字符串（可能是 ''）
+                    it.skuId   → 【可能整个 key 消失】（历史订单 / 孤儿明细）
+                    it.reviewId→ 【可能整个 key 消失】（还没评价）
+                  所以这个文件里判断可评价用 {@code !it.reviewId}，
+                  判断有无规格用 {@code it.skuSpec} —— 都用真值判断是对的。
+              -->
+              <span v-if="it.skuSpec" class="item-spec">{{ it.skuSpec }}</span>
+            </span>
             <span class="item-qty">× {{ it.quantity }}</span>
             <span class="item-sub">¥{{ formatAmount(it.subtotal) }}</span>
 
@@ -757,6 +782,19 @@ watch(() => route.query, load, { immediate: true })
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/*
+ * ★ 规格文本。.item-name 是 nowrap 的，所以这个 span 会跟在商品名
+ *   后面【同一行】显示 —— "某某T恤  颜色:黑 / 尺码:M"。
+ *   样式上只压低颜色，不加 margin-top 之类的换行暗示：
+ *   订单明细行本来就窄，多一行会让整行高度不齐。
+ *   完整地看完由 .item-name 的 ellipsis 兜底（截断比换行好）。
+ */
+.item-spec {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #909399;
 }
 
 .item-qty {

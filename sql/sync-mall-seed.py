@@ -129,16 +129,25 @@ def main():
     # ---- 自检：读回来确认改对了 ----
     back = open(MALL, encoding="utf-8").read()
     problems = []
-    if back.count("INSERT INTO product") != 1:
+    # ⚠️ 这里数的是 "INSERT INTO product ("（【带左括号】），不是 "INSERT INTO product"。
+    #   因为里程碑 13 之后 mall.sql 里多了一段 `INSERT INTO product_sku (`
+    #   —— 它含有 "INSERT INTO product" 这个子串，会把计数变成 2，
+    #   然后自检报「product 的 INSERT 不止一处」——一个和真实原因毫无关系的提示。
+    #   带上左括号之后只有真正的 product 段匹配得上：
+    #   product_sku 里 product 后面跟的是下划线，不是空格。
+    #   （⚠️ 写注释时也别把那串没有左括号的字符原样写出来，见 mall.sql 里的同一条提醒。）
+    if back.count("INSERT INTO product (") != 1:
         problems.append("product 的 INSERT 不止一处")
+    if back.count("INSERT INTO product_sku (") != 1:
+        problems.append("product_sku 的 INSERT 丢了")
     if back.count("INSERT INTO category") != 1:
         problems.append("category 的 INSERT 不止一处")
     if back.count("INSERT INTO member") != 1:
         problems.append("member 的 INSERT 丢了")
     if back.count("INSERT INTO admin_user") != 1:
         problems.append("admin_user 的 INSERT 丢了")
-    if back.count("DROP TABLE") != 10:
-        problems.append(f"DROP TABLE 数量变了（应为 10，实际 {back.count('DROP TABLE')}）")
+    if back.count("DROP TABLE") != 11:
+        problems.append(f"DROP TABLE 数量变了（应为 11，实际 {back.count('DROP TABLE')}）")
 
     # ★ 这几条断言是里程碑 11 加的，加它的理由是一条真实踩过的设计陷阱：
     #   mall.sql 里 CREATE TABLE 分两处 —— 种子数据区【前面】的是表定义，
@@ -151,7 +160,7 @@ def main():
     #
     #   ⚠️ 加新表的时候【一定要在这里补一条】。这个清单漏了一张表，
     #      就等于那张表的建表语句可以在无人察觉的情况下消失。
-    for table in ("product_image", "product_review", "product_review_image"):
+    for table in ("product_image", "product_review", "product_review_image", "product_sku"):
         if f"CREATE TABLE {table}" not in back:
             problems.append(f"{table} 的建表语句不见了（可能落进了替换区间）")
 
@@ -161,8 +170,9 @@ def main():
         for p in problems:
             print(f"  ✗ {p}")
         sys.exit("✗ 自检没过。用 git 或者备份把 mall.sql 还原，然后检查脚本。")
-    print("  ✓ 自检通过：category / product / member / admin_user 各一处，10 条 DROP TABLE 完好，"
-          "product_image / product_review / product_review_image 三张表的建表语句都在位")
+    print("  ✓ 自检通过：category / product / product_sku / member / admin_user 各一处，"
+          "11 条 DROP TABLE 完好，"
+          "product_image / product_review / product_review_image / product_sku 四张表的建表语句都在位")
 
 
 if __name__ == "__main__":

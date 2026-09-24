@@ -17,20 +17,20 @@ import com.example.mall.dto.ShopOrderQueryDTO;
 import com.example.mall.entity.MemberAddress;
 import com.example.mall.entity.Order;
 import com.example.mall.entity.OrderItem;
-import com.example.mall.entity.Product;
 import com.example.mall.mapper.MemberAddressMapper;
 import com.example.mall.mapper.OrderAdminMapper;
 import com.example.mall.mapper.OrderItemMapper;
 import com.example.mall.mapper.OrderMapper;
 import com.example.mall.mapper.OrderTimeoutMapper;
-import com.example.mall.mapper.ProductMapper;
+import com.example.mall.mapper.ProductSkuMapper;
 import com.example.mall.service.CartService;
 import com.example.mall.service.OrderService;
+import com.example.mall.service.ShopSkuService;
 import com.example.mall.util.OrderNoGenerator;
 import com.example.mall.vo.AdminOrderVO;
 import com.example.mall.vo.OrderItemVO;
 import com.example.mall.vo.OrderVO;
-import com.example.mall.vo.ShopProductVO;
+import com.example.mall.vo.ShopSkuVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -66,9 +66,35 @@ public class OrderServiceImpl implements OrderService {
 
     private final OrderMapper orderMapper;
     private final OrderItemMapper orderItemMapper;
-    private final ProductMapper productMapper;
+
+    /**
+     * ★ 里程碑 15 阶段 4：扣库存 / 还库存都走它。
+     *
+     * <p>⚠️ 这里原本依赖的是 {@code ProductMapper}，而且<b>已经整个去掉了</b> ——
+     * 注意是「去掉」不是「换掉」：本轮之后这个类<b>一条 SQL 都不再碰 product 表</b>。
+     * 下单要的商品信息全部来自 {@link #shopSkuService}（它内部才去查 product），
+     * 而下单要改的库存全部在 {@code product_sku} 上。
+     *
+     * <p>★ 少一个依赖的价值不是「代码短了」，而是<b>少一条路</b>：
+     * 只要 {@code ProductMapper} 还注入在这里，下一个人想读一下
+     * {@code product.price} 就只是「顺手」的事；而本轮的不变量是
+     * 「product 表上没有价格，也没有库存」——
+     * 让那条路根本不存在，比每次 code review 都提醒一遍可靠。
+     */
+    private final ProductSkuMapper productSkuMapper;
+
     private final MemberAddressMapper addressMapper;
     private final CartService cartService;
+
+    /**
+     * ★ 里程碑 15 阶段 4：下单时查「买的是哪几个规格、现在多少钱、还有多少货」。
+     *
+     * <p>用它而不是直接用 {@code ProductSkuMapper}，是因为它才是
+     * 「这个规格现在能不能买」那<b>唯一一处定义</b>（内部会去查商品、带上 status = 1）。
+     * 直接查 mapper 拿到的是「这一行存在」，而下单要问的是「这一行可买」——
+     * 两者在下架商品上给出完全不同的答案。
+     */
+    private final ShopSkuService shopSkuService;
 
     /**
      * ★ 只有超时扫描用它。之所以单独一个 Mapper 而不是复用 {@code OrderMapper}，
@@ -169,8 +195,14 @@ public class OrderServiceImpl implements OrderService {
      * 写进签名里，不用靠注释和记忆。</b>
      * （购物车那边返回 Map 是可以的，因为它是"读出来的原始数据"；
      *   这里是"下单要用的订单行"，有自己的含义，就该有自己的类型。）
+     *
+     * <p>★ 里程碑 15 阶段 4：{@code productId} 换成了 {@code skuId}。
+     * <b>「下单的一行」到底是什么，这一轮才第一次答对</b> ——
+     * 在 SKU 之前，「买 2 件 T 恤」这一行是说不清买的是哪个规格的，
+     * 而扣库存、算单价、写快照全都要知道这件事。
+     * 所以这个 record 的第一个字段必须是 skuId，它同时是这三件事的主语。
      */
-    private record OrderLine(Long productId, Integer quantity) {
+    private record OrderLine(Long skuId, Integer quantity) {
     }
 
     // ==========================================================================
@@ -188,8 +220,9 @@ public class OrderServiceImpl implements OrderService {
             return hit;
         }
 
-        // ★ 差异一：数量从 Redis 购物车里读，不信客户端传的任何数量
-        List<OrderLine> lines = linesFromCart(dto.getProductIds());
+        // ★ 差异一：数量从 Redis 购物车里读，不信客户端传的任何数量。
+        //   传进来的是【勾选了哪几个规格】，不是"每种买几件"。
+        List<OrderLine> lines = linesFromCart(dto.getSkuIds());
         // ★ 差异二由 OrderSource.CART 表达：下单成功后要清购物车
         return submit(OrderSource.CART, lines, dto, memberId);
     }
@@ -207,7 +240,7 @@ public class OrderServiceImpl implements OrderService {
         //   服务端没有别的真相来源，所以只能采信客户端说的数字。
         //   ⚠️ 但"采信数量"不等于"采信价格"：
         //      价格永远是服务端现查的，见 doCreate。
-        List<OrderLine> lines = List.of(new OrderLine(dto.getProductId(), dto.getQuantity()));
+        List<OrderLine> lines = List.of(new OrderLine(dto.getSkuId(), dto.getQuantity()));
         return submit(OrderSource.BUY_NOW, lines, dto, memberId);
     }
 
@@ -270,28 +303,28 @@ public class OrderServiceImpl implements OrderService {
     }
 
     /**
-     * 从购物车里取出要结算的商品和数量，并校验「勾选的商品确实在车里」。
+     * 从购物车里取出要结算的规格和数量，并校验「勾选的规格确实在车里」。
      *
      * <p><b>★ 为什么必须有这个校验？</b>
-     * 前端会说"我要结算 3 号和 7 号"，但前端说的话不能直接信 ——
-     * 用户可能在另一个标签页里把 7 号删了，也可能有人直接构造请求
-     * 传一个自己车里根本没有（甚至不存在）的商品 id 过来。
+     * 前端会说"我要结算 204 号和 311 号"，但前端说的话不能直接信 ——
+     * 用户可能在另一个标签页里把 311 号删了，也可能有人直接构造请求
+     * 传一个自己车里根本没有（甚至不存在）的规格 id 过来。
      * <b>凡是客户端"声称"的事实，服务端都要能用自己手里的数据验证一遍。</b>
      */
-    private List<OrderLine> linesFromCart(List<Long> productIds) {
-        // 去重：万一客户端传了 [3, 3]，不去重的话会生成两行明细、
+    private List<OrderLine> linesFromCart(List<Long> skuIds) {
+        // 去重：万一客户端传了 [204, 204]，不去重的话会生成两行明细、
         // 扣两次库存。而 Redis Hash 的 field 天然唯一，
         // 读出来的数量只有一份，所以重复的 id 前面会查出同一个数量，
-        // 结果就是"同一商品买两份"，金额却只算了一份 —— 数据就不一致了。
-        List<Long> distinctIds = productIds.stream().distinct().toList();
+        // 结果就是"同一规格买两份"，金额却只算了一份 —— 数据就不一致了。
+        List<Long> distinctIds = skuIds.stream().distinct().toList();
 
         Map<Long, Integer> quantities = cartService.readQuantities(distinctIds);
 
         List<OrderLine> lines = new ArrayList<>(distinctIds.size());
-        for (Long pid : distinctIds) {
-            Integer qty = quantities.get(pid);
+        for (Long sid : distinctIds) {
+            Integer qty = quantities.get(sid);
             if (qty == null) {
-                // 勾了一件"购物车里没有"的商品。可能是：
+                // 勾了一个"购物车里没有"的规格。可能是：
                 //   - 用户开了两个标签页，另一个把它删了
                 //   - 有人直接构造请求
                 // 不管哪种，都不能继续 —— 因为"买几件"无从得知，
@@ -299,7 +332,7 @@ public class OrderServiceImpl implements OrderService {
                 throw new BusinessException(ResultCode.NOT_FOUND,
                         "购物车里没有这件商品，请刷新页面后重试");
             }
-            lines.add(new OrderLine(pid, qty));
+            lines.add(new OrderLine(sid, qty));
         }
         return lines;
     }
@@ -448,39 +481,41 @@ public class OrderServiceImpl implements OrderService {
             throw new BusinessException(ResultCode.NOT_FOUND, "收货地址不存在，请重新选择");
         }
 
-        // ---- 2. 批量查商品 ----
-        // 用一次 IN 查询，不是循环 selectShopById（那是 N+1）。
-        // selectShopByIds 自带 status = 1，所以下架商品在这里就查不出来。
-        List<Long> productIds = lines.stream().map(OrderLine::productId).toList();
-        List<ShopProductVO> products = productMapper.selectShopByIds(productIds);
+        // ---- 2. 批量查规格 ----
+        // 用一次 IN 查询，不是循环查（那是 N+1）。
+        // ★ listAvailable 内部会拿 SKU 行去查它们所属的商品，而那条查询
+        //   自带 status = 1 —— 所以下架商品在这里就查不出来。
+        //   「能买」这条规则仍然只有一处定义，这里只是复用它。
+        List<Long> skuIds = lines.stream().map(OrderLine::skuId).toList();
+        List<ShopSkuVO> skus = shopSkuService.listAvailable(skuIds);
 
-        Map<Long, ShopProductVO> productMap = new HashMap<>(products.size());
-        for (ShopProductVO p : products) {
-            productMap.put(p.getId(), p);
+        Map<Long, ShopSkuVO> skuMap = new HashMap<>(skus.size());
+        for (ShopSkuVO s : skus) {
+            skuMap.put(s.getId(), s);
         }
 
         for (OrderLine line : lines) {
-            if (!productMap.containsKey(line.productId())) {
-                // 购物车里的商品可能在下单前被下架/删除了。
+            if (!skuMap.containsKey(line.skuId())) {
+                // 购物车里的商品/规格可能在下单前被下架/删除了。
                 // 和商品详情接口一样不区分"不存在"和"已下架"。
                 throw new BusinessException(ResultCode.NOT_FOUND,
                         "有商品已下架或不存在，请刷新购物车后重试");
             }
-            // ★ 单个商品的数量上限。放在这里而不是 DTO，理由见 BusinessRules：
+            // ★ 单个规格的数量上限。放在这里而不是 DTO，理由见 BusinessRules：
             //   购物车结算这条路的前端根本不传数量，DTO 根本拦不到它 ——
             //   数量是从 Redis 读出来的，只有 Service 才拿得到。
             //   （这正是"业务规则要放在拿得到数据的那一层"。）
             if (line.quantity() > BusinessRules.MAX_QUANTITY_PER_ITEM) {
-                ShopProductVO p = productMap.get(line.productId());
+                ShopSkuVO s = skuMap.get(line.skuId());
                 throw new BusinessException(ResultCode.CART_QUANTITY_LIMIT,
-                        "「" + p.getName() + "」最多购买 "
+                        "「" + s.getProductName() + "」最多购买 "
                                 + BusinessRules.MAX_QUANTITY_PER_ITEM + " 件");
             }
         }
 
         // ---- 3. 扣库存：★★ 防超卖的关键在这里 ----
         for (OrderLine line : lines) {
-            int affected = productMapper.decreaseStock(line.productId(), line.quantity());
+            int affected = productSkuMapper.decreaseSkuStock(line.skuId(), line.quantity());
 
             if (affected == 0) {
                 // 影响 0 行 = WHERE 里的 stock >= ? 不成立 = 库存不够。
@@ -488,22 +523,31 @@ public class OrderServiceImpl implements OrderService {
                 // 判断完全依赖数据库这条原子 UPDATE 的结果。
                 //
                 // ★ 失败路径上再查一次，是为了给出**准确**的原因和剩余量。
-                //   上面 productMap 里的 stock 是下单开始时读到的旧值，
+                //   上面 skuMap 里的 stock 是下单开始时读到的旧值，
                 //   在并发场景下可能已经变了，报给用户就是错的数字。
                 //   错误路径很少走到，多查一次库完全可以接受 ——
                 //   **优化要针对热路径，错误路径上准确性比性能重要。**
-                Product current = productMapper.selectEntityById(line.productId());
-                if (current == null || !Integer.valueOf(1).equals(current.getStatus())) {
+                //
+                // ★ 里程碑 15 阶段 4 换成了 listAvailable，而不是原来的
+                //   productMapper.selectEntityById —— 两个理由：
+                //     ① 它复用的还是「可买」那唯一一处定义（status = 1），
+                //        不会在这里长出第二条判断商品状态的路径
+                //     ② 顺手把 OrderServiceImpl 对 ProductMapper 的依赖整个去掉了
+                //        （下面第 7 步和取消路径也都换成 SKU 了），
+                //        少一个依赖就少一条「有人又从这里读写 product 表」的路
+                List<ShopSkuVO> current = shopSkuService.listAvailable(List.of(line.skuId()));
+                if (current.isEmpty()) {
                     throw new BusinessException(ResultCode.NOT_FOUND,
                             "有商品已下架，请刷新购物车后重试");
                 }
+                ShopSkuVO cur = current.get(0);
                 throw new BusinessException(ResultCode.STOCK_NOT_ENOUGH,
-                        "「" + current.getName() + "」库存不足，仅剩 " + current.getStock() + " 件");
+                        "「" + cur.getProductName() + "」库存不足，仅剩 " + cur.getStock() + " 件");
             }
         }
 
         // ---- 4. 算总金额 ----
-        // ★ 价格来自 productMap（也就是【数据库里现在的价格】），
+        // ★ 价格来自 skuMap（也就是【数据库里现在的价格】），
         //   不是客户端传的。这是"金额永远由服务端算"的落地。
         //
         // ★ 每一步都用 BigDecimal 的方法，不写成 price * quantity 这种
@@ -513,19 +557,29 @@ public class OrderServiceImpl implements OrderService {
         List<OrderItem> items = new ArrayList<>(lines.size());
 
         for (OrderLine line : lines) {
-            ShopProductVO p = productMap.get(line.productId());
+            ShopSkuVO s = skuMap.get(line.skuId());
 
             // 小计 = 单价 × 数量。单价是 DECIMAL(10,2)，乘出来的小数位数
             // 最多也就是 2 位，不会出现"两位以上的钱"。
-            BigDecimal subtotal = p.getPrice().multiply(BigDecimal.valueOf(line.quantity()));
+            BigDecimal subtotal = s.getPrice().multiply(BigDecimal.valueOf(line.quantity()));
             totalAmount = totalAmount.add(subtotal);
 
             OrderItem item = new OrderItem();
-            item.setProductId(p.getId());
-            // ★ 快照：把商品名和单价抄进明细。
-            //   商品明天改名或涨价，这笔订单不受影响。
-            item.setProductName(p.getName());
-            item.setPrice(p.getPrice());
+            // ★ 追溯线索：买的是哪件商品、哪个规格，都记下来。
+            //   两个都不是显示依据（显示以下面的快照为准），只是"去查原始商品"的入口。
+            item.setProductId(s.getProductId());
+            item.setSkuId(s.getId());
+            // ★ 快照：把商品名、规格文本和单价抄进明细。
+            //   商品明天改名、商家改规格定义、涨价 —— 这笔订单都不受影响。
+            //
+            //   ★ 里程碑 15 阶段 4 加了两样：
+            //     skuId   —— 取消订单时要把库存还回【哪一行】。没有它就只能还到商品级的
+            //                汇总库存上，而那一列已经不存在了。
+            //     skuSpec —— 「买的是哪个规格」这句话。存文本不存 JSON 的理由
+            //                见 OrderItem.skuSpec 的注释。
+            item.setProductName(s.getProductName());
+            item.setSkuSpec(s.getSpecText());
+            item.setPrice(s.getPrice());
             item.setQuantity(line.quantity());
             item.setSubtotal(subtotal);
             items.add(item);
@@ -560,8 +614,14 @@ public class OrderServiceImpl implements OrderService {
         orderItemMapper.batchInsert(items);
 
         // ---- 7. 注册"提交之后"的动作：清购物车 ----
+        // ★ 传的是 skuIds（就是上面第 2 步查规格用的那个列表）。
+        //   ⚠️⚠️ 别在这里顺手传 productId —— 购物车的 Redis field 是 skuId，
+        //   传 productId 不但删不掉，还可能把用户车里【另一行】删掉
+        //   （两个表的 id 都是自增的，撞车几乎是必然的），
+        //   而且这个回调里的异常只打日志，所以不会有任何报错。
+        //   详见 CartService.removeItems 和 CartServiceImpl 的注释。
         if (source == OrderSource.CART) {
-            registerCartCleanupAfterCommit(productIds, order.getOrderNo(), memberId);
+            registerCartCleanupAfterCommit(skuIds, order.getOrderNo(), memberId);
         }
 
         log.info("下单成功: source={}, memberId={}, orderNo={}, 商品种类={}, 总金额={}",
@@ -661,7 +721,7 @@ public class OrderServiceImpl implements OrderService {
      *       （用户车里可能正好有同一件商品，那是他自己加的，不该被清）。</li>
      * </ol>
      */
-    private void registerCartCleanupAfterCommit(List<Long> productIds,
+    private void registerCartCleanupAfterCommit(List<Long> skuIds,
                                                String orderNo, Long memberId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             // 理论上不会发生（这个方法只在 transactionTemplate.execute 里被调）。
@@ -676,12 +736,12 @@ public class OrderServiceImpl implements OrderService {
             @Override
             public void afterCommit() {
                 try {
-                    cartService.removeItems(productIds);
+                    cartService.removeItems(skuIds);
                 } catch (Exception e) {
                     // ★ 绝不能让它抛出去，理由见上面第 1 点
                     log.error("订单已创建但清理购物车失败，需人工核对: "
-                                    + "orderNo={}, memberId={}, productIds={}",
-                            orderNo, memberId, productIds, e);
+                                    + "orderNo={}, memberId={}, skuIds={}",
+                            orderNo, memberId, skuIds, e);
                 }
             }
         });
@@ -810,7 +870,7 @@ public class OrderServiceImpl implements OrderService {
      *
      * <p><b>必须让条件更新当闸门：只有拿到 {@code affected = 1} 的那一个，
      * 才有资格往下走。</b> 仓库里没有超卖，靠的就是这一条。
-     * （这和 {@code decreaseStock} 的「影响行数就是判断结果」是同一个模式。）
+     * （这和 {@code decreaseSkuStock} 的「影响行数就是判断结果」是同一个模式。）
      *
      * <h3>★ 为什么这个方法必须开事务？</h3>
      *
@@ -878,17 +938,48 @@ public class OrderServiceImpl implements OrderService {
             List<OrderItemVO> items = orderItemMapper.selectByOrderId(order.getId());
 
             for (OrderItemVO item : items) {
-                int restored = productMapper.increaseStock(item.getProductId(), item.getQuantity());
+                // ★★ 里程碑 15 阶段 4：还库存的主语从【商品】换成了【规格】。
+                //
+                //    这一处是整轮里最不容易被测出来的一处：还错了 SKU，
+                //    接口照样 200、订单状态照样变成「已取消」，
+                //    只是库存加到了另一件商品（或另一个规格）上。
+                //    test-sku.py 的 C 组专门为它准备了一条：
+                //    「同商品两个规格，取消后 A 加回来 2、B 一个数都不动」。
+                //
+                //    ⚠️ 用 productId 归还的老代码会让那条断言翻红 ——
+                //       因为 product_sku 的主键空间和 product 是两套独立的自增值，
+                //       拿 productId 去 WHERE id 是会命中【别人的 SKU】的。
+                //
+                // ★ 先挡掉 skuId 为 null 的历史明细。
+                //   这里【不】指望 increaseSkuStock(null, qty) 返回 0 就够了，
+                //   是因为下面那条 warn 会打出「SKU 不存在（可能已被删除）」——
+                //   而对 null 来说那句话是错的（它不是被删了，是这一行
+                //   本来就没有 SKU 这个概念：里程碑 13 之前下的单、
+                //   以及商品被硬删的孤儿明细）。**错误路径上的日志必须是真话**，
+                //   否则运维会照着它去查一个根本不存在的「被删的 SKU」。
+                if (item.getSkuId() == null) {
+                    log.warn("归还库存时该明细没有 skuId（历史订单或商品已被硬删），跳过: "
+                                    + "orderNo={}, orderItemId={}, productId={}, quantity={}",
+                            orderNo, item.getId(), item.getProductId(), item.getQuantity());
+                    continue;
+                }
+
+                int restored = productSkuMapper.increaseSkuStock(item.getSkuId(), item.getQuantity());
 
                 if (restored == 0) {
                     // ★ 只记日志，不抛异常。
                     //   order_item 故意没有外键（见 mall.sql 里那段说明），
-                    //   所以商品有可能已经被硬删除。这不是用户的错，
+                    //   所以这个 SKU 有可能已经被硬删除（商家改了规格定义，
+                    //   旧的那一行被删了）。这不是用户的错，
                     //   不能因此让「取消订单」这个操作失败 ——
                     //   否则订单卡在待付款、库存永远占着、用户还看得见它。
-                    //   商品没了是运维数据的问题，人工核对即可。
-                    log.warn("归还库存时商品不存在（可能已被删除），跳过: orderNo={}, productId={}, quantity={}",
-                            orderNo, item.getProductId(), item.getQuantity());
+                    //   SKU 没了是运维数据的问题，人工核对即可。
+                    //
+                    //   （这和 increaseStock 当年那句「商品已被硬删」是同一类情况，
+                    //     只是粒度细了一层。）
+                    log.warn("归还库存时 SKU 不存在（可能已被删除或换过规格），跳过: "
+                                    + "orderNo={}, skuId={}, quantity={}",
+                            orderNo, item.getSkuId(), item.getQuantity());
                 }
             }
 
@@ -913,10 +1004,10 @@ public class OrderServiceImpl implements OrderService {
      * <b>定时任务里的循环，默认就该是「尽力而为」而不是「全有全无」。</b>
      *
      * <p>⚠️ 注意这里的 try-catch 和 {@code cancelInternal} 里的
-     * {@code increaseStock == 0 只记日志} 是<b>两个不同层次</b>的容错：
+     * {@code increaseSkuStock == 0 只记日志} 是<b>两个不同层次</b>的容错：
      * <pre>
-     *   increaseStock == 0  →  预期内的、已知无害的情况（商品被删了），继续
-     *   这里的 catch        →  预期外的、不知道原因的情况，跳过这一条并记 error
+     *   increaseSkuStock == 0  →  预期内的、已知无害的情况（SKU 被删了 / 历史明细没有 skuId），继续
+     *   这里的 catch           →  预期外的、不知道原因的情况，跳过这一条并记 error
      * </pre>
      * 前者继续处理<b>这笔订单剩下的商品</b>，后者跳过<b>整笔订单</b>。
      *

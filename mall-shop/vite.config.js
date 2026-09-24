@@ -46,7 +46,7 @@ export default defineConfig({
       // ★ 里程碑 11 新增：商品图片改由【后端】提供，所以也要转发。
       //
       // 在这之前用户端从不转发 /api 以外的东西，因为图片是
-      // public/images/ 下的 47 个 SVG，Vite 自己就发了。
+      // public/images/ 下的 105 个 SVG，Vite 自己就发了。
       // 现在上传的图在 mall-server/uploads/ 下，得转发给 8080。
       //
       // ⚠️⚠️ 漏配这条的失败方式是 **200 + text/html**，不是 404：

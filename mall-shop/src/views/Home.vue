@@ -8,6 +8,7 @@ import { useCartStore } from '@/stores/cart'
 import { useCategoryStore } from '@/stores/category'
 import { readCategoryId } from '@/utils/query'
 import { useUserStore } from '@/stores/user'
+import { formatAmount } from '@/utils/format'
 
 /**
  * 用户端首页 = 商品列表页。
@@ -619,17 +620,79 @@ function goDetail(id) {
  * 要习惯性地问一句：里面的按钮点了会冒泡到外面吗？
  */
 async function quickAdd(product) {
+  // ★★ 里程碑 15 阶段 3：多规格商品在卡片上【不做加购】，先去详情页。
+  //
+  //   ★ 为什么不能「随便挑一个规格加进购物车」：
+  //     那样用户以为买的是"那个商品"，实际上系统替他选了一个规格 ——
+  //     而不同的规格【价格可以不一样】。他会以为什么价都行，
+  //     到结算页才发现金额和他看到的不一样，或者到货发现颜色不对。
+  //     **一个回答不了的问题（你要哪个规格？）不应该有一个假答案。**
+  //
+  //   ★ 这也正是后端那条「多规格时不给 defaultSkuId」的规矩在界面上
+  //     的落点：接口只对单规格商品给出「加购直接用它」的那个 id，
+  //     多规格时那个 key 整个不存在。前端在这里做的判断
+  //     （skuCount > 1）和它是同一件事，不是第二套规则。
+  //
+  //   ⚠️ 登录检查排在它后面：【看规格不需要登录】。
+  //     先跳登录页会打断一条本来可以继续的浏览路径。
+  if ((product.skuCount ?? 0) > 1) {
+    ElMessage.info('这件商品有多个规格，请先选择规格')
+    goDetail(product.id)
+    return
+  }
+
+  // ★★ 里程碑 15 阶段 4：这里传的是 {@code defaultSkuId}，不是商品 id。
+  //
+  //   ⚠️ 走到这里时 {@code skuCount} 必然是 1（多规格的在上面就跳走了），
+  //      所以后端【一定】会给出 defaultSkuId —— 这条链是闭合的。
+  //      但为了防止数据漂移（比如 skuCount 是脏的、或者某件商品真的
+  //      一条 SKU 都没有），下面还是兜一道：拿不到就退回去详情页，
+  //      而不是发一个注定失败的请求，让用户看到一句他看不懂的错误。
+  //
+  //   ★ 为什么用宽松真值判断而不是 === undefined：后端配了 non_null，
+  //     值为 null 的字段【整个 key 消失】，这里读到的是 undefined。
+  //     （这个语义在本项目里出现过很多次，见 CartItemVO / OrderItemVO。）
+  //
+  //   ⚠️ 这道检查排在登录检查【前面】。理由和上面那条一样：
+  //     它跟登不登录没关系，是数据的问题。
+  //     把一个"商品数据有问题"的用户送去登录页，他会登录完再回来，
+  //     再撞一次同一堵墙 —— 而且始终没人告诉他到底怎么了。
+  if (!product.defaultSkuId) {
+    goDetail(product.id)
+    return
+  }
+
   if (!userStore.isLoggedIn) {
     ElMessage.info('请先登录后再加入购物车')
     router.push({ path: '/login', query: { redirect: route.fullPath } })
     return
   }
 
-  const ok = await cartStore.add(product.id, 1)
+  const ok = await cartStore.add(product.defaultSkuId, 1)
   if (ok) {
     await cartStore.refresh(true)
     ElMessage.success('已加入购物车')
   }
+}
+
+/**
+ * 卡片上那个按钮的字。
+ *
+ * <p>三种状态，判据和上面那个 {@code :disabled} 是同一组字段：
+ * <pre>
+ *   整件商品都没货   → 「已售罄」    （disabled，点不动）
+ *   多个规格         → 「选规格」    （点了去详情页）
+ *   一个规格         → 「加入购物车」（点了直接加）
+ * </pre>
+ *
+ * <p>★ 写成函数而不是三段内联三元表达式：同一个判断在模板里要用两次
+ * （一次决定文字、一次决定禁用），写成两处内联就是两份会分叉的规则。
+ */
+function cardLabel(p) {
+  if ((p.totalStock ?? 0) <= 0) {
+    return '已售罄'
+  }
+  return (p.skuCount ?? 0) > 1 ? '选规格' : '加入购物车'
 }
 </script>
 
@@ -799,15 +862,30 @@ async function quickAdd(product) {
                   就不用每张都往下找一遍。
               -->
               <div class="product-meta">
-                <span class="product-price"><i>¥</i>{{ p.price }}</span>
                 <!--
-                  库存只做【展示】，不用来判断能不能买。
-                  真正的判断必须在下单时由后端在事务里做 ——
-                  前端显示「有货」和用户点下按钮之间可能隔了几分钟，
-                  这期间库存可能已经被别人买光了。
-                  详见后端 ShopProductVO 里 stock 字段的注释
+                  ⚠️ <i> 不能去掉、也不能把 ¥ 并进 formatAmount 的返回值 ——
+                     符号比数字小一号这件事是靠这个标签的 CSS 实现的
+                     （见本文件 <style> 里 .product-price i），
+                     而 formatAmount 的契约是【不带货币符号】。
+                     里程碑 14 改的是插值里的表达式，不是标签结构。
                 -->
-                <span class="product-stock">库存 {{ p.stock }}</span>
+                <span class="product-price"><i>¥</i>{{ formatAmount(p.minPrice) }}<span v-if="(p.skuCount ?? 0) > 1" class="price-from">起</span></span>
+                <!--
+                  ★★ 里程碑 15 阶段 3：这里原来是「库存 N 件」。
+
+                  ⚠️ 换成「N 个规格」不是换了个说法，是那个数【变得没有意义了】。
+                     SKU 化之后「这件商品的库存」是一个跨规格的合计
+                     （totalStock = SUM(product_sku.stock)），而它回答的
+                     「一共还有几件」不是一个买得到的数量 ——
+                     总库存 10 件分散在 4 个规格上，用户选哪一档都买不到 10 件。
+                     一个用户用不到的数摆在卡片上，比不摆更糟：
+                     他会拿它当"我最多能买几件"。
+
+                  ★ 而「几个规格」是【真的】：它就是这个商品的规格数，
+                    也正是卡片上最该告诉用户的那件事 ——
+                    他要不要为了一件商品多点一次进去选规格。
+                -->
+                <span class="product-stock">{{ p.skuCount ?? 0 }} 个规格</span>
               </div>
 
               <div class="product-name" :title="p.name">{{ p.name }}</div>
@@ -825,15 +903,30 @@ async function quickAdd(product) {
               <!--
                 ★ .stop 是必须的：阻止点击冒泡到卡片的 goDetail，
                   否则点加购会同时跳转到详情页。详见 quickAdd 的注释
+
+                ★★ 里程碑 15 阶段 3：这个按钮有了【三种】状态。
+
+                  判据是 totalStock（跨规格合计）—— 它是唯一一个
+                  「这件商品整体还有没有货」的判据，而这里问的正是这个问题。
+
+                  ⚠️ 但 totalStock 【只能】用来判断「整件商品售罄」，
+                     不能拿它当「最多能买几件」：
+                       判断整体有没有货 → 合计是对的，全部规格都没货才算售罄
+                       决定单次买几件   → 必须用【所选规格】的库存（详情页里）
+                     ⚠️ 用错方向不会报错，只会让数量选择器的上限比实际大几倍。
+
+                  ⚠️ 而且这个禁用它【拦不住任何东西】——库存可能在这几秒里
+                     被别人买走。真正的判定在后端下单时的事务里。
+                     这里做只是为了让用户少点一个注定失败的按钮。
               -->
               <el-button
                 class="quick-add"
                 type="danger"
                 size="small"
-                :disabled="p.stock <= 0"
+                :disabled="(p.totalStock ?? 0) <= 0"
                 @click.stop="quickAdd(p)"
               >
-                {{ p.stock > 0 ? '加入购物车' : '已售罄' }}
+                {{ cardLabel(p) }}
               </el-button>
             </div>
           </div>
@@ -1173,6 +1266,16 @@ async function quickAdd(product) {
   font-style: normal;
   font-size: 12px;
   margin-right: 1px;
+}
+
+/* 「起」——跟在起售价后面那个字（里程碑 15）。
+   ★ 用中性的灰，不用价格那个红：它是【注解】不是价格的一部分，
+     染成红的会被一起读成数字 */
+.price-from {
+  margin-left: 2px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #909399;
 }
 
 .product-stock {

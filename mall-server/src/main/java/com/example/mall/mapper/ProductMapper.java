@@ -105,6 +105,48 @@ public interface ProductMapper {
     Product selectEntityById(@Param("id") Long id);
 
     /**
+     * 只查一件商品的规格定义（{@code spec_schema} 那一列，原始 JSON 文本）。
+     *
+     * <p>★ 里程碑 15 新增。管理端详情要把它<b>解析成 {@code List<SpecGroup>}</b>
+     * 回给前端，而解析这一步只能由 Service 显式做 —— 见 XML 里那段注释：
+     * {@code selectById} 的 {@code resultType} 上那个字段是 List，
+     * 数据库里是 VARCHAR，MyBatis 没有现成的 TypeHandler 把前者映射成后者。
+     *
+     * <p>⚠️ 返回的是<b>文本</b>，可能是 {@code "[]"}，也可能是 {@code null}
+     * （阶段 1 回填的那批老数据没写过这一列）。{@code null} 的含义是
+     * 「无规格」，不是「查不到」—— 解析请一律走 {@code SpecJson.schemaOf}，
+     * 它已经把这两种情况统一处理掉了。
+     *
+     * @return 原始 JSON 文本，商品不存在时为 null
+     */
+    String selectSpecSchema(@Param("id") Long id);
+
+    /**
+     * 批量查一批商品的规格定义（{@code spec_schema} 那一列，原始 JSON 文本）。
+     *
+     * <p>★ 里程碑 15 阶段 3 新增。它存在的理由是「<b>别写成 N+1</b>」：
+     * 用户端的 {@code ShopSkuServiceImpl} 要渲染一批 SKU 的 {@code specText}，
+     * 而那句话里维度的显示顺序来自各自商品的 {@code spec_schema} ——
+     * 逐个商品调 {@link #selectSpecSchema} 就是「车里 10 件商品发 10 条 SQL」。
+     * 这条一次查完。
+     *
+     * <p>⚠️ <b>返回值里只有 {@code id} 和 {@code specSchema} 两个字段有值</b>，
+     * 其余全是 null —— 这条 SQL 的 SELECT 列表里就只有那两列。
+     * 这不是偷懒，是<b>刻意的</b>：调用方只拿它当「id → 规格定义」的载体，
+     * 查别的列纯属浪费。{@link Product} 在这里的角色是<b>载体</b>而不是实体，
+     * 这一点和它平时「product 表的一行」的用法不同，所以写在注释里而不是靠猜。
+     *
+     * <p>★ 为什么不干脆返回一个 {@code Map<Long, String>}？
+     * 因为 MyBatis 的 {@code resultType="map"} 会得到一个
+     * {@code List<Map<String,Object>>}，列名的字符串键和 {@code Object} 值
+     * 会让调用处退化成一堆强制转换 —— 那比一个「有两个字段有值」的载体更难读。
+     *
+     * @param ids 商品 id 列表，<b>调用方必须保证非空</b>（空的 {@code IN ()} 是语法错误）
+     * @return 每个商品一行，只有 id 和 specSchema。查不到的商品不会出现在结果里
+     */
+    List<Product> selectSpecSchemasByProductIds(@Param("ids") List<Long> ids);
+
+    /**
      * 新增商品。
      *
      * <p>插入成功后，MyBatis 会把数据库生成的自增主键<b>回填</b>到传入的
@@ -214,101 +256,37 @@ public interface ProductMapper {
      */
     List<ShopProductVO> selectShopByIds(@Param("ids") List<Long> ids);
 
-    /**
-     * 扣减库存 —— <b>本项目里防超卖最关键的一个方法。</b>
-     *
-     * <p>它只做一件事：把指定商品的库存减去 {@code quantity}，
-     * <b>但只在这个操作合法时才真的扣</b>。
-     *
-     * <h4>★★ 为什么不能写成「先查库存，再判断，再更新」？</h4>
-     *
-     * <p>因为那是<b>三个独立的步骤</b>，中间可以被别人插进来：
-     * <pre>
-     *   库存 = 1
-     *
-     *   线程 A：查库存 → 1，够 → 【准备扣】
-     *   线程 B：查库存 → 1，够 → 【准备扣】     ← B 在 A 扣之前也查到了 1
-     *   线程 A：UPDATE stock = 0
-     *   线程 B：UPDATE stock = 0                ← 两个人都以为自己买到了
-     *
-     *   结果：卖出去 2 件，库存只减了 1 → 超卖
-     * </pre>
-     * 这就是「先查后改」的经典竞态（check-then-act）。
-     * 它的问题在于「判断」和「修改」之间有一道缝。
-     *
-     * <h4>★ 解决办法：把判断和修改压成一条 SQL</h4>
-     *
-     * <pre>
-     *   UPDATE product SET stock = stock - 5
-     *   WHERE id = 3 AND stock >= 5
-     * </pre>
-     * 这条语句在数据库里是<b>原子的</b> —— InnoDB 执行 UPDATE 时
-     * 会给这一行加排他锁，「判断 stock >= 5」和「减掉 5」
-     * 在同一次加锁里完成，中间没有缝。
-     *
-     * <p>于是：
-     * <pre>
-     *   线程 A：UPDATE ... WHERE stock >= 5  →  影响 1 行（成功，库存变 0）
-     *   线程 B：UPDATE ... WHERE stock >= 5  →  影响 0 行（不满足条件，什么都没改）
-     * </pre>
-     * <b>「影响行数」就是判断结果：1 = 扣成功，0 = 库存不够。</b>
-     * 不需要在 Java 里写 {@code if (stock >= qty)}。
-     *
-     * <h4>★ 这是「乐观锁」思想的一种形式</h4>
-     *
-     * <p>它不加悲观锁（{@code SELECT ... FOR UPDATE}），
-     * 而是直接在写入时校验条件，靠数据库的行锁保证原子性。
-     * 好处是不用「先锁住再查」，一次往返搞定，
-     * 并发高的时候不会有一堆事务排队等锁。
-     *
-     * <p>⚠️ <b>必须说清楚一个前提</b>：这个方案的原子性来自
-     * InnoDB 的行锁。如果哪天数据库换成了 MyISAM（表锁，但没关系），
-     * 或者把 {@code stock} 挪到了 Redis，这个保证就不成立了。
-     * <b>「用了什么并发手段」和「依赖了什么东西的特性」是要一起记住的。</b>
-     *
-     * @param id       商品 id
-     * @param quantity 要扣掉的数量，必须为正数
-     * @return 影响行数。<b>1 = 扣减成功；0 = 库存不足或商品已下架</b>
-     *         —— 返回 0 时库存没有被改变，调用方要抛业务异常
-     */
-    int decreaseStock(@Param("id") Long id, @Param("quantity") Integer quantity);
-
-    /**
-     * 归还库存（取消订单时用）。
-     *
-     * <h4>★ 这不是 {@link #decreaseStock} 的逆运算，别为了对称写成一样</h4>
-     *
-     * <p>看两条 SQL 的差别：
-     * <pre>
-     *   decreaseStock:  UPDATE product SET stock = stock - ? WHERE id = ? AND stock >= ?
-     *   increaseStock:  UPDATE product SET stock = stock + ? WHERE id = ?
-     * </pre>
-     * <b>归还这边【故意没有】任何附加条件。</b>
-     *
-     * <p>为什么？因为扣减有一个<b>前置条件</b>要守（库存够不够），
-     * 加归还<b>没有前置条件</b> —— 库存是多少都能还，
-     * 商品已下架也照样要还，还完变成负数是不可能的（只加不减）。
-     *
-     * <p><b>★ 提炼出来：条件越少，越不容易在异常路径上卡住。</b>
-     * 归还库存走的是「订单取消」这条路径 —— 而这已经是一条<b>出错路径</b>了
-     * （用户不想要了、或者超时没付款）。在出错路径上多加一个判断，
-     * 就多一种「连取消都取消不掉」的可能：订单卡在待付款、
-     * 库存永远占着、用户还看到自己的订单。</p>
-     *
-     * <p>这一点和 {@code decreaseStock} 的注释里那句
-     * 「把判断集中在能给出好错误信息的那一层」是同一条原则的两次应用 ——
-     * 只不过那边是把判断<b>移到上层</b>，这边是把判断<b>直接去掉</b>。</p>
-     *
-     * <h4>★ 影响行数为 0 不算错误</h4>
-     *
-     * <p>{@code order_item} 表故意没有外键（见 {@code mall.sql} 里那段说明），
-     * 所以商品有可能已经被硬删除。这时候这条 UPDATE 影响 0 行。
-     * <b>调用方看到 0 行时应该记一条 warn 日志然后继续，不能因此让取消失败</b> ——
-     * 商品没了是维护数据的问题，不该让用户的取消操作跟着失败。
-     *
-     * @param id       商品 id
-     * @param quantity 要归还的数量，必须为正数
-     * @return 影响行数。<b>1 = 归还成功；0 = 商品不存在（已被硬删）</b>
-     */
-    int increaseStock(@Param("id") Long id, @Param("quantity") Integer quantity);
+    // ==========================================================================
+    // ★ 里程碑 15 阶段 4：decreaseStock / increaseStock 【已从这里删除】，
+    //   搬去了 ProductSkuMapper（decreaseSkuStock / increaseSkuStock）。
+    //
+    //   理由不是「同类的东西放一起好看」，而是【库存的定义者换人了】：
+    //     阶段 4 之前  product.stock 是库存      → 扣它
+    //     阶段 4 之后  product_sku.stock 是库存  → 扣它
+    //
+    //   而本轮的不变量是「product 表上没有价格，也没有库存」。
+    //   一个表上没有的东西，这里就不该有改它的方法 ——
+    //   留着 decreaseStock 等于留了一条「把库存写回一个已经不表示库存的列」的路，
+    //   而且它【不会报错】：product.stock 那一列要到阶段 6 才删。
+    //   静默地扣错表，比编译不过危险得多。
+    //
+    //   ★ 阶段 6 跑完 migration-13b 之后，那两列真的没有了 ——
+    //     于是一个假设可以回头核对一下：**这个删除到底有没有必要？**
+    //     如果当初把 decreaseStock 留在 ProductMapper 里，
+    //     现在它会是编译不过（列没了，INSERT/UPDATE 语句里写着它）
+    //     而不是「静默扣错表」。也就是说阶段 6 之后，
+    //     「删方法」这件事本身不再救你 —— 救你的是**阶段 4 那时就删掉**。
+    //     先删方法、再删列，两件事的次序不能反：
+    //     列先没了，方法就变成「编译期报错」这种最好的形式了，
+    //     但那要等到阶段 6；而阶段 4~6 之间那段有两列都在的时间，
+    //     才是静默出错的高危窗口。
+    //     ★ 教训：**「删掉一个定义者」和「删掉它留下的副本」不是同一个动作，
+    //       而且前者必须在前。**
+    //
+    //   ⚠️ 而 selectShopById / selectShopByIds 【留在这里，没有删】——
+    //      它们不是库存方法，是「用户端能看见什么」的唯一定义
+    //      （WHERE p.status = 1）。阶段 3 的 ShopSkuServiceImpl 正是靠
+    //      「SKU 查到了、但它所属商品查不到 → 不可买」复用这一条规则。
+    //      删掉它们，这条规则就会长出第二份实现。
+    // ==========================================================================
 }

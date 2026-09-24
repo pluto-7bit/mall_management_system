@@ -160,16 +160,24 @@ def cleanup():
     run_sql(f"DELETE FROM product_review WHERE product_id IN "
             f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
 
+    # ★ 里程碑 15：product_sku 也【没有外键】，所以它同样必须排在商品之前。
+    #   顺序错了不报错，只会留下一批「商品没了但 SKU 行还在」的孤儿 ——
+    #   和上面图集/评价那两段一模一样的道理。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
+
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
 
 
 def create_product(name, category_id, price, stock, status, description=""):
     """用管理端接口建商品，返回新商品的 id。"""
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
         "categoryId": category_id,
         "name": name,
-        "price": price,
-        "stock": stock,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
         "description": description,
         "status": status,
     }, token=ADMIN_TOKEN)
@@ -399,13 +407,22 @@ def main():
     # ==================================================================
     section("6. 排序")
 
+    # ★ 里程碑 15 阶段 6：这里读的键从 price 变成了 minPrice。
+    #   两者在阶段 2~5 期间【恰好相等】（product.price 那时是派生汇总），
+    #   所以这一节在那时"改不改都绿"—— 而那正是它值得改的理由：
+    #   **排序依据必须等于列表上显示的那个数。**
+    #   列表现在显示 minPrice，如果 ORDER BY 还按别的东西排，
+    #   用户会看到 [¥100, ¥80, ¥50] 这样一个"没排序"的列表。
+    #   ⚠️ 而这条断言【测不出】那种情况：它只验证「结果是有序的」，
+    #      不验证「按哪个数有序」。真正的守护是 ProductMapper.xml 的
+    #      shopOrderBy 里那句 ORDER BY a.min_price —— 两边取的是同一个值。
     st, r = shop_list(sort="price_asc", pageSize=100)
-    prices = [float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])]
+    prices = [float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])]
     check("sort=price_asc → 价格单调不减",
           st == 200 and prices == sorted(prices) and len(prices) > 1, f"{prices}")
 
     st, r = shop_list(sort="price_desc", pageSize=100)
-    prices_desc = [float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])]
+    prices_desc = [float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])]
     check("sort=price_desc → 价格单调不增",
           st == 200 and prices_desc == sorted(prices_desc, reverse=True) and len(prices_desc) > 1,
           f"{prices_desc}")
@@ -414,12 +431,12 @@ def main():
           prices != prices_desc, f"asc={prices[:5]} desc={prices_desc[:5]}")
 
     st, r = shop_list(sort="price_asc", keyword=TAG, pageSize=100)
-    tagged_prices = [float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])]
+    tagged_prices = [float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])]
     check("同一批商品按价格升序 → 11.11 在 33.33 前面",
           tagged_prices == [11.11, 33.33], f"{tagged_prices}")
 
     st, r = shop_list(sort="price_desc", keyword=TAG, pageSize=100)
-    tagged_desc = [float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])]
+    tagged_desc = [float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])]
     check("同一批商品按价格降序 → 33.33 在 11.11 前面",
           tagged_desc == [33.33, 11.11], f"{tagged_desc}")
 
@@ -438,8 +455,8 @@ def main():
 
     st, r = shop_list(sort="price_asc", pageSize=5)
     check("（复核）非法排序值没有影响后续的正常排序",
-          r.get("code") == 200 and [float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])]
-          == sorted(float(i["price"]) for i in ((r.get("data") or {}).get("list") or [])),
+          r.get("code") == 200 and [float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])]
+          == sorted(float(i["minPrice"]) for i in ((r.get("data") or {}).get("list") or [])),
           f"{r}")
 
     # ==================================================================

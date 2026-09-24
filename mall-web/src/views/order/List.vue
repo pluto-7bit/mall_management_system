@@ -244,7 +244,7 @@ async function handleShip(row) {
  * {@code mall-shop} 那个 {@code utils/format.js}，也没有 {@code theme.css}，
  * 两个工程之间没有代码共享机制（见 {@code utils/orderStatus.js} 开头
  * 关于「刻意重复」的说明）。
- * 商品列表页（{@code product/List.vue:253}）里那一份是<b>内联在模板里</b>的
+ * 商品列表页（{@code product/List.vue}）里那一份是<b>内联在模板里</b>的
  * {@code Number(row.price).toFixed(2)}，属于同类东西但形态不同 ——
  * 等这里也出现第四处时再考虑提取，现在不动它。
  * <b>顺手改掉别人依赖的东西，是协作里最招人烦的一类改动。</b>

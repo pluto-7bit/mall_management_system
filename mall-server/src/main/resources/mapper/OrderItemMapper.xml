@@ -29,11 +29,11 @@
         所以才必须配一层 Java 白名单)。
     -->
     <insert id="batchInsert">
-        INSERT INTO order_item (order_id, product_id, product_name, price, quantity, subtotal)
+        INSERT INTO order_item (order_id, product_id, sku_id, product_name, sku_spec, price, quantity, subtotal)
         VALUES
         <foreach collection="items" item="it" separator=",">
-            (#{it.orderId}, #{it.productId}, #{it.productName},
-             #{it.price}, #{it.quantity}, #{it.subtotal})
+            (#{it.orderId}, #{it.productId}, #{it.skuId}, #{it.productName},
+             #{it.skuSpec}, #{it.price}, #{it.quantity}, #{it.subtotal})
         </foreach>
     </insert>
 
@@ -71,6 +71,12 @@
         「订单列表里点不了评价、订单详情里能点」，而它们共用同一个 VO，
         看 Java 代码根本看不出差别。
 
+      ★ 里程碑 15 又给两条查询【同时】加了两列：oi.sku_id / oi.sku_spec。
+        加这两列的理由和里程碑 12 加 reviewId 那次完全一样（见 OrderItemVO
+        的类注释），所以处理方式也照抄：两条一起改，列清单逐字对齐。
+        ⚠️ 这两列是【左对齐补空格】排的，加字段时留意别把 `AS` 的位置弄歪 ——
+        歪了不影响执行，但下一个人对照两条 SQL 时要多数一遍空格才能确认一致。
+
       ★ 表加了别名 oi（原来没有）—— 因为 join 进来的 product_review
         也有 id 列，不加限定符的话 SELECT id 会直接报
         "Column 'id' in field list is ambiguous"。
@@ -80,7 +86,9 @@
         SELECT oi.id           AS id,
                oi.order_id     AS orderId,
                oi.product_id   AS productId,
+               oi.sku_id       AS skuId,
                oi.product_name AS productName,
+               oi.sku_spec     AS skuSpec,
                oi.price,
                oi.quantity,
                oi.subtotal,
@@ -129,7 +137,9 @@
         SELECT oi.id           AS id,
                oi.order_id     AS orderId,
                oi.product_id   AS productId,
+               oi.sku_id       AS skuId,
                oi.product_name AS productName,
+               oi.sku_spec     AS skuSpec,
                oi.price,
                oi.quantity,
                oi.subtotal,

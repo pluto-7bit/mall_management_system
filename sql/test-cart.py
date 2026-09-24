@@ -103,6 +103,11 @@ def run_sql(sql):
     return [line.split("\t") for line in result.stdout.strip().splitlines() if line]
 
 
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
+
+
 REDIS = "mall-redis"
 
 
@@ -156,6 +161,10 @@ def member_setup():
 
 
 def cleanup():
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    #   顺序反了不会报任何错，只会安静地攒孤儿行。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
     # Redis 里的购物车也要清 —— 会员 id 是自增的，
@@ -166,48 +175,81 @@ def cleanup():
 
 
 def create_product(name, category_id, price, stock, status=1):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "categoryId": category_id, "name": name, "price": price,
-        "stock": stock, "status": status,
+        "categoryId": category_id, "name": name, "status": status,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
     }, token=ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
-    return r["data"]
+    return default_sku_of(r["data"])
+
+
+def default_sku_of(pid):
+    """无规格商品的那唯一一条「默认 SKU」的 id。
+
+    ★★ 里程碑 15 阶段 4：这个脚本返回的标识符从【商品 id】换成了【SKU id】。
+      为什么不是「顺便也返回商品 id」？因为购物车接口现在只认 SKU id，
+      而这个脚本 90% 的断言都在讲购物车。让它继续叫 p1..p5 但实际是 skuId，
+      会让每一个 `set_product_status(pid_of_sku(p3), 0)` 看起来仍然是对的 ——
+      而这正是本轮最危险的那类错误（两种 id 都是自增数字，撞车是必然的，
+      传错了不会 404、不会 400，只会静默地操作【另一行】）。
+      所以凡是需要商品 id 的地方，一律显式写 pid_of_sku(...)，
+      让「这里用的是哪种 id」在每一行上都看得见。
+    """
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
+
+
+def pid_of_sku(sku_id):
+    """SKU id → 商品 id。★ 只给「按商品整体操作」的地方用（下架、删除）。"""
+    return int(scalar(f"SELECT product_id FROM product_sku WHERE id = {sku_id}"))
 
 
 def set_product_status(pid, status):
     """直接改数据库。用 SQL 而不是管理端接口，是因为管理端更新接口
-    要求传完整的商品信息（categoryId/name/price/stock 都不能为空），
+    要求传完整的商品信息（categoryId/name/skus 都不能为空），
     为了改一个 status 要先把整个商品查出来再传回去，很啰嗦。
 
     ★ 测试脚本里「绕过业务层直接改数据」是可以的 ——
       它模拟的正是「运营在后台下架了商品」这个外部事件，
       而这个事件从购物车的视角看，就是「数据库里的 status 变了」。
+
+    ⚠️ 参数是【商品 id】。下架是商品级操作（整个商品连同它的全部规格
+       一起不可售），所以它必须走 product 表。
     """
     run_sql(f"UPDATE product SET status = {status} WHERE id = {pid}")
 
 
-def set_product_price(pid, price):
-    run_sql(f"UPDATE product SET price = {price} WHERE id = {pid}")
+def set_sku_price(sku_id, price):
+    """★ 里程碑 15 阶段 4：改的是 product_sku 那行，不是 product 那行。
+
+    以前写的是 `UPDATE product SET price = ...`。阶段 2~5 期间 product.price
+    还作为回滚预案在写，所以【写错了不会报错】—— 列还在，语句合法，
+    只是购物车读的是 sku 行，于是「改价后购物车跟着变」那条断言会红。
+    """
+    run_sql(f"UPDATE product_sku SET price = {price} WHERE id = {sku_id}")
 
 
-def set_product_stock(pid, stock):
-    run_sql(f"UPDATE product SET stock = {stock} WHERE id = {pid}")
+def set_sku_stock(sku_id, stock):
+    """同上：库存的唯一真源是 sku 行。"""
+    run_sql(f"UPDATE product_sku SET stock = {stock} WHERE id = {sku_id}")
 
 
 # ---- 购物车接口的便捷封装（都用会员 token）----------------------------------
-def cart_add(product_id, quantity):
+def cart_add(sku_id, quantity):
     return call("POST", "/shop/cart/items",
-                {"productId": product_id, "quantity": quantity}, token=MEMBER_TOKEN)
+                {"skuId": sku_id, "quantity": quantity}, token=MEMBER_TOKEN)
 
 
-def cart_update(product_id, quantity):
-    return call("PUT", f"/shop/cart/items/{product_id}",
+def cart_update(sku_id, quantity):
+    return call("PUT", f"/shop/cart/items/{sku_id}",
                 {"quantity": quantity}, token=MEMBER_TOKEN)
 
 
-def cart_remove(product_id):
-    return call("DELETE", f"/shop/cart/items/{product_id}", token=MEMBER_TOKEN)
+def cart_remove(sku_id):
+    return call("DELETE", f"/shop/cart/items/{sku_id}", token=MEMBER_TOKEN)
 
 
 def cart_get():
@@ -222,9 +264,15 @@ def items_of(r):
     return ((r.get("data") or {}).get("items")) or []
 
 
-def find_item(r, product_id):
+def find_item(r, sku_id):
+    """按 skuId 找购物车里的一行。
+
+    ★ 用 skuId 而不是 productId：同一件商品的两个规格在车里是【两行】，
+      按 productId 找会永远只拿到第一行 —— 而且两行的 productId 相同，
+      断言会在「另一行」上通过。这一轮 D1b 那条断言就是在防这个。
+    """
     for i in items_of(r):
-        if i["productId"] == product_id:
+        if i.get("skuId") == sku_id:
             return i
     return None
 
@@ -256,6 +304,10 @@ def main():
     #                             只有它能把「超过 99 上限」和「超过库存」
     #                             这两种超限区分开 —— 用 P2（库存 3）测 99 上限
     #                             是测不出来的，因为库存先拦住了，根本到不了 99
+    #
+    # ⚠️ 里程碑 15 阶段 4：下面这五个变量拿到的是【SKU id】，不是商品 id。
+    #    它们都是无规格商品，各自只有一条默认 SKU，所以是一一对应的 ——
+    #    但凡是「按商品整体」的操作（下架、删除）都要显式写 pid_of_sku(...)。
     p1 = create_product(f"{TAG} 商品一", CAT, "100.00", 10)
     p2 = create_product(f"{TAG} 商品二", CAT, "200.00", 3)
     p3 = create_product(f"{TAG} 商品三", CAT, "300.00", 50)
@@ -263,6 +315,8 @@ def main():
     p5 = create_product(f"{TAG} 商品五", CAT, "50.00", 500)
     print(f"  已创建：P1={p1}(100元/库存10)  P2={p2}(200元/库存3)  "
           f"P3={p3}(300元/库存50)  P4={p4}(400元/库存50)  P5={p5}(50元/库存500)")
+    print(f"  ★ 上面是 SKU id。对应的商品 id："
+          f"{[pid_of_sku(x) for x in (p1, p2, p3, p4, p5)]}")
 
     # 从干净状态开始
     redis_cmd("DEL", f"mall:cart:{MEMBER_ID}")
@@ -273,7 +327,7 @@ def main():
     st, r = call("GET", "/shop/cart")
     check("游客查购物车 → 401", st == 401, f"HTTP {st} / {r}")
 
-    st, r = call("POST", "/shop/cart/items", {"productId": p1, "quantity": 1})
+    st, r = call("POST", "/shop/cart/items", {"skuId": p1, "quantity": 1})
     check("★ 游客加购 → 401（否则任何人都能改别人的购物车）",
           st == 401, f"HTTP {st} / {r}")
 
@@ -356,14 +410,14 @@ def main():
           find_item(r, p1).get("quantity") == 5, f"{find_item(r, p1)}")
 
     st, r = call("POST", "/shop/cart/items", {"quantity": 1}, token=MEMBER_TOKEN)
-    check("不传 productId → 业务码 400", r.get("code") == 400, f"HTTP {st} / {r}")
+    check("不传 skuId → 业务码 400", r.get("code") == 400, f"HTTP {st} / {r}")
 
-    st, r = call("POST", "/shop/cart/items", {"productId": p1}, token=MEMBER_TOKEN)
+    st, r = call("POST", "/shop/cart/items", {"skuId": p1}, token=MEMBER_TOKEN)
     check("不传 quantity → 业务码 400", r.get("code") == 400, f"HTTP {st} / {r}")
 
     # ★ 参数白名单：多传的字段必须被忽略，不能生效
     st, r = call("POST", "/shop/cart/items",
-                 {"productId": p1, "quantity": 1,
+                 {"skuId": p1, "quantity": 1,
                   "price": "0.01", "memberId": 99999, "id": 1},
                  token=MEMBER_TOKEN)
     check("★ 多传 price / memberId / id → 被忽略（参数白名单）",
@@ -396,7 +450,7 @@ def main():
     pairs = dict(zip(raw[0::2], raw[1::2]))
     print(f"  Redis 里的原始内容：{pairs}")
 
-    check("★ field 是商品 id（字符串形式）",
+    check("★★ field 是 skuId（字符串形式）—— 阶段 4 把 field 从商品 id 换成了规格 id",
           str(p1) in pairs and str(p3) in pairs, f"{pairs}")
     check("★ value 是数量（字符串形式）",
           pairs.get(str(p1)) == "6" and pairs.get(str(p3)) == "1",
@@ -434,7 +488,7 @@ def main():
           float(find_item(r, p4)["subtotal"]) == 800.0, f"{find_item(r, p4)}")
 
     # ★ 模拟运营在后台把价格从 400 调到 250
-    set_product_price(p4, "250.00")
+    set_sku_price(p4, "250.00")
 
     st, r = cart_get()
     item4 = find_item(r, p4)
@@ -445,7 +499,7 @@ def main():
           float(item4["subtotal"]) == 500.0, f"小计 = {item4.get('subtotal')}")
 
     # 改回去，别影响后面的合计断言
-    set_product_price(p4, "400.00")
+    set_sku_price(p4, "400.00")
     st, r = cart_get()
     check("（恢复）价格改回 400 后购物车也跟着回到 400",
           float(find_item(r, p4)["price"]) == 400.0, f"{find_item(r, p4)}")
@@ -462,7 +516,7 @@ def main():
     before_total = float(r["data"]["totalAmount"])
 
     # ★ 模拟运营在后台下架 P3
-    set_product_status(p3, 0)
+    set_product_status(pid_of_sku(p3), 0)
 
     st, r = cart_get()
     item3 = find_item(r, p3)
@@ -492,8 +546,8 @@ def main():
           r["data"]["totalQuantity"] == 8, f"总件数 = {r['data']['totalQuantity']}")
 
     check("★ 失效商品沉到列表底部（能买的排前面）",
-          items_of(r)[-1]["productId"] == p3,
-          f"顺序：{[i['productId'] for i in items_of(r)]}")
+          items_of(r)[-1]["skuId"] == p3,
+          f"顺序：{[i['skuId'] for i in items_of(r)]}")
 
     # 下架的商品不能【新】加进购物车
     st, r = cart_add(p3, 1)
@@ -506,7 +560,7 @@ def main():
 
     # ---- 库存不足的失效 ----
     # P1 在购物车里有 6 件，把库存降到 2
-    set_product_stock(p1, 2)
+    set_sku_stock(p1, 2)
     st, r = cart_get()
     item1 = find_item(r, p1)
     check("★ 库存不足时标记为失效，并说明只剩几件",
@@ -516,14 +570,19 @@ def main():
     print(f"  失效原因：「{item1.get('unavailableReason')}」")
 
     # 库存降到 0 = 售罄
-    set_product_stock(p1, 0)
+    set_sku_stock(p1, 0)
     st, r = cart_get()
-    check("库存为 0 时原因是「已售罄」",
-          find_item(r, p1).get("unavailableReason") == "已售罄", f"{find_item(r, p1)}")
+    # ★ 里程碑 15 阶段 4：文案从「已售罄」变成「该规格已售罄」。
+    #   不是措辞讲究 —— SKU 化之后「这件商品卖光了」和「你选的这个规格卖光了」
+    #   是两件事：同一件商品很可能别的规格还有货，说「已售罄」会让用户
+    #   以为整件商品都没了，直接走掉。
+    check("★ 库存为 0 时原因是「该规格已售罄」（不是说整件商品卖光了）",
+          find_item(r, p1).get("unavailableReason") == "该规格已售罄",
+          f"{find_item(r, p1)}")
 
     # 恢复
-    set_product_stock(p1, 10)
-    set_product_status(p3, 1)
+    set_sku_stock(p1, 10)
+    set_product_status(pid_of_sku(p3), 1)
 
     # ==================================================================
     section("7. 修改数量（设值语义）")
@@ -578,14 +637,14 @@ def main():
     check("★ 改一个不在购物车里的商品 → 1003（PUT 不能当 POST 用）",
           r.get("code") == 1003, f"HTTP {st} / {r}")
 
-    # 参数白名单：body 里多写 productId 也不该生效
-    st, r = call("PUT", f"/shop/cart/items/{p1}", {"quantity": 2, "productId": 999999},
+    # 参数白名单：body 里多写另一个 skuId 也不该生效
+    st, r = call("PUT", f"/shop/cart/items/{p1}", {"quantity": 2, "skuId": 999999},
                  token=MEMBER_TOKEN)
-    check("★ 改数量时 body 里的 productId 被忽略（URL 才是准的）",
+    check("★ 改数量时 body 里的 skuId 被忽略（URL 才是准的）",
           r.get("code") == 200, f"HTTP {st} / {r}")
     st, r = cart_get()
     check("★ 没有凭空多出一个 id=999999 的条目",
-          find_item(r, 999999) is None, f"{[i['productId'] for i in items_of(r)]}")
+          find_item(r, 999999) is None, f"{[i['skuId'] for i in items_of(r)]}")
 
     # ==================================================================
     section("8. ★ 两种「超限」：超过库存 vs 超过 99 上限")
@@ -655,7 +714,7 @@ def main():
     check("移除购物车里的商品成功", r.get("code") == 200, f"HTTP {st} / {r}")
     st, r = cart_get()
     check("移除后购物车里没有它了", find_item(r, p2) is None,
-          f"{[i['productId'] for i in items_of(r)]}")
+          f"{[i['skuId'] for i in items_of(r)]}")
 
     # ★ 幂等：再删一次也应该成功
     st, r = cart_remove(p2)
@@ -732,7 +791,7 @@ def main():
     # ★ 金额不用浮点数运算的验证：把所有商品调成 0.10 元
     #   double 累加 0.1 三次会得到 0.30000000000000004
     for pid in (p1, p2, p4):
-        set_product_price(pid, "0.10")
+        set_sku_price(pid, "0.10")
     cart_clear()
     cart_add(p1, 1)
     cart_add(p2, 1)
@@ -743,15 +802,20 @@ def main():
           total_str in ("0.30", "0.3"), f"合计 = {total_str}")
 
     for pid, price in ((p1, "100.00"), (p2, "200.00"), (p4, "400.00")):
-        set_product_price(pid, price)
+        set_sku_price(pid, price)
 
     # ==================================================================
     section("12. 清理")
 
     cart_clear()
-    for pid in (p1, p2, p3, p4, p5):
+    # ★ 删除是【商品级】操作，所以要先把 skuId 换成商品 id。
+    #   直接把 skuId 填进 /admin/products/{id} 的话，会删掉【另一件】商品
+    #   （或者 404 之后再想），而且这里两种 id 都是自增数字，撞车是必然的。
+    for sku in (p1, p2, p3, p4, p5):
+        pid = pid_of_sku(sku)
         st, r = call("DELETE", f"/admin/products/{pid}", token=ADMIN_TOKEN)
-        check(f"删除测试商品 {pid}", r.get("code") == 200, f"HTTP {st} / {r}")
+        check(f"删除测试商品 商品id={pid}（sku={sku}）",
+              r.get("code") == 200, f"HTTP {st} / {r}")
 
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
     rows = run_sql(f"SELECT COUNT(*) FROM member WHERE username LIKE '{PREFIX}%'")

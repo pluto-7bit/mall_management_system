@@ -18,6 +18,24 @@ import request from './request'
  * {@code request.js} 的拦截器会清 token 并跳登录页。
  * 但在界面层先拦一道体验好得多 —— 用户点「加入购物车」
  * 直接被告知「请先登录」并跳到登录页，比先发一个注定失败的请求再跳要干脆。
+ *
+ * <h3>★★ 里程碑 15 阶段 4：这个文件里的 id 全部从 productId 换成了 skuId</h3>
+ *
+ * <p><b>接口路径一个字都没变</b> —— 还是 {@code /shop/cart/items/730}，
+ * 变的只是那个 730 现在指「哪个规格」。这是本轮最容易漏的一类改动：
+ * 漏改的话不会有 404、不会有 400，<b>只会静默地改错行</b>。
+ *
+ * <p>为什么必须换？因为「一件商品只能有一个价格、一个库存」这个模型
+ * 已经不存在了。同一件 T 恤的「黑色 S」和「白色 M」是两个独立的
+ * 可买对象，各有各的库存 —— 购物车里它们必须是<b>两条记录</b>。
+ * 如果 field 还是 productId，它们会被合并成一条，
+ * 下单时也就说不清用户买的到底是哪个规格。
+ *
+ * <p>⚠️ 换 field 的连带后果：<b>Redis 里的老购物车数据必须清掉</b>。
+ * 老数据里的 productId 如果碰巧等于某个 skuId，它会被当成那个规格读出来 ——
+ * 购物车里凭空出现一件用户从没加过的商品。
+ * （这个清理已经在阶段 4 手工做过一次，理由写在
+ * {@code CartServiceImpl.KEY_PREFIX} 的注释里。）
  */
 
 /**
@@ -66,33 +84,34 @@ export function getCartCount() {
  * 结果变成了 5。「多出来的数量从哪来的」这种 bug 很难查，
  * 因为看起来每一步都"正常"。
  *
- * @param {number} productId 商品 id
- * @param {number} quantity  要【增加】的数量，1~99
+ * @param {number} skuId    ★ 规格 id，不是商品 id
+ *                          （里程碑 15 阶段 4 换的，理由见类注释末尾）
+ * @param {number} quantity 要【增加】的数量，1~99
  */
-export function addCartItem(productId, quantity = 1) {
-  return request.post('/shop/cart/items', { productId, quantity })
+export function addCartItem(skuId, quantity = 1) {
+  return request.post('/shop/cart/items', { skuId, quantity })
 }
 
 /**
  * 修改购物车里某个商品的数量（<b>设成</b>指定值，不是累加）。
  *
- * @param {number} productId 商品 id
- * @param {number} quantity  目标数量，1~99。
- *                           想变成 0 请调 {@link removeCartItem} ——
- *                           后端会拒绝 quantity 为 0 的请求
+ * @param {number} skuId    规格 id
+ * @param {number} quantity 目标数量，1~99。
+ *                          想变成 0 请调 {@link removeCartItem} ——
+ *                          后端会拒绝 quantity 为 0 的请求
  */
-export function updateCartItem(productId, quantity) {
-  return request.put(`/shop/cart/items/${productId}`, { quantity })
+export function updateCartItem(skuId, quantity) {
+  return request.put(`/shop/cart/items/${skuId}`, { quantity })
 }
 
 /**
- * 从购物车移除一个商品。
+ * 从购物车移除一个<b>规格</b>。
  *
- * <p><b>幂等</b>：商品本来就不在车里也返回成功，不报错。
+ * <p><b>幂等</b>：规格本来就不在车里也返回成功，不报错。
  * 所以调用方不用先判断「它还在不在」。
  */
-export function removeCartItem(productId) {
-  return request.delete(`/shop/cart/items/${productId}`)
+export function removeCartItem(skuId) {
+  return request.delete(`/shop/cart/items/${skuId}`)
 }
 
 /** 清空购物车。⚠️ 界面层必须先弹二次确认，这个操作不可撤销 */

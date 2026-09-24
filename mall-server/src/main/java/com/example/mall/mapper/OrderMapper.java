@@ -103,7 +103,7 @@ public interface OrderMapper {
      * <h4>1. {@code AND status = 0} 就是并发防护本身</h4>
      *
      * <p>不需要额外的锁，也不需要先查一次状态再判断
-     * （那是「先查后改」的竞态，和 {@code decreaseStock} 注释里讲的是同一个坑）。
+     * （那是「先查后改」的竞态，和 {@code decreaseSkuStock} 注释里讲的是同一个坑）。
      * 两个人同时点「支付」，或者用户点支付的同一瞬间定时任务在扫超时 ——
      * 两条 UPDATE 争同一行的 InnoDB 行锁，<b>只有一个能拿到 {@code affected = 1}</b>，
      * 另一个拿到 0。

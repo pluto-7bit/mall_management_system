@@ -8,8 +8,12 @@ import lombok.Data;
 /**
  * 「修改购物车里某个商品的数量」的请求体。
  *
- * <p>{@code PUT /api/shop/cart/items/5}
+ * <p>{@code PUT /api/shop/cart/items/204}
  * <pre>{ "quantity": 3 }</pre>
+ *
+ * <p>⚠️ 路径上那个数字是 <b>skuId</b>（里程碑 15 阶段 4 起），不是 productId。
+ * 同一个商品的「黑色 S」和「白色 M」是两条独立的购物车记录，
+ * 改数量只改其中一个。
  *
  * <h3>★ 为什么「加入购物车」和「修改数量」要分成两个接口？</h3>
  *
@@ -55,9 +59,11 @@ public class CartQuantityDTO {
      *
      * <h3>★ 为什么这里的 {@code @Max} 是 999，而不是 99？</h3>
      *
-     * <p>因为「一个商品最多买 99 件」是<b>业务规则</b>，
+     * <p>因为「一个规格最多买 99 件」是<b>业务规则</b>，
      * 业务规则只能有一个地方说了算 —— 也就是
-     * {@code CartServiceImpl.MAX_QUANTITY_PER_ITEM}。
+     * {@code BusinessRules.MAX_QUANTITY_PER_ITEM}。
+     * （★ 里程碑 15 阶段 4：这个常量原来在 {@code CartServiceImpl} 里
+     * 另有一份私有副本，两处都写着 99。收上去之后，这里引用的那句话才成立。）
      *
      * <p>一开始这里写的是 {@code @Max(99)}，看起来和 Service 一致，
      * 实际却造成了两个问题：

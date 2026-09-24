@@ -1,29 +1,44 @@
 package com.example.mall.service.impl;
 
 import com.example.mall.common.BusinessException;
+import com.example.mall.common.BusinessRules;
 import com.example.mall.common.PageResult;
 import com.example.mall.common.ResultCode;
+import com.example.mall.common.SpecGroup;
+import com.example.mall.common.SpecItem;
 import com.example.mall.dto.ProductQueryDTO;
 import com.example.mall.dto.ProductSaveDTO;
+import com.example.mall.dto.SkuSaveDTO;
 import com.example.mall.entity.Category;
 import com.example.mall.entity.Product;
 import com.example.mall.entity.ProductImage;
+import com.example.mall.entity.ProductSku;
 import com.example.mall.mapper.CategoryMapper;
 import com.example.mall.mapper.ProductImageMapper;
 import com.example.mall.mapper.ProductMapper;
 import com.example.mall.mapper.ProductReviewImageMapper;
 import com.example.mall.mapper.ProductReviewMapper;
+import com.example.mall.mapper.ProductSkuMapper;
 import com.example.mall.service.FileStorageService;
 import com.example.mall.service.ProductService;
+import com.example.mall.util.SpecJson;
 import com.example.mall.vo.AdminProductDetailVO;
 import com.example.mall.vo.ProductVO;
+import com.example.mall.vo.SkuVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * 商品业务实现。
@@ -86,6 +101,22 @@ public class ProductServiceImpl implements ProductService {
      */
     private final FileStorageService fileStorageService;
 
+    /**
+     * 商品 SKU 的读写（★ 里程碑 15 起）。
+     *
+     * <p>★ 为什么这里可以直接用 Mapper，而不需要一个 {@code ProductSkuService}？
+     * 因为「维护一件商品的规格」<b>就是「维护这件商品」的一部分</b>：
+     * 它们同属一个事务、同一个业务动作、同一个管理员操作。
+     * 拆一个 Service 出来，只会让 {@code create} 变成
+     * 「先建商品、再委托别人塞 SKU」—— 而那个「别人」永远只会有一个调用方。
+     *
+     * <p>⚠️ 反过来，阶段 3 会新建一个 {@code ShopSkuService}：
+     * 那是因为<b>读</b>SKU 的语义（「这个 SKU 还能不能买」）是独立的一块，
+     * 而且被加购、下单、详情页三处共用。
+     * 「写归商品、读归自己」——这条线是按<b>语义</b>划的，不是按表划的。
+     */
+    private final ProductSkuMapper productSkuMapper;
+
     // =======================================================================
     //  查询
     // =======================================================================
@@ -145,6 +176,23 @@ public class ProductServiceImpl implements ProductService {
      * 不是「查出 ProductVO 再手工 new 一个子类拷字段」——
      * 那会造出第二条转换路径，而 {@code OrderServiceImpl.toVO} 的注释
      * 专门警告过：<b>第二条转换路径就是将来加字段时漏掉一处的来源</b>。
+     *
+     * <h4>★ 里程碑 15：规格定义和 SKU 也走同一条路（再查两次）</h4>
+     *
+     * <p>和 {@code images} 一字不差的理由，所以这里不再重抄一遍。
+     * 只补一句这次新出现的取舍：<b>管理端详情现在一共发三条 SQL</b>
+     * （商品 + 图集 + SKU），外加一条只取 {@code spec_schema} 一列的。
+     *
+     * <p>看着有点多，但每一条都有独立的存在理由，而且都<b>只服务于详情页</b>：
+     * 那几条被复用在高频路径上的查询（{@code selectShopById} /
+     * {@code selectPage}）一列都没有被污染。这正是这套做法要买的东西。
+     *
+     * <p>⚠️ <b>顺序不能反</b>：必须先用商品自己那一列 {@code spec_schema}
+     * 解析出规格定义，再用它去渲染每个 SKU 的 {@code specText}。
+     * 拿每个 SKU 自己的 {@code spec_json} 去渲染也能出结果，
+     * 但维度顺序会变成<b>名字的字典序</b>（{@code canonical()} 为了去重排过序），
+     * 于是管理员定义的「颜色 → 内存」会显示成「内存 → 颜色」——
+     * 一个没人会报 bug 的错误，因为它看起来只是「顺序不太对」。
      */
     @Override
     public AdminProductDetailVO getById(Long id) {
@@ -155,6 +203,15 @@ public class ProductServiceImpl implements ProductService {
         // 商品没有图时这里返回空列表（不是 null）——
         // 前端因此可以直接写 product.images.length，见 AdminProductDetailVO 的注释
         product.setImages(productImageMapper.selectUrlsByProductId(id));
+
+        // ★ 规格定义：从 product 那一列读原始 JSON，解析成结构化数组再放回 VO。
+        //   spec_schema 为 NULL（阶段 1 回填的老数据）时 schemaOf 返回空列表，
+        //   也就是「无规格」—— 这是【读】路径，宽容一点是对的。
+        List<SpecGroup> schema = SpecJson.schemaOf(productMapper.selectSpecSchema(id));
+        product.setSpecSchema(schema);
+
+        // SKU 列表：查一次，然后把每行渲染成 VO（specText 需要上面那个 schema）
+        product.setSkus(toSkuVOs(productSkuMapper.selectByProductId(id), schema));
         return product;
     }
 
@@ -174,6 +231,29 @@ public class ProductServiceImpl implements ProductService {
      * 「商品建出来了但图集没进去」是必须避免的不一致，
      * 所以事务从「防御性习惯」变成了<b>真正承重</b>的东西。
      * 判据没变（多步写才需要事务），变的是这个方法本身。
+     *
+     * <h4>★ 里程碑 15：又多了一组写（SKU），而且顺序有讲究</h4>
+     *
+     * <p>三步，顺序不能换：
+     * <pre>
+     *   ① planSkus()    —— 纯计算，不碰数据库：把规格定义和 SKU 列表校验一遍，
+     *                      顺便算出「起售价」和「总库存」
+     *   ② insert product —— 因为 product 上那两个派生列是 NOT NULL，
+     *                      过不了这一步就没有 id，也就没有后面那一步
+     *   ③ applySkus()   —— 真正的 SKU 写（删/改/插），需要 productId
+     * </pre>
+     *
+     * <p>★ 为什么要拆成「先算、再插、最后写」而不是一个方法做完？
+     * 因为 {@code product.price} / {@code product.stock} 是 {@code NOT NULL}，
+     * 而它们现在<b>由 SKU 算出来</b> —— 也就是说
+     * 「SKU 还没进库，但商品行必须先写」这个顺序是<b>强制的</b>。
+     * 把计划（{@link SkuPlan}）和落库（{@link #applySkus}）分开，
+     * 这件事就变成了类型上的事实，而不是一句注释里的叮嘱。
+     *
+     * <p>⚠️ 那两个派生列的存在是<b>过渡期</b>的安排（回滚预案），
+     * 见 {@code Product.price} 的注释。阶段 6 删掉它们之后，
+     * 上面那个「先插商品、再写 SKU」的强制顺序也就随之消失了 ——
+     * 但那时这段注释要一起改，否则它会变成一句关于过去的话。
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -183,11 +263,14 @@ public class ProductServiceImpl implements ProductService {
         // 传一个不存在的 categoryId 完全可能，所以后端必须自己校验一遍
         checkCategoryAvailable(dto.getCategoryId());
 
+        // ① 先把规格和 SKU 全部校验一遍，并算出派生汇总。
+        //    放在最前面：一个「规格填错了」的请求不该先建出一行商品再回滚 ——
+        //    虽然事务能兜住，但先校验能让错误路径根本不产生写操作。
+        SkuPlan plan = planSkus(dto.getSpecSchema(), dto.getSkus());
+
         Product product = new Product();
         product.setCategoryId(dto.getCategoryId());
         product.setName(dto.getName());
-        product.setPrice(dto.getPrice());
-        product.setStock(dto.getStock());
         product.setCover(dto.getCover());
         product.setDescription(dto.getDescription());
         // 前端不传状态时默认上架。
@@ -195,19 +278,35 @@ public class ProductServiceImpl implements ProductService {
         // 默认值的填充逻辑放在 Service，而不是散落在各处
         product.setStatus(dto.getStatus() == null ? 1 : dto.getStatus());
 
+        // ★★ 里程碑 15 阶段 6：这里原来有两行
+        //      product.setPrice(plan.minPrice());
+        //      product.setStock(plan.totalStock());
+        //    它们把 SKU 的派生汇总【写回 product 表】。现在 product 表上
+        //    没有那两列了，所以这两行删除。
+        //
+        //    ★ 这两行曾经被称为「本轮唯一真源那句话在写路径上的全部体现」——
+        //      那句话现在要改一个字：写路径上的体现【只剩下面一行】，
+        //      而价格和库存的体现是 applySkus() 里往 product_sku 写的那批行。
+        //      **「派生汇总」这四个字本身就是过渡期的说法**：
+        //      没有副本，就没有汇总，也就没有漂移。
+        product.setSpecSchema(plan.schemaJson());
+
         productMapper.insert(product);
 
-        // 靠 XML 里的 useGeneratedKeys 配置，id 已经被回填进 product 对象了，
-        // 不需要再查一次数据库
+        // ② 靠 XML 里的 useGeneratedKeys 配置，id 已经被回填进 product 对象了，
+        //    不需要再查一次数据库
         //
-        // ★ 图集的插入必须在 insert 之后 —— 图集行需要一个 productId，
+        // ★ SKU 和图集的写入都必须在 insert 之后 —— 它们的行都需要一个 productId，
         //   而商品没有 id 之前，这个值根本不存在。
         //   （这正是「上传接口不能挂在 /api/admin/products/{id} 下」的原因：
         //     新增商品时先传图、后提交表单，传图那一刻商品还没有 id。）
+        applySkus(product.getId(), plan);
+
         replaceImages(product.getId(), dto.getImages());
 
-        log.info("新增商品成功, id={}, name={}, 图集 {} 张",
-                product.getId(), product.getName(),
+        log.info("新增商品成功, id={}, name={}, SKU {} 条（起售价 {}，总库存 {}）, 图集 {} 张",
+                product.getId(), product.getName(), plan.byCanonical().size(),
+                plan.minPrice(), plan.totalStock(),
                 dto.getImages() == null ? 0 : dto.getImages().size());
         return product.getId();
     }
@@ -265,19 +364,39 @@ public class ProductServiceImpl implements ProductService {
 
         checkCategoryAvailable(dto.getCategoryId());
 
+        // ① 同 create：先把规格和 SKU 校验一遍并算出派生汇总。
+        //    ⚠️ 这一步对 update 来说【比 create 更要紧】：
+        //       它决定了「哪些老的 SKU 行能被认领、哪些要被删掉」，
+        //       而那关系到 order_item.sku_id 还能不能指到东西。
+        SkuPlan plan = planSkus(dto.getSpecSchema(), dto.getSkus());
+
         // 构造一个只带 id 和待更新字段的对象。
         // 没赋值的字段保持 null，XML 里的 <if> 会让它们不参与 UPDATE
         Product product = new Product();
         product.setId(id);
         product.setCategoryId(dto.getCategoryId());
         product.setName(dto.getName());
-        product.setPrice(dto.getPrice());
-        product.setStock(dto.getStock());
         product.setCover(dto.getCover());
         product.setDescription(dto.getDescription());
         product.setStatus(dto.getStatus());
 
+        // ★★ 同 create：setPrice / setStock 两行在阶段 6 一起删掉了。
+        //    ⚠️ 这里比 create 更容易漏 —— 因为 create 的那两行删了之后
+        //       「新建的商品没价格」会立刻被测试发现，而 update 的这两行
+        //       删了之后，「改完商品价格没变」只会在**改价之后**才暴露。
+        //       换句话说：**同一个改动在两条路径上的可观测性不一样**，
+        //       删的时候要按最不敏感的那条来定检查方式（这里就是全量测试）。
+        product.setSpecSchema(plan.schemaJson());
+
         productMapper.updateById(product);
+
+        // ② SKU 是「整集合替换」，而且【不是可选的】——
+        //   它带着价格和库存，没有它这次保存就没有价格可写，
+        //   所以 DTO 上它有 @NotEmpty，这里也就不需要像图集那样判空。
+        //
+        //   ⚠️ 这一点和图集【刻意不同】，理由见 ProductSaveDTO 上的注释：
+        //      图集「不改」是有意义的，「这次保存不带价格」没有意义。
+        applySkus(id, plan);
 
         // ★ 图集是「有值才动」的 —— null 表示调用方不关心这件事。
         //   注意这里【不能】写成 replaceImages(id, dto.getImages()) 然后
@@ -287,7 +406,8 @@ public class ProductServiceImpl implements ProductService {
             replaceImages(id, dto.getImages());
         }
 
-        log.info("修改商品成功, id={}, 图集{}", id,
+        log.info("修改商品成功, id={}, SKU {} 条（起售价 {}，总库存 {}）, 图集{}", id,
+                plan.byCanonical().size(), plan.minPrice(), plan.totalStock(),
                 dto.getImages() == null ? "未改动" : "替换为 " + dto.getImages().size() + " 张");
     }
 
@@ -329,6 +449,37 @@ public class ProductServiceImpl implements ProductService {
      *   商品 (product)                ← 父
      * </pre>
      *
+     * <h4>★ 里程碑 15：再添一级 SKU，变成<del>四</del>五级</h4>
+     *
+     * <pre>
+     *   晒图 (product_review_image)   ← 孙
+     *   评价 (product_review)         ← 子
+     *   图集 (product_image)          ← 子
+     *   SKU  (product_sku)            ← 子（★ 新）
+     *   商品 (product)                ← 父
+     * </pre>
+     *
+     * <p>SKU 和商品是直接父子（{@code product_sku.product_id} 指着 {@code product.id}），
+     * 所以它<b>只需要排在商品之前</b> —— 和评价、图集之间没有先后关系，
+     * 和上面那个「晒图必须在评价之前」不是一类约束。
+     * 下面代码里的位置只是顺着链条读起来顺。
+     *
+     * <p>⚠️ <b>删 SKU 行是【不可逆地打断历史订单】</b>，这一点必须说清楚，
+     * 因为它和删图集完全不同：
+     * <pre>
+     *   删图集 → 商品还在，图没了。用户看得见，能重传
+     *   删 SKU → 那个规格从此不存在。而 order_item.sku_id 正指着它
+     * </pre>
+     *
+     * <p>全库零外键，所以数据库<b>不会</b>拦这件事。被删掉的 SKU 在历史明细里
+     * 变成一个悬空的 id，而那张订单被取消时 {@code increaseSkuStock}
+     * 会更新 0 行、只打一条 warn 日志 —— <b>库存就这么丢了，而且没人报错</b>。
+     *
+     * <p>★ 这个后果是<b>已知的、接受的</b>，不是漏了：它和「商品被硬删」
+     * 是同一个已有取舍（{@code test-pay.py} 第 9 节专门测过那条路）。
+     * 真正的修法是商品改逻辑删除（本方法第一段 javadoc 里建议的那件事），
+     * 那时这个洞会一起被堵上。在此之前，<b>删商品是一个该被慎用的管理动作</b>。
+     *
      * <p>多出来的这两级是<b>两级</b>、不是一级：评价挂在商品上，
      * 晒图又挂在评价上。所以「先删商品行」在这里的后果比里程碑 11 更糟 ——
      * 它会让<b>两</b>张表各留下一批孤儿行，而且从商品那一侧再也找不到它们了。
@@ -355,11 +506,11 @@ public class ProductServiceImpl implements ProductService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void delete(Long id) {
-        // ★ 四级级联，顺序一层都不能反：晒图 → 评价 → 图集 → 商品。
-        //   见上面 javadoc 里的完整论证。
+        // ★ 五级级联，SKU 必须排在商品之前：晒图 → 评价 → 图集 → SKU → 商品。
+        //   见上面 javadoc 里的完整论证（含「删 SKU 会打断历史订单」那段）。
         //
-        //   ⚠️ 这两条（以及下面的图集）【都不判影响行数】：
-        //      返回 0 表示「这个商品本来就没评价 / 没晒图 / 没图集」，
+        //   ⚠️ 这几条（以及下面的 SKU、图集）【都不判影响行数】：
+        //      返回 0 表示「这个商品本来就没评价 / 没晒图 / 没图集 / 没 SKU」，
         //      是完全正常的情况，不是错误。
         //
         //   ★ 为什么直接用 Mapper 而不调 ProductReviewService：
@@ -370,6 +521,12 @@ public class ProductServiceImpl implements ProductService {
         productReviewMapper.deleteByProductId(id);
 
         productImageMapper.deleteByProductId(id);
+
+        // ★ 里程碑 15 新增的第四级。
+        //   ⚠️ 它必须在下面那条 DELETE FROM product 之前 —— 否则
+        //      product_sku 里就是一批「查不到、也删不掉」的孤儿行，
+        //      而且不会有任何东西报错。
+        productSkuMapper.deleteByProductId(id);
 
         int affected = productMapper.deleteById(id);
 
@@ -405,6 +562,424 @@ public class ProductServiceImpl implements ProductService {
         if (category.getStatus() != null && category.getStatus() == 0) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "所选分类已被禁用");
         }
+    }
+
+    // =======================================================================
+    //  ★ 里程碑 15：SKU 的校验与写入
+    //
+    //  这里的四个方法构成一条链：planSkus 校验并算好一切（不碰数据库）
+    //  → applySkus 才真正落库。create 和 update 共用同一条链。
+    //
+ 	//  ★ 为什么校验只有这一处？因为它同时服务于两个入口，而且规则很多
+ 	//  （叉乘、上限、不漏行、不重复）。复制一份到 update 里，
+ 	//  两条路径会在某次改动后开始接受不同的输入 —— 而那正是
+ 	//  「第二条转换路径就是将来加字段时漏掉一处的来源」的另一种形态。
+    // =======================================================================
+
+    /**
+     * 一次 SKU 写入的「计划」：<b>已经校验完、算完，但还没有碰数据库</b>。
+     *
+     * <p>★ 拆出这个中间态，是因为 {@code create} 有一个<b>强制的顺序</b>：
+     * {@code product.price} / {@code product.stock} 是 NOT NULL 且由 SKU 汇总而来，
+     * 所以「SKU 还没进库，商品行就必须先写」。把「算」和「写」分开之后，
+     * 这个顺序就成了类型上看得见的事实。
+     *
+     * <p>用 record 而不是 {@code @Data}：它是一次性算出来的不可变结果，
+     * 没有 setter、没有行为 —— 和 {@code LoginUser}、{@code OrderLine} 同一条理由。
+     *
+     * @param schemaJson  规范化后的 {@code spec_schema}，直接写进 product 那一列
+     * @param byCanonical 规范化 {@code spec_json} → 管理员填的那一行。
+     *                    用 {@code LinkedHashMap} 是为了让插入顺序稳定（便于调试），
+     *                    顺序本身不参与任何判断
+     * @param minPrice    起售价 = 各 SKU 里最低的那个
+     * @param totalStock  总库存 = 各 SKU 之和
+     */
+    private record SkuPlan(String schemaJson,
+                           LinkedHashMap<String, SkuSaveDTO> byCanonical,
+                           BigDecimal minPrice,
+                           Integer totalStock) {
+    }
+
+    /**
+     * 校验规格定义和 SKU 列表，算出派生汇总 —— <b>纯计算，一条 SQL 都不发</b>。
+     *
+     * <p>校验全部集中在这一个方法里，一次跑完，报第一个错。规则：
+     * <ol>
+     *   <li>规格维度 ≤ {@code MAX_SKU_DIMENSIONS}，每维取值 ≤ {@code MAX_SPEC_VALUES_PER_DIM}</li>
+     *   <li>规格名/值去空白后非空、不重复、长度不超</li>
+     *   <li>叉乘出来的组合数 ≤ {@code MAX_SKU_COUNT}</li>
+     *   <li>每个 SKU 的 specs 恰好每维一个值，且值在定义里</li>
+     *   <li>SKU 条数<b>恰好等于</b>各维取值数之积（不许漏行、不许重复）</li>
+     *   <li>单个规格的库存 ≤ {@code MAX_SKU_STOCK}</li>
+     *   <li>序列化后的 {@code spec_schema} 放得进 {@code VARCHAR(500)}</li>
+     * </ol>
+     *
+     * <p>⚠️ <b>价格和库存的「非空、是正数」这里【不判】</b>，因为 DTO 上的
+     * {@code @NotNull} / {@code @DecimalMin} / {@code @Min} 已经判过了。
+     * 在这里再判一次，用户会为同一个错误拿到<b>两个不同的错误码</b>
+     * —— 这正是 {@code BusinessRules} 的类注释里记着的那次踩坑。
+     * 这里只判 DTO 上<b>没有</b>的那条：{@code MAX_SKU_STOCK} 是业务上限，
+     * 按项目约定一律由 Service 判断。
+     *
+     * @param rawSchema 请求里的规格定义
+     * @param rawSkus   请求里的 SKU 列表
+     */
+    private SkuPlan planSkus(List<SpecGroup> rawSchema, List<SkuSaveDTO> rawSkus) {
+        List<SpecGroup> schema = normalizeSchema(rawSchema);
+
+        // 规范化后 【期望】有哪些组合 —— 叉乘，无规格时是唯一的 "[]"
+        LinkedHashSet<String> expected = combinationsOf(schema);
+
+        if (rawSkus == null || rawSkus.isEmpty()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "至少要有一个规格组合");
+        }
+
+        LinkedHashMap<String, SkuSaveDTO> byCanonical = new LinkedHashMap<>();
+        BigDecimal minPrice = null;
+        long totalStock = 0L;
+
+        for (SkuSaveDTO sku : rawSkus) {
+            if (sku == null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "规格组合不能为空");
+            }
+            String specJson = canonicalOfSku(schema, sku);
+
+            // ★ 去重靠的是 put 的返回值，不是「先在 List 里找一遍」。
+            //   查重的那一轮会比对【规范化之前】的字符串，
+            //   于是「颜色:黑,内存:128G」和「内存:128G,颜色:黑」会被当成两条 ——
+            //   而它们本来就是同一个组合，最后会撞上数据库的唯一索引，
+            //   报出一个 SQL 级别的 500 而不是这里这句人话。
+            if (byCanonical.put(specJson, sku) != null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "规格组合重复了：" + SpecJson.text(specJson, schema));
+            }
+
+            if (sku.getStock() > BusinessRules.MAX_SKU_STOCK) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "单个规格的库存最多 " + BusinessRules.MAX_SKU_STOCK + " 件");
+            }
+
+            if (minPrice == null || sku.getPrice().compareTo(minPrice) < 0) {
+                minPrice = sku.getPrice();
+            }
+            totalStock += sku.getStock();
+        }
+
+        // ★ 集合相等 = 「不漏行 + 不重复 + 值都在定义里」三件事一次验完。
+        //   上面 canonicalOfSku 已经逐项报过更精确的错，走到这里多半是
+        //   【条数不对】：商家声明了「白色」，却没给「白色」填价格。
+        if (!byCanonical.keySet().equals(expected)) {
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    describeCombinationMismatch(expected, byCanonical.keySet(), schema));
+        }
+
+        String schemaJson = SpecJson.schemaJson(schema);
+        if (schemaJson.length() > BusinessRules.MAX_SPEC_SCHEMA_LENGTH) {
+            // ⚠️ 这条【不是】多余的防御：维度 ≤3、每维 ≤10 个值这些上限
+            //    挡不住长度 —— 3 维 × 10 个 20 字的取值序列化出来约 780 字符，
+            //    远超 500。不判的话，超长会一路走到 INSERT，
+            //    用户看到的是「服务器错误」，而且是保存之后才知道。
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    "规格定义太长了（" + schemaJson.length() + " / "
+                            + BusinessRules.MAX_SPEC_SCHEMA_LENGTH + "），请精简规格名和规格值");
+        }
+
+        // ★ Math.toIntExact 而不是 (int)：MAX_SKU_STOCK × MAX_SKU_COUNT
+        //   已经保证了不会溢出（见 BusinessRules 里那道算术），
+        //   所以这一行永远不会抛。用它而不是强转，是为了让
+        //   「哪天有人调大那两条上限」变成一次响亮的崩溃，
+        //   而不是一个被悄悄截断的库存数字。
+        return new SkuPlan(schemaJson, byCanonical, minPrice, Math.toIntExact(totalStock));
+    }
+
+    /**
+     * 校验并规范化规格定义。返回的是一个<b>全新的列表</b>，
+     * 每个规格名和取值都已经去过首尾空白。
+     *
+     * <p>★ <b>去空白是必须的，不是顺手做的清洁工作。</b>
+     * 数据库的排序规则是 {@code utf8mb4_0900_ai_ci}，它是 <b>NO PAD</b> 的
+     * —— 也就是说 {@code "黑"} 和 {@code "黑 "} 是<b>两个不同的字符串</b>，
+     * {@code uk_product_spec} 认不出它们是同一个组合，
+     * 于是同一件商品会插出两条「黑色」SKU，起售价静默地取了低的那条。
+     *
+     * <p>⚠️ 规格定义和请求体里的规格项<b>都要去</b>（另一边在
+     * {@link #canonicalOfSku} 里做），只去一边等于没去 ——
+     * 一边是「黑」另一边是「黑 」，比较照样对不上。
+     */
+    private List<SpecGroup> normalizeSchema(List<SpecGroup> rawSchema) {
+        if (rawSchema == null || rawSchema.isEmpty()) {
+            // 无规格商品：合法的，它的 SKU 只有一条默认 SKU
+            return List.of();
+        }
+        if (rawSchema.size() > BusinessRules.MAX_SKU_DIMENSIONS) {
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    "规格维度最多 " + BusinessRules.MAX_SKU_DIMENSIONS + " 个，收到 " + rawSchema.size() + " 个");
+        }
+
+        List<SpecGroup> schema = new ArrayList<>(rawSchema.size());
+        Set<String> names = new HashSet<>();
+        long combinations = 1L;
+
+        for (SpecGroup group : rawSchema) {
+            String name = trimToEmpty(group == null ? null : group.name());
+            if (name.isEmpty()) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "规格名不能为空");
+            }
+            if (name.length() > BusinessRules.MAX_SPEC_NAME_LENGTH) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "规格名「" + name + "」太长了（最多 " + BusinessRules.MAX_SPEC_NAME_LENGTH + " 个字）");
+            }
+            if (!names.add(name)) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "规格名「" + name + "」重复了");
+            }
+
+            List<String> rawValues = group.values();
+            if (rawValues == null || rawValues.isEmpty()) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "规格「" + name + "」至少要有一个取值");
+            }
+            if (rawValues.size() > BusinessRules.MAX_SPEC_VALUES_PER_DIM) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "规格「" + name + "」最多 " + BusinessRules.MAX_SPEC_VALUES_PER_DIM
+                                + " 个取值，收到 " + rawValues.size() + " 个");
+            }
+
+            List<String> values = new ArrayList<>(rawValues.size());
+            Set<String> seen = new HashSet<>();
+            for (String raw : rawValues) {
+                String value = trimToEmpty(raw);
+                if (value.isEmpty()) {
+                    throw new BusinessException(ResultCode.BAD_REQUEST,
+                            "规格「" + name + "」里有一个空取值");
+                }
+                if (value.length() > BusinessRules.MAX_SPEC_VALUE_LENGTH) {
+                    throw new BusinessException(ResultCode.BAD_REQUEST,
+                            "规格「" + name + "」的取值「" + value + "」太长了（最多 "
+                                    + BusinessRules.MAX_SPEC_VALUE_LENGTH + " 个字）");
+                }
+                if (!seen.add(value)) {
+                    throw new BusinessException(ResultCode.BAD_REQUEST,
+                            "规格「" + name + "」的取值「" + value + "」重复了");
+                }
+                values.add(value);
+            }
+
+            combinations *= values.size();
+            schema.add(new SpecGroup(name, values));
+        }
+
+        // ★ 组合数要在这里就拦住，不能等 combinationsOf 真去展开 ——
+        //   三维各十个值是 1000 个组合，展开完再报错等于白算一遍。
+        if (combinations > BusinessRules.MAX_SKU_COUNT) {
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    "规格叉乘出来有 " + combinations + " 个组合，超过上限 "
+                            + BusinessRules.MAX_SKU_COUNT + "。请减少规格维度或取值");
+        }
+        return schema;
+    }
+
+    /**
+     * 叉乘出这件商品的<b>全部</b>规格组合，返回它们的规范化 {@code spec_json}。
+     *
+     * <p>无规格时返回<b>恰好一个</b>元素：{@code "[]"}（默认 SKU）。
+     *
+     * <p>⚠️ 返回值是 {@code LinkedHashSet} 而不是 {@code List}：
+     * 调用方要做的是「和我收到的那些比一比是不是同一套」，
+     * 那是一次<b>集合</b>比较。用 List 的话得先自己去重，而去重的规则
+     * 又得和 {@code SpecJson.canonical} 保持一致 —— 那是第二处定义。
+     */
+    private LinkedHashSet<String> combinationsOf(List<SpecGroup> schema) {
+        LinkedHashSet<String> keys = new LinkedHashSet<>();
+        if (schema.isEmpty()) {
+            keys.add(SpecJson.EMPTY);
+            return keys;
+        }
+
+        // 逐维展开成「前缀 × 这一维的每个取值」
+        List<List<SpecItem>> combos = new ArrayList<>();
+        combos.add(List.of());
+        for (SpecGroup group : schema) {
+            List<List<SpecItem>> next = new ArrayList<>();
+            for (List<SpecItem> prefix : combos) {
+                for (String value : group.values()) {
+                    List<SpecItem> extended = new ArrayList<>(prefix);
+                    extended.add(new SpecItem(group.name(), value));
+                    next.add(extended);
+                }
+            }
+            combos = next;
+        }
+
+        for (List<SpecItem> combo : combos) {
+            keys.add(SpecJson.canonical(combo));
+        }
+        return keys;
+    }
+
+    /**
+     * 校验一个 SKU 的规格组合，并返回它的规范化 {@code spec_json}。
+     *
+     * <p>检查的是「形状」：维数对不对、缺不缺某一维、值在不在定义里。
+     * <b>「条数够不够」不在这里</b> —— 那需要看到全部 SKU 才能判断，
+     * 由 {@link #planSkus} 末尾那次集合比较负责。
+     */
+    private String canonicalOfSku(List<SpecGroup> schema, SkuSaveDTO sku) {
+        List<SpecItem> specs = sku.getSpecs();
+        if (specs == null) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "规格组合不能为空（无规格请传空数组）");
+        }
+
+        if (schema.isEmpty()) {
+            if (!specs.isEmpty()) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "这件商品没有规格定义，所以每个 SKU 的规格组合必须是空数组，收到 " + specs.size() + " 个规格项");
+            }
+            return SpecJson.EMPTY;
+        }
+
+        if (specs.size() != schema.size()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST,
+                    "每个规格组合必须正好 " + schema.size() + " 个规格项（每维一个），收到 " + specs.size() + " 个");
+        }
+
+        Map<String, String> picked = new HashMap<>();
+        for (SpecItem item : specs) {
+            if (item == null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "规格项不能为空");
+            }
+            String name = trimToEmpty(item.name());
+            String value = trimToEmpty(item.value());
+            if (name.isEmpty() || value.isEmpty()) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "规格名和规格值都不能为空");
+            }
+            if (picked.put(name, value) != null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "同一个规格「" + name + "」在一个组合里出现了两次");
+            }
+        }
+
+        // 按【规格定义里的维度顺序】重新组装，顺带检查每一维都取到了合法值。
+        // 注意这里不看 picked 的迭代顺序 —— 顺序由 schema 决定，
+        // 而 spec_json 的最终顺序由 SpecJson.canonical 统一负责，两处都不靠插入顺序。
+        List<SpecItem> normalized = new ArrayList<>(schema.size());
+        for (SpecGroup group : schema) {
+            String value = picked.get(group.name());
+            if (value == null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "这个规格组合缺少「" + group.name() + "」这一维");
+            }
+            if (!group.values().contains(value)) {
+                throw new BusinessException(ResultCode.BAD_REQUEST,
+                        "规格「" + group.name() + "」没有取值「" + value + "」，可选："
+                                + String.join("、", group.values()));
+            }
+            normalized.add(new SpecItem(group.name(), value));
+        }
+        return SpecJson.canonical(normalized);
+    }
+
+    /** 生成一句说得清「差在哪」的话，给人看，也给下一个查这个 bug 的人看。 */
+    private String describeCombinationMismatch(Set<String> expected, Set<String> actual,
+                                               List<SpecGroup> schema) {
+        Set<String> missing = new LinkedHashSet<>(expected);
+        missing.removeAll(actual);
+        Set<String> extra = new LinkedHashSet<>(actual);
+        extra.removeAll(expected);
+
+        StringBuilder sb = new StringBuilder("规格组合和规格定义对不上");
+        if (!missing.isEmpty()) {
+            sb.append("：缺少 ").append(missing.size()).append(" 种，例如「")
+                    .append(SpecJson.text(missing.iterator().next(), schema)).append("」");
+        }
+        if (!extra.isEmpty()) {
+            sb.append("；多出 ").append(extra.size()).append(" 种，例如「")
+                    .append(SpecJson.text(extra.iterator().next(), schema)).append("」");
+        }
+        return sb.append("。规格定义里声明了多少种组合，就必须有多少条 SKU（不能漏行）").toString();
+    }
+
+    /**
+     * 把计划落库：<b>删掉这次没提到的老 SKU 行，改掉留下来的，插上新的</b>。
+     *
+     * <h4>★★ 为什么 SKU 不能像图集那样「删光了重建」？</h4>
+     *
+     * <p>{@code replaceImages} 是 delete + insert，{@code product_image.id}
+     * 每次都变 —— 那没关系，因为<b>id 没有读者</b>，前端拿的是 url。
+     *
+     * <p>而 {@code product_sku.id} <b>有读者</b>：{@code order_item.sku_id}
+     * 正指着它。删了重建的后果不是「id 变了」这么轻：
+     * 取消一条历史订单时要按 {@code sku_id} 把库存还回去，
+     * 而那一行已经不存在了 —— {@code increaseSkuStock} 更新 0 行、
+     * 只打一条 warn 日志，<b>库存就这么丢了，接口返回 200</b>。
+     *
+     * <p>★ 所以这里<b>认领</b>老行：只要规格组合（规范化后的 {@code spec_json}）
+     * 没变，就更新它的价格库存、<b>保住它的 id</b>。
+     * 「同一形态第二次出现，该复用的复用、该分岔的分岔，理由要重新问一遍」
+     * —— 这次的理由是：这一行的 id 被别的表引用着。
+     *
+     * <p>⚠️ 一个诚实的例外：如果库里某一行的 {@code spec_json}
+     * 不是规范形态（理论上只能是外部直接改库造成的），它认领不到，
+     * 会被当成「没提到」删掉、再以新 id 插回来。id 会变，
+     * 那条链接就断了 —— 但这是数据已经坏掉之后的表现，不是这个方法造成的。
+     */
+    private void applySkus(Long productId, SkuPlan plan) {
+        List<ProductSku> existing = productSkuMapper.selectByProductId(productId);
+
+        Map<String, ProductSku> byJson = new HashMap<>();
+        for (ProductSku row : existing) {
+            byJson.put(row.getSpecJson(), row);
+        }
+
+        // ★ 先删。必须在插入之前 —— 否则「同一个 spec_json 的老行还在、
+        //   新行又要插进去」会撞上 uk_product_spec，报一个 1062。
+        List<Long> obsolete = new ArrayList<>();
+        for (ProductSku row : existing) {
+            if (!plan.byCanonical().containsKey(row.getSpecJson())) {
+                obsolete.add(row.getId());
+            }
+        }
+        // deleteByIds 的 <foreach> 遇到空集合会拼出 IN ()，那是 SQL 语法错误。
+        // 空集合在 Java 层拦住 —— 这个坑里程碑 10 的 attachItems 已经踩过一次。
+        if (!obsolete.isEmpty()) {
+            productSkuMapper.deleteByIds(obsolete);
+        }
+
+        for (Map.Entry<String, SkuSaveDTO> entry : plan.byCanonical().entrySet()) {
+            String specJson = entry.getKey();
+            SkuSaveDTO dto = entry.getValue();
+
+            ProductSku old = byJson.get(specJson);
+            if (old != null) {
+                productSkuMapper.updatePriceStock(old.getId(), dto.getPrice(), dto.getStock());
+            } else {
+                ProductSku row = new ProductSku();
+                row.setProductId(productId);
+                row.setSpecJson(specJson);
+                row.setPrice(dto.getPrice());
+                row.setStock(dto.getStock());
+                productSkuMapper.insert(row);
+            }
+        }
+    }
+
+    /**
+     * 把 SKU 行渲染成 VO。{@code schema} 只影响 {@code specText} 里维度的显示顺序。
+     *
+     * <p>★ 里程碑 15 阶段 3：<b>真正干活的那几行搬到了 {@code SkuVO.ofAll()}</b> ——
+     * 因为用户端的详情页（{@code ShopSkuServiceImpl.listByProductId}）
+     * 需要一模一样的一段转换。留在这里的话就是复制一份，
+     * 而复制出来的那份是将来加字段时漏掉一处的来源。
+     *
+     * <p>这个方法保留下来只是为了让调用点读起来短一点，<b>它不含任何逻辑</b>——
+     * 所以它不会成为「第二个定义」。
+     */
+    private List<SkuVO> toSkuVOs(List<ProductSku> rows, List<SpecGroup> schema) {
+        return SkuVO.ofAll(rows, schema);
+    }
+
+    /** {@code null} 安全地去首尾空白。空规格名/值的拦截在调用处，这里只管「不要 NPE」。 */
+    private String trimToEmpty(String value) {
+        return value == null ? "" : value.trim();
     }
 
     /**

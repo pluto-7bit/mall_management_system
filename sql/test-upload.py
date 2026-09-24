@@ -282,8 +282,10 @@ def url_to_disk(url):
 
 
 def create_product(name, stock=100, images="__OMIT__", cover=None):
-    body = {"categoryId": CATEGORY_ID, "name": name, "price": 9.90,
-            "stock": stock, "status": 1}
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
+    body = {"categoryId": CATEGORY_ID, "name": name, "status": 1,
+            "specSchema": [], "skus": [{"specs": [], "price": 9.90, "stock": stock}]}
     # ★ 用哨兵值区分「不传这个字段」和「传 null」——
     #   本脚本要测的正是这两种情况的区别，所以不能都写成 body["images"] = None
     if images != "__OMIT__":
@@ -298,8 +300,11 @@ def create_product(name, stock=100, images="__OMIT__", cover=None):
 
 def update_product(pid, name, images="__OMIT__"):
     """PUT /api/admin/products/{id} —— ★ 里程碑 11 之前全项目没人调过这个接口。"""
-    body = {"categoryId": CATEGORY_ID, "name": name, "price": 9.90,
-            "stock": 100, "status": 1}
+    # ★ skus 也必须一起传：PUT 是【整集合替换】，传空等于把规格删光。
+    #   这里传的是和 create_product 一模一样的默认 SKU，所以那一行的 id 会被保住
+    #   （replaceSkus 按 spec_json 认领老行，不是删了重建）。
+    body = {"categoryId": CATEGORY_ID, "name": name, "status": 1,
+            "specSchema": [], "skus": [{"specs": [], "price": 9.90, "stock": 100}]}
     if images != "__OMIT__":
         body["images"] = images
     return call("PUT", f"/admin/products/{pid}", body, token=ADMIN_TOKEN)
@@ -352,6 +357,9 @@ def cleanup():
     只会留下孤儿行 —— 那正是本脚本末尾要断言的东西之一。
     """
     run_sql(f"DELETE FROM product_image WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，同样必须在商品之前删。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
             f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")

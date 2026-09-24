@@ -141,13 +141,35 @@ def redis_cmd(*args):
     return [l for l in result.stdout.strip().splitlines() if l]
 
 
-def stock_of(pid):
-    rows = run_sql(f"SELECT stock FROM product WHERE id = {pid}")
+def stock_of(sku_id):
+    """★ 里程碑 15 阶段 4：库存的唯一真源是 product_sku.stock。
+
+    以前读的是 product.stock。阶段 2~5 期间那列还在（回滚预案），
+    所以读错了【不会报错】—— 它只会永远停在阶段 1 迁移时的值，
+    于是「下单后库存应为 N」这类前置断言会集体失败，
+    看起来像「扣库存坏了」，实际是读错了地方。
+    """
+    rows = run_sql(f"SELECT stock FROM product_sku WHERE id = {sku_id}")
     return int(rows[0][0]) if rows else None
 
 
-def set_stock(pid, stock):
-    run_sql(f"UPDATE product SET stock = {stock} WHERE id = {pid}")
+def set_stock(sku_id, stock):
+    run_sql(f"UPDATE product_sku SET stock = {stock} WHERE id = {sku_id}")
+
+
+def default_sku_of(pid):
+    """无规格商品的那唯一一条「默认 SKU」的 id。"""
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
+
+
+def pid_of_sku(sku_id):
+    """SKU id → 商品 id。★ 只给【按商品整体】的操作用（直接 DELETE 商品）。"""
+    return int(scalar(f"SELECT product_id FROM product_sku WHERE id = {sku_id}"))
+
+
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
 
 
 def order_row(order_no):
@@ -212,6 +234,9 @@ def cleanup():
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE a FROM member_address a "
             f"JOIN member m ON m.id = a.member_id WHERE m.username LIKE '{PREFIX}%'")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
 
@@ -246,13 +271,17 @@ def register(tag):
 
 
 def create_product(name, price, stock, status=1):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "categoryId": CATEGORY_ID, "name": name, "price": price,
-        "stock": stock, "status": status,
+        "categoryId": CATEGORY_ID, "name": name, "status": status,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
     }, token=ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
-    return r["data"]
+    # ★ 里程碑 15 阶段 4：返回【SKU id】—— 下单、加购、扣库存都按规格走。
+    return default_sku_of(r["data"])
 
 
 def create_address(token, receiver, phone, region, detail):
@@ -268,9 +297,9 @@ def key_for(tag):
     return f"k{RUN}{tag}"
 
 
-def buy_now(token, pid, qty, address_id, idem_key):
+def buy_now(token, sku_id, qty, address_id, idem_key):
     return call("POST", "/shop/orders/buy-now", {
-        "productId": pid, "quantity": qty,
+        "skuId": sku_id, "quantity": qty,
         "addressId": address_id, "idempotencyKey": idem_key,
     }, token=token)
 
@@ -531,14 +560,14 @@ def main():
     p4c = create_product(f"{PREFIX}多件丙{RUN}", "33.00", 80)
 
     # 用购物车结算，这样一笔订单里能有三种商品
-    for pid, qty in ((p4a, 2), (p4b, 3), (p4c, 4)):
-        st, r = call("POST", "/shop/cart/items", {"productId": pid, "quantity": qty},
+    for sku, qty in ((p4a, 2), (p4b, 3), (p4c, 4)):
+        st, r = call("POST", "/shop/cart/items", {"skuId": sku, "quantity": qty},
                      token=TOKEN_A)
         if r.get("code") != 200:
             raise SystemExit(f"加购物车失败：{r}")
 
     st, r = call("POST", "/shop/orders", {
-        "productIds": [p4a, p4b, p4c], "addressId": ADDR_A,
+        "skuIds": [p4a, p4b, p4c], "addressId": ADDR_A,
         "idempotencyKey": key_for("o4"),
     }, token=TOKEN_A)
     if r.get("code") != 200:
@@ -566,7 +595,13 @@ def main():
 
     # 直接从数据库删掉商品（模拟「运维手滑删数据」）。
     # order_item 故意没有外键，所以数据库不会拦这件事。
-    run_sql(f"DELETE FROM product WHERE id = {p5}")
+    # ★ 里程碑 15：SKU 行也要一起消失，否则留下孤儿。下面是【直接改库】，
+    #   所以绕过了 Service 的级联删除，得自己按顺序删。
+    # ⚠️ p5 是【SKU id】。直接把 skuId 当成商品 id 删，会删掉【另一件】商品 ——
+    #   两种 id 都是自增数字，撞车是必然的，而且这里不会有任何报错。
+    p5_pid = pid_of_sku(p5)
+    run_sql(f"DELETE FROM product_sku WHERE product_id = {p5_pid}")
+    run_sql(f"DELETE FROM product WHERE id = {p5_pid}")
     check("前置：商品已从库里消失", stock_of(p5) is None, f"{stock_of(p5)}")
 
     st, r = cancel(TOKEN_A, order5)

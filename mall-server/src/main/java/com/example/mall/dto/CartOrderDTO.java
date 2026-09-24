@@ -11,15 +11,15 @@ import java.util.List;
  *
  * <p>{@code POST /api/shop/orders}
  *
- * <h3>★ 为什么请求里只有商品 id，没有数量？</h3>
+ * <h3>★ 为什么请求里只有 skuId，没有数量？</h3>
  *
  * <p>这是这个 DTO 最需要理解的地方。购物车结算时前端传的是：
  * <pre>
- *   { "productIds": [3, 7], "addressId": 1, "idempotencyKey": "..." }
+ *   { "skuIds": [204, 311], "addressId": 1, "idempotencyKey": "..." }
  * </pre>
  * 而<b>不是</b>：
  * <pre>
- *   { "items": [ {"productId": 3, "quantity": 2}, {"productId": 7, "quantity": 1} ], ... }
+ *   { "items": [ {"skuId": 204, "quantity": 2}, {"skuId": 311, "quantity": 1} ], ... }
  * </pre>
  *
  * <p>区别在哪？数量。
@@ -36,41 +36,47 @@ import java.util.List;
  *
  * <p><b>★ 判断一个字段该不该由客户端传，标准是「这件事是不是只有客户端知道」。</b>
  * <ul>
- *   <li>「买了哪几种商品」—— 只有客户端知道（他勾选了哪几个）✅ 要传</li>
+ *   <li>「买了哪几种规格」—— 只有客户端知道（他勾选了哪几个）✅ 要传</li>
  *   <li>「每种买几件」—— 服务端从 Redis 读就有，客户端不必也不能传 ❌ 不传</li>
  * </ul>
  *
  * <p>购物车里的数量只有一个真相来源：<b>Redis</b>。
  * 前端传它，就是给同一个事实造了第二个来源，两个来源迟早会打架。
  *
- * <h3>★ 那 {@code productIds} 是干什么的？</h3>
+ * <h3>★ 那 {@code skuIds} 是干什么的？</h3>
  *
  * <p>因为用户可能<b>只勾选了购物车里的部分商品</b>结算。
  * 车里 5 种商品，只买其中 2 种，是很常见的操作。
  *
- * <p>所以 {@code productIds} 表达的是<b>「要结算哪些」</b>这个选择，
+ * <p>所以 {@code skuIds} 表达的是<b>「要结算哪些」</b>这个选择，
  * 而不是「每种买几件」这个数据。
  *
  * <p>服务端拿到它之后做的事是：
  * <pre>
  *   1. 读 Redis 里该会员的整个购物车
- *   2. 取出 productIds 里指定的那几种（顺便校验：传的 id 真的在车里吗？）
+ *   2. 取出 skuIds 里指定的那几种（顺便校验：传的 id 真的在车里吗？）
  *   3. 数量直接用 Redis 里的值
  * </pre>
- * 也就是 <b>{@code productIds} 只是一个「过滤器」，不是一个「数据来源」。</b>
+ * 也就是 <b>{@code skuIds} 只是一个「过滤器」，不是一个「数据来源」。</b>
+ *
+ * <p>★ 里程碑 15 阶段 4：这里从 {@code productIds} 换成了 {@code skuIds}，
+ * 因为购物车的 Redis field 换成了 skuId。这不是「参数改个名」——
+ * 这是<b>粒度变了</b>：一辆车里现在可以同时有「黑色 S」和「白色 M」，
+ * 而它们属于同一件商品。用 productIds 的话这两行无法区分，
+ * 用户勾了两行、结算出来只有一行。
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
 public class CartOrderDTO extends OrderBaseDTO {
 
     /**
-     * 要结算的商品 id 列表。
+     * 要结算的 SKU id 列表。
      *
      * <p>{@code @NotEmpty}：一个都不选就点结算，应该被拦下。
      * 服务端也会再判一次（前端拦是为了体验，服务端拦才是为了正确）。
      *
      * <p>⚠️ 这里<b>不校验每个元素是不是正数</b> —— 那属于业务判断
-     * （「这个 id 的商品真的存在吗、是不是在购物车里」），
+     * （「这个 id 的规格真的存在吗、是不是在购物车里」），
      * 要查库才知道，放在 Service 里做。DTO 只保证「给了一个非空列表」。
      *
      * <p>也不要在这里加 {@code @Size(max = 50)} 之类的「一次最多结算多少种」
@@ -79,5 +85,5 @@ public class CartOrderDTO extends OrderBaseDTO {
      * <b>只加真的有意义的约束。</b>
      */
     @NotEmpty(message = "请至少选择一件商品")
-    private List<Long> productIds;
+    private List<Long> skuIds;
 }

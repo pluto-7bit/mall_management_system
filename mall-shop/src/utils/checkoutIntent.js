@@ -135,7 +135,7 @@ function randomKey() {
 /**
  * 算出「这次买的是什么」的签名。
  *
- * <p>入参是一组 {@code "商品id:数量"}，顺序无关
+ * <p>入参是一组 {@code "规格id:数量"}，顺序无关
  * （用户勾选的先后顺序不该被当成两次不同的意图），
  * 所以这里<b>先排序再拼接</b>。
  *
@@ -143,12 +143,34 @@ function randomKey() {
  * 不同的签名 → 生成新的键 → 幂等保护失效。
  * 这类"看起来等价的东西算出来不等价"是签名/哈希最经典的坑。
  *
- * @param {Array<{productId: number, quantity: number}>} lines
+ * <h3>★★ 里程碑 15 阶段 4：这里的 {@code productId} 换成了 {@code skuId}</h3>
+ *
+ * <p>这是本轮<b>第二隐蔽</b>的一处改动（第一是 {@code removeItems} 传错 id）。
+ * 它编译得过、跑得通、接口全部 200，只有一种场景会露馅：
+ *
+ * <pre>
+ *   1. 用户在结算页看到「黑色 / 128G」，数量 1
+ *   2. 返回详情页换成「白色 / 256G」，数量仍是 1
+ *   3. 再进结算页 —— 签名是「白色那个 skuId:1」
+ *   4. 如果签名还在用 productId：两次算出来都是「同一件商品:1」→ 【签名一样】
+ *      → 复用同一个幂等键 → 服务端认出"处理过" → 把【黑色那单】原样返回
+ * </pre>
+ *
+ * <p>结果是：下单"成功"、跳转"成功"、订单号也是真的，
+ * <b>只是买错了规格</b>。而且这类错误的金额可能还是对的
+ * （两个规格同价的话），所以连对账都发现不了。
+ *
+ * <p>★ 顺带说清为什么签名里不能只放 productId：
+ * 「买什么」在这个项目里从来不是商品级的 ——
+ * 从 stage 4 起，<b>skuId 才是"一件可买的货"的身份</b>。
+ * 签名要覆盖的正是"可买的东西"这一层。
+ *
+ * @param {Array<{skuId: number, quantity: number}>} lines
  * @returns {string}
  */
 export function signatureOf(lines) {
   const parts = lines
-    .map((l) => `${l.productId}:${l.quantity}`)
+    .map((l) => `${l.skuId}:${l.quantity}`)
     .sort()
   return parts.join(',')
 }
@@ -160,7 +182,7 @@ export function signatureOf(lines) {
  * 告诉它「我要买这些」，它负责决定是复用还是新生成。
  * 让调用方自己判断该不该复用，就等着出现"两个地方判断得不一样"。
  *
- * @param {Array<{productId: number, quantity: number}>} lines
+ * @param {Array<{skuId: number, quantity: number}>} lines
  * @returns {string} 幂等键
  */
 export function getIntentKey(lines) {

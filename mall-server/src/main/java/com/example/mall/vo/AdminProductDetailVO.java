@@ -1,5 +1,6 @@
 package com.example.mall.vo;
 
+import com.example.mall.common.SpecGroup;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
@@ -8,7 +9,8 @@ import java.util.List;
 /**
  * 管理端商品<b>详情</b>（VO）。
  *
- * <p>比 {@link ProductVO} 只多一个 {@code images}。
+ * <p>比 {@link ProductVO} 多三个字段：{@code images}（图集）、
+ * {@code specSchema}（规格定义）、{@code skus}（逐个规格的价格库存）。
  *
  * <h3>★ 为什么是 {@code extends ProductVO}，而不是往 ProductVO 里塞一个列表字段？</h3>
  *
@@ -68,4 +70,35 @@ public class AdminProductDetailVO extends ProductVO {
      * 不用先判 undefined。这是「Service 保证不返回 null」的价值。
      */
     private List<String> images;
+
+    /**
+     * 这件商品的规格定义（★ 里程碑 15 新增）。
+     *
+     * <p>无规格的商品是<b>空列表</b>，不是 null —— 和 {@code images} 同一条规矩。
+     *
+     * <p>★ 它是 {@code ProductForm.vue} 规格矩阵编辑器<b>唯一的回填来源</b>：
+     * 编辑器靠它知道「有几维、每维有哪些值、值按什么顺序排」，
+     * 然后拿 {@link #skus} 里的价格库存去填每个组合。
+     *
+     * <p>⚠️ 这两个字段是<b>一对</b>，必须一起回填。只回填 {@code skus}
+     * 而不回填 {@code specSchema}，编辑器会以为这是个无规格商品，
+     * 于是那几行价格全部对不上号 —— 而用户在界面上看到的是
+     * 「规格没了，但价格也没了」，他会以为数据被删了。
+     */
+    private List<SpecGroup> specSchema;
+
+    /**
+     * 这件商品的全部 SKU（★ 里程碑 15 新增），按 id（插入顺序）排列。
+     *
+     * <p>无规格的商品是<b>恰好一条</b> {@code specs} 为空列表的默认 SKU，
+     * 它的 price/stock 就是这件商品的价格和库存。
+     *
+     * <p>⚠️ <b>它包含缺货（{@code stock = 0}）的 SKU。</b>
+     * 编辑器要能看见它们 —— 看不到的规格行等于被系统删掉了。
+     *
+     * <p>★ 它和图集 {@code images} 一样，是<b>在 Service 里单独查一次</b>
+     * 装进来的，不在这条 SQL 里 JOIN。理由同 {@code images}：
+     * 那几条查询被多处共用，往里塞只给详情页用的东西会伤到别人。
+     */
+    private List<SkuVO> skus;
 }

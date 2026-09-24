@@ -136,9 +136,20 @@ def redis_cmd(*args):
     return [l for l in result.stdout.strip().splitlines() if l]
 
 
-def stock_of(pid):
-    rows = run_sql(f"SELECT stock FROM product WHERE id = {pid}")
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
+
+
+def stock_of(sku_id):
+    """★ 里程碑 15 阶段 4：库存的唯一真源是 product_sku.stock。"""
+    rows = run_sql(f"SELECT stock FROM product_sku WHERE id = {sku_id}")
     return int(rows[0][0]) if rows else None
+
+
+def default_sku_of(pid):
+    """无规格商品的那唯一一条「默认 SKU」的 id。"""
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
 
 
 def db_order(order_no):
@@ -184,13 +195,18 @@ def register(tag):
 
 
 def create_product(name, price, stock):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 当作这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "categoryId": CATEGORY_ID, "name": name, "price": price,
-        "stock": stock, "status": 1,
+        "categoryId": CATEGORY_ID, "name": name,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
+        "status": 1,
     }, token=ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
-    return r["data"]
+    # ★ 里程碑 15 阶段 4：返回【SKU id】—— 下单和加购现在都按规格走。
+    return default_sku_of(r["data"])
 
 
 def create_address(token, receiver):
@@ -208,9 +224,9 @@ def key_for(tag):
     return f"k{RUN}{tag}"
 
 
-def buy_now(token, pid, qty, address_id, idem_key):
+def buy_now(token, sku_id, qty, address_id, idem_key):
     st, r = call("POST", "/shop/orders/buy-now", {
-        "productId": pid, "quantity": qty,
+        "skuId": sku_id, "quantity": qty,
         "addressId": address_id, "idempotencyKey": idem_key,
     }, token=token)
     if r.get("code") != 200:
@@ -218,9 +234,9 @@ def buy_now(token, pid, qty, address_id, idem_key):
     return r["data"]["orderNo"]
 
 
-def cart_order(token, product_ids, address_id, idem_key):
+def cart_order(token, sku_ids, address_id, idem_key):
     st, r = call("POST", "/shop/orders", {
-        "productIds": product_ids,
+        "skuIds": sku_ids,
         "addressId": address_id, "idempotencyKey": idem_key,
     }, token=token)
     if r.get("code") != 200:
@@ -228,8 +244,8 @@ def cart_order(token, product_ids, address_id, idem_key):
     return r["data"]["orderNo"]
 
 
-def cart_add(token, pid, qty):
-    st, r = call("POST", "/shop/cart/items", {"productId": pid, "quantity": qty},
+def cart_add(token, sku_id, qty):
+    st, r = call("POST", "/shop/cart/items", {"skuId": sku_id, "quantity": qty},
                  token=token)
     if r.get("code") != 200:
         raise SystemExit(f"加入购物车失败：HTTP {st} / {r}")
@@ -293,6 +309,9 @@ def cleanup():
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE a FROM member_address a "
             f"JOIN member m ON m.id = a.member_id WHERE m.username LIKE '{PREFIX}%'")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
 
@@ -397,7 +416,12 @@ def main():
     print(f"  C 的 5 笔订单落在 {len(c_seconds)} 个不同的秒上"
           f"{'（★ 同秒，正是要测的情形）' if len(c_seconds) == 1 else ''}")
 
-    # 每笔订单期望的明细：{商品id: 数量}
+    # 每笔订单期望的明细：{【规格id】: 数量}
+    # ★ 里程碑 15 阶段 4：键从商品 id 换成了规格 id。
+    #   这三件都是无规格商品，各自只有一条默认 SKU，所以只是数字变了 ——
+    #   但如果谁把明细按商品 id 去重分组，同一件商品的两个规格会被合并成一行，
+    #   而这里恰好都是单规格商品，看不出来。所以 test-sku.py 的 C4 那组
+    #   专门用【一件商品两个规格】来盯这件事。
     EXPECT_ITEMS = {
         a1: {pA: 1}, a2: {pA: 1}, a3: {pA: 1}, a4: {pS: 3}, a5: {pA: 1},
         a6: {pA: 1, pB: 1},
@@ -423,7 +447,7 @@ def main():
         items = order.get("items") or []
         got = {}
         for it in items:
-            got[it["productId"]] = got.get(it["productId"], 0) + it["quantity"]
+            got[it["skuId"]] = got.get(it["skuId"], 0) + it["quantity"]
 
         ok = (len(items) == len(expect)) and (got == expect)
         check(f"订单 …{no[-4:]} 的明细是 {len(expect)} 件且商品正确（实际 {len(items)} 件）",

@@ -6,6 +6,7 @@ import { clearCart, getCart, removeCartItem, updateCartItem } from '@/api/cart'
 import ProductImage from '@/components/ProductImage.vue'
 import { useCartStore } from '@/stores/cart'
 import { MAX_QUANTITY_PER_ITEM as MAX_PER_ITEM } from '@/utils/constants'
+import { formatAmount } from '@/utils/format'
 
 /**
  * 购物车页面。
@@ -49,7 +50,7 @@ const cart = ref({ items: [], totalQuantity: 0, totalAmount: 0 })
 const loading = ref(false)
 const loadFailed = ref(false)
 
-/** 正在改数量的商品 id —— 用来给那一行的输入框加 loading */
+/** 正在改数量的<b>规格</b> id —— 用来给那一行的输入框加 loading */
 const updatingId = ref(null)
 
 const items = computed(() => cart.value.items || [])
@@ -63,8 +64,19 @@ const nothingBuyable = computed(() => availableItems.value.length === 0)
 // ★ 勾选（里程碑 8 新增）
 // ---------------------------------------------------------------------------
 
-/** 勾选了的商品 id。只可能包含【能买的】商品 —— 失效商品不给勾 */
-const selectedIds = ref([])
+/**
+ * 勾选了的<b>规格</b> id。只可能包含【能买的】行 —— 失效商品不给勾。
+ *
+ * <p>★★ 里程碑 15 阶段 4：这个变量从 {@code selectedIds} 改名成了
+ * {@code selectedSkuIds}。改名不是为了好看 —— 是因为它的内容从商品 id
+ * 变成了规格 id，而这两者<b>在类型上都是数字、在代码里长得一模一样</b>。
+ * 留着一个叫 {@code selectedIds} 的变量装 skuId，
+ * 下次有人改这个文件时根本看不出自己传错了。
+ *
+ * <p>★ 这也是为什么这一轮改前端时统一用了「改名 + 全局替换」的做法：
+ * 让所有漏改的地方在 grep 里一眼可见，而不是靠人一个个去读。
+ */
+const selectedSkuIds = ref([])
 
 /**
  * 首次加载后是否已经做过默认勾选。
@@ -86,29 +98,33 @@ let selectionInitialized = false
  *   之后的每次刷新    →  【保留】用户的勾选，但把已经不能买的剔掉
  * </pre>
  *
- * <p>⚠️ 第二步的"剔除"是必须的。一个商品在用户勾上之后、
+ * <p>⚠️ 第二步的"剔除"是必须的。一个规格在用户勾上之后、
  * 提交之前被下架了，它就会从 available 变成 unavailable。
- * 这时候如果还留在 selectedIds 里，结算请求就会带上一个
- * <b>买不了的商品 id</b> —— 整单失败，而且用户看着自己
+ * 这时候如果还留在 selectedSkuIds 里，结算请求就会带上一个
+ * <b>买不了的 skuId</b> —— 整单失败，而且用户看着自己
  * 明明没勾它，不知道为什么失败。
+ *
+ * <p>★ 里程碑 15 阶段 4：这里的身份是 {@code item.skuId} 不是 productId。
+ * 同一件商品的两行（「黑色 S」和「白色 M」）是<b>两个独立的勾选单位</b> ——
+ * 用 productId 的话它们会一起被勾上或一起被取消，用户没法只结算其中一个。
  */
 function syncSelection() {
-  const available = availableItems.value.map((i) => i.productId)
+  const available = availableItems.value.map((i) => i.skuId)
   if (!selectionInitialized) {
-    selectedIds.value = available
+    selectedSkuIds.value = available
     selectionInitialized = true
     return
   }
   // ⚠️ 用 filter 保留【原来的顺序】，不是直接赋成 available。
   //   顺序不影响提交（后端不关心），但勾选框的视觉状态稳定一些
-  selectedIds.value = selectedIds.value.filter((id) => available.includes(id))
+  selectedSkuIds.value = selectedSkuIds.value.filter((id) => available.includes(id))
 }
 
 /** 全选：能买的是不是都勾上了 */
 const allSelected = computed(
   () =>
     availableItems.value.length > 0 &&
-    selectedIds.value.length === availableItems.value.length,
+    selectedSkuIds.value.length === availableItems.value.length,
 )
 
 /**
@@ -118,19 +134,19 @@ const allSelected = computed(
  * 会以为自己的勾选没生效。
  */
 const indeterminate = computed(
-  () => selectedIds.value.length > 0 && !allSelected.value,
+  () => selectedSkuIds.value.length > 0 && !allSelected.value,
 )
 
 function toggleAll(checked) {
-  selectedIds.value = checked
-    ? availableItems.value.map((i) => i.productId)
+  selectedSkuIds.value = checked
+    ? availableItems.value.map((i) => i.skuId)
     : []
 }
 
 /** 勾选的商品合计【件数】（不是条目数，和角标的口径一致） */
 const selectedQuantity = computed(() =>
   availableItems.value
-    .filter((i) => selectedIds.value.includes(i.productId))
+    .filter((i) => selectedSkuIds.value.includes(i.skuId))
     .reduce((sum, i) => sum + Number(i.quantity || 0), 0),
 )
 
@@ -156,12 +172,25 @@ const selectedQuantity = computed(() =>
  * 算好的，前端只做加法，误差的来源就少了一层。
  * 而且最终金额永远以后端下单时算的为准 ——
  * 万一这里因为浮点误差差了 1 分钱，也不会影响实际扣款。
+ *
+ * <p>★ 里程碑 14：这个 computed 现在返回<b>数字</b>，不再返回格式化好的字符串。
+ * 「保留两位小数」挪到模板里由 {@code formatAmount} 做（见 {@code utils/format.js}）。
+ *
+ * <p>判据是「谁该知道这是一笔钱」：这个 computed 回答的是<b>多少钱</b>，
+ * 而 {@code "228.70"} 这个字符串回答的是<b>这行字该怎么写</b>。
+ * 后者必须和 ¥ 符号待在一起 —— 因为符号和位数本来就是同一件事的两半
+ * （{@code formatAmount} 的 {@code @returns} 里写着「符号由各页面自己加」）。
+ *
+ * <p>⚠️ 这一改把它的类型从 String 换成了 Number。换之前查过：
+ * <b>读它的只有模板里那一处插值</b>，脚本里没有第二个人用它，
+ * 所以换成数字不影响任何判断逻辑。反过来，将来真有人要拿它做比较或再相加，
+ * 数字才是他要的东西 —— <b>字符串做加法会变成拼接</b>。
+ * （同理 {@code Checkout.vue} 的 {@code estimateTotal}。）
  */
 const selectedAmount = computed(() =>
   availableItems.value
-    .filter((i) => selectedIds.value.includes(i.productId))
-    .reduce((sum, i) => sum + Number(i.subtotal || 0), 0)
-    .toFixed(2),
+    .filter((i) => selectedSkuIds.value.includes(i.skuId))
+    .reduce((sum, i) => sum + Number(i.subtotal || 0), 0),
 )
 
 async function loadCart() {
@@ -206,9 +235,9 @@ async function changeQuantity(item, newValue) {
     return
   }
 
-  updatingId.value = item.productId
+  updatingId.value = item.skuId
   try {
-    await updateCartItem(item.productId, qty)
+    await updateCartItem(item.skuId, qty)
     await loadCart()
   } catch {
     // ★ 失败了要【重新拉一次】，把输入框的数字恢复成服务端的真实值。
@@ -224,9 +253,13 @@ async function changeQuantity(item, newValue) {
 }
 
 async function removeItem(item) {
+  // ★ 二次确认里带上规格。同一件商品在车里可能有两行，
+  //   只报商品名的话用户没法确认自己删的是哪一个 ——
+  //   而「删错了」是不可撤销的。
+  const label = item.specText ? `${item.name}（${item.specText}）` : item.name
   try {
     await ElMessageBox.confirm(
-      `确定要把「${item.name || '这件商品'}」从购物车移除吗？`,
+      `确定要把「${label || '这件商品'}」从购物车移除吗？`,
       '提示',
       { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' },
     )
@@ -235,7 +268,7 @@ async function removeItem(item) {
   }
 
   try {
-    await removeCartItem(item.productId)
+    await removeCartItem(item.skuId)
     ElMessage.success('已移除')
     await loadCart()
   } catch {
@@ -284,7 +317,7 @@ async function clearUnavailable() {
   //   **并发的度要看数据量，不能无脑并发。**
   try {
     await Promise.all(
-      unavailableItems.value.map((i) => removeCartItem(i.productId)),
+      unavailableItems.value.map((i) => removeCartItem(i.skuId)),
     )
     ElMessage.success('已清理失效商品')
     await loadCart()
@@ -305,9 +338,9 @@ function goShopping() {
 /**
  * 去结算。
  *
- * <p>★ 注意这里跳到结算页时，只带了<b>商品 id</b>，没带数量、没带价格：
+ * <p>★ 注意这里跳到结算页时，只带了<b>规格 id</b>，没带数量、没带价格：
  * <pre>
- *   /checkout?ids=3,7
+ *   /checkout?ids=204,311
  * </pre>
  * 数量由结算页重新从购物车接口读（因为那是服务端的真相），
  * 价格由后端在下单时算。详见 {@code Checkout.vue} 的注释。
@@ -316,9 +349,14 @@ function goShopping() {
  * 这样用户在结算页按 F5 时数据不会丢。<b>URL 是唯一能活过刷新的地方。</b>
  *
  * <p>勾选顺序不影响结果，所以这里<b>不排序</b>（后端也不关心顺序）。
+ *
+ * <p>★ 里程碑 15 阶段 4：URL 参数名 {@code ids} <b>没改</b>。
+ * 它本来就是中性的（"ids" 没说是什么 id），而且改它要动
+ * {@code Checkout.vue} 的 {@code parseIds} 和所有外部链接 ——
+ * 收益是零，风险是漏一处。改的是<b>值</b>：现在装的是 skuId。
  */
 function goCheckout() {
-  if (!selectedIds.value.length) {
+  if (!selectedSkuIds.value.length) {
     // 正常不会走到这里（按钮是禁用的），但"正常不会"不等于"一定不会"：
     // 用户可能在点下的同时刚好有商品被下架，syncSelection 把勾选清空了
     ElMessage.warning('请先选择要结算的商品')
@@ -326,7 +364,7 @@ function goCheckout() {
   }
   router.push({
     path: '/checkout',
-    query: { ids: selectedIds.value.join(',') },
+    query: { ids: selectedSkuIds.value.join(',') },
   })
 }
 
@@ -389,7 +427,7 @@ onMounted(loadCart)
             它不会报错，但勾选状态会一直不对。
 
             ⚠️ 而这正是前端最讨厌的一类 bug：模板里写得
-            `<el-checkbox v-model="selectedIds" :value="..." />`
+            `<el-checkbox v-model="selectedSkuIds" :value="..." />`
             看着完全合理，构建也通过，构建工具和 JS 都不会告诉你
             "这个用法不成立"。**没有类型检查的地方，
             "看起来对"和"确实对"之间的距离要靠查源码来填。**
@@ -399,14 +437,19 @@ onMounted(loadCart)
             每行一个 group 的话，每个 group 各管一个 id，
             "全选"就没法一眼算出勾了几个。
           -->
-          <el-checkbox-group v-model="selectedIds">
-            <div v-for="item in availableItems" :key="item.productId" class="cart-row">
+          <el-checkbox-group v-model="selectedSkuIds">
+            <div v-for="item in availableItems" :key="item.skuId" class="cart-row">
               <!--
                 ★ 只有【能买的】商品才有勾选框。失效商品不给勾 ——
                   一个能勾上却一定提交失败的选项，是纯粹的陷阱
-              -->
-              <el-checkbox :value="item.productId" />
 
+                ★★ 里程碑 15 阶段 4：这里的 value 从 item.productId 换成了 item.skuId。
+                    勾选的单位是【规格】—— 同一件商品的「黑色 S」和「白色 M」
+                    必须能分别勾选、分别结算。
+              -->
+              <el-checkbox :value="item.skuId" />
+
+              <!-- ★ 图/名点进商品详情页，所以这里仍然用 productId（规格不能单独开一个页面） -->
               <div class="row-cover" @click="goDetail(item.productId)">
                 <ProductImage :src="item.cover" :alt="item.name" :size="12" />
               </div>
@@ -415,25 +458,40 @@ onMounted(loadCart)
                 <div class="row-name" @click="goDetail(item.productId)">
                   {{ item.name }}
                 </div>
+                <!--
+                  ★ 规格文本。里程碑 15 阶段 4 新增的 —— 没有它，
+                    同一件商品的两行在购物车里长得一模一样，
+                    用户根本不知道自己在改哪一行的数量、删的是哪一个。
+
+                  ⚠️ 判断用 v-if="item.specText"（宽松真值）覆盖两种"没有规格"：
+                    无规格商品是【空串】，而失效行是【null 且整个 key 消失】。
+                    两种都该不显示这一行，所以一个 v-if 就够了 ——
+                    不用去区分""和 undefined，那样只会多一个判断和一处可能的洞。
+                -->
+                <div v-if="item.specText" class="row-spec">{{ item.specText }}</div>
                 <div class="row-category">{{ item.categoryName || '未分类' }}</div>
               </div>
 
-              <div class="row-price">¥{{ item.price }}</div>
+              <div class="row-price">¥{{ formatAmount(item.price) }}</div>
 
               <div class="row-quantity">
                 <el-input-number
                   :model-value="item.quantity"
                   :min="1"
                   :max="Math.max(Math.min(item.stock, MAX_PER_ITEM), 1)"
-                  :loading="updatingId === item.productId"
+                  :loading="updatingId === item.skuId"
                   size="small"
                   @change="(v) => changeQuantity(item, v)"
                 />
-                <!-- 库存提示：让用户知道为什么不能再加了 -->
+                <!--
+                  库存提示。★ 里程碑 15 阶段 4 之后这是【这个规格】的库存，
+                  不是商品的总库存 —— 所以「库存 3」这句话现在是准确的
+                  （以前多规格商品根本没这个概念，总库存对选规格没有指导意义）
+                -->
                 <div class="stock-hint">库存 {{ item.stock }}</div>
               </div>
 
-              <div class="row-subtotal">¥{{ item.subtotal }}</div>
+              <div class="row-subtotal">¥{{ formatAmount(item.subtotal) }}</div>
 
               <el-button text type="danger" @click="removeItem(item)">移除</el-button>
             </div>
@@ -454,9 +512,18 @@ onMounted(loadCart)
             </div>
           </template>
 
+          <!--
+            ★★ 里程碑 15 阶段 4：:key 从 item.productId 换成了 item.skuId。
+
+            ⚠️ 这里【不只是】为了正确性 —— 用 productId 会直接崩。
+               失效行的 productId 是 null（商品下架/被删就查不到了），
+               而 Vue 的 :key 不允许重复/空值：多行 key 都是 undefined 时，
+               列表的复用逻辑会错乱（改一行的数量，DOM 变的是另一行）。
+               而 skuId 来自 Redis，【一定有值】，见 CartItemVO.skuId 的注释。
+          -->
           <div
             v-for="item in unavailableItems"
-            :key="item.productId"
+            :key="item.skuId"
             class="cart-row invalid-row"
           >
             <!--
@@ -474,12 +541,58 @@ onMounted(loadCart)
 
             <div class="row-info">
               <div class="row-name">{{ item.name || '商品已下架' }}</div>
-              <!-- ★ 原因是后端算好给的，前端只负责显示，
-                   不在前端猜「为什么不能买」 -->
+              <!--
+                ★ 原因是后端算好给的，前端只负责显示，
+                  不在前端猜「为什么不能买」
+              -->
               <div class="row-reason">{{ item.unavailableReason }}</div>
+
+              <!--
+                ★★ 里程碑 15 阶段 4：【刻意】不在这里显示规格，这是一个已知的取舍。
+
+                计划里原本要求失效行也显示规格文本，实际做的时候发现做不到 ——
+                而且不是因为"懒得做"：
+
+                  规格文本 = SKU 行 + 商品 拼出来的
+                  而查商品那条 SQL 带 `status = 1`（用户端只能看见上架商品）
+                  失效行的商品查不到 → 商品名是 null，规格文本也是 null
+
+                为什么不为了失效行另开一条「不过滤 status」的查询？
+                因为那等于给「用户端能看见什么」这条【安全规则开第二个口子】。
+                （完整的论证见 ProductSkuMapper.selectByIds 的注释。）
+                代价是一个安全问题，收益是"在一条用户点不开、也改不了的
+                灰色行上多显示一句规格"。
+
+                ★ 所以这里【什么都不显示】。用户仍然能从封面图和
+                  「商品已下架」知道这一行是什么，也仍然能移除它。
+                  一行失效记录的可读性，不值得为它开第二条查询路径。
+
+                ⚠️ 如果将来真要补上，正确的做法是【让后端在失效行上也带上
+                  specText】（从 Redis 的 field 反查 SKU 表，不 join 商品），
+                  而不是在前端拼 —— 前端没有 SKU 表。
+              -->
             </div>
 
-            <div class="row-price">¥{{ item.price ?? '—' }}</div>
+            <!--
+              ★ 「价格查不到」显示破折号，【不是】显示 ¥0.00。
+                这一行是失效商品区：商品被删掉之后后端给不出价格，
+                而「没有价格」在这里的含义是「这件不能买了」，
+                不是「这件白送」—— 显示成 0.00 会让那句话变得荒谬。
+
+              ⚠️ 判断用的是【宽松】的 `== null`，不是 `=== null`。
+                后端配了 non_null，值为 null 的字段会【整个 key 消失】，
+                这里读到的是 undefined。`=== null` 判不到 undefined，
+                结果是失效行显示 ¥NaN 或者直接抛错。
+                这个语义和本轮之前那句 `item.price ?? '—'` 一字不差。
+
+              ★ 为什么不把 '—' 塞进 formatAmount（比如给它加个兜底参数）？
+                因为「查不到价格意味着什么」是【这一页的语义】，
+                不是金额格式化的问题。formatAmount 的契约是
+                「给一个数，还它两位小数的文本」，它无权解释 null。
+                为了让一个调用者少写三个字符，给共享函数加一个模式开关，
+                正是在犯里程碑 14 要清掉的同一类错。
+            -->
+            <div class="row-price">¥{{ item.price == null ? '—' : formatAmount(item.price) }}</div>
 
             <div class="row-quantity">×{{ item.quantity }}</div>
 
@@ -512,12 +625,12 @@ onMounted(loadCart)
           <div class="checkout-right">
             <div class="total">
               已选 <b>{{ selectedQuantity }}</b> 件，合计：
-              <span class="total-amount">¥{{ selectedAmount }}</span>
+              <span class="total-amount">¥{{ formatAmount(selectedAmount) }}</span>
             </div>
             <el-button
               type="danger"
               size="large"
-              :disabled="nothingBuyable || !selectedIds.length"
+              :disabled="nothingBuyable || !selectedSkuIds.length"
               @click="goCheckout"
             >
               去结算
@@ -644,6 +757,19 @@ onMounted(loadCart)
 
 .row-name:hover {
   color: var(--jd-red);
+}
+
+/* ★ 规格文本。比商品名浅、比分类名深 —— 它是「同一件商品的哪一行」，
+   重要性介于两者之间：不显示会认错，显示得太抢眼又会盖过商品名 */
+.row-spec {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #909399;
+  /* 规格值多了（3 维 10 值）会很长，截断而不是换行 ——
+     换行会把行高撑开，和右边固定的价格/数量列错位 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .row-category {

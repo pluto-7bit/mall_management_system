@@ -10,10 +10,10 @@ import request from './request'
  * <p>下单是用户能做的<b>唯一一个会扣别人东西</b>的操作
  * （扣库存），所以「前端能往请求里塞什么」这件事格外重要：
  * <pre>
- *   createFromCart 的 body:  {productIds, addressId, idempotencyKey, remark}
- *   createByBuyNow 的 body:  {productId, quantity, addressId, idempotencyKey, remark}
+ *   createFromCart 的 body:  {skuIds, addressId, idempotencyKey, remark}
+ *   createByBuyNow 的 body:  {skuId, quantity, addressId, idempotencyKey, remark}
  *
- *   ✗ 没有 totalAmount   —— 金额由服务端按商品现价算
+ *   ✗ 没有 totalAmount   —— 金额由服务端按规格现价算
  *   ✗ 没有 price         —— 单价同理
  *   ✗ 没有 receiver/phone/address —— 收货信息由 addressId 间接指定
  *   ✗ 没有 memberId      —— 身份从 JWT 里取
@@ -23,11 +23,17 @@ import request from './request'
  *
  * <p>这不是"少写几个字段"，而是<b>一条明确的边界</b>：
  * <b>凡是「服务端有权威来源」的数据，一律不接受客户端提供。</b>
- * 购物车结算的 {@code productIds} 里连数量都没有 ——
+ * 购物车结算的 {@code skuIds} 里连数量都没有 ——
  * 数量从 Redis 购物车里读，因为那才是真相所在。
  *
  * <p>这条规则的意义在于：客户端能提供的东西，客户端就能伪造。
  * 金额能被伪造的商城，是一个可以一块钱买 iPhone 的商城。
+ *
+ * <p>★ 里程碑 15 阶段 4：两个 body 里的 id 都从商品换成了<b>规格</b>。
+ * 这同样不只是改名字 —— <b>换规格 = 换一样东西</b>。
+ * 用户把「黑色 / 128G」改成「白色 / 256G」，
+ * 服务端要按另一个价格、扣另一个库存、快照另一串规格文本。
+ * 用 productId 下单的话，这三件事一件都做不到。
  */
 
 /**
@@ -35,22 +41,34 @@ import request from './request'
  *
  * <p>{@code POST /api/shop/orders}
  *
- * <p>⚠️ <b>{@code productIds} 是「用户勾选了哪几种商品」，
- * 不是「要买什么」的完整描述。</b>每种买几件由服务端去
+ * <p>⚠️ <b>{@code skuIds} 是「用户勾选了哪几个规格」，
+ * 不是「要买什么」的完整描述。</b>每个买几件由服务端去
  * Redis 购物车里读 —— 所以调用方<b>不需要也不应该</b>传数量。
  *
- * <p>下单成功且事务提交之后，后端会把这几种商品从购物车里移除。
+ * <p>下单成功且事务提交之后，后端会把这几个规格从购物车里移除。
  *
- * @param {number[]} productIds 勾选的商品 id
+ * <p>★★ <b>里程碑 15 阶段 4 最危险的改动就在这一行上。</b>
+ * 后端的参数名从 {@code productIds} 改成了 {@code skuIds}，
+ * 而清理购物车时用的也是它。如果前端还传商品 id：
+ * <pre>
+ *   HDEL mall:cart:1 &lt;productId&gt;     ← 车里现在的 field 是 skuId
+ * </pre>
+ * 后果<b>不是「什么都没删掉」</b>（那还算好的），
+ * 而是<b>商品 id 撞上了另一个规格的 id，把用户购物车里
+ * 另一行完全无关的东西删掉了</b>。而且这个清理发生在
+ * 订单事务提交之后的回调里，那里抛的异常只打一条日志 ——
+ * 三层代码没有一层会报错。
+ *
+ * @param {number[]} skuIds 勾选的规格 id
  * @param {number}   addressId  收货地址 id
  * @param {string}   idempotencyKey 见 {@code utils/checkoutIntent.js} ——
  *                 <b>不要在这个函数里现生成</b>，要从外面传进来
  * @param {string}   [remark]   备注，可以为空
  * @returns {Promise<object>} 新订单，或<b>幂等命中时</b>之前建立的那笔订单
  */
-export function createOrderFromCart(productIds, addressId, idempotencyKey, remark) {
+export function createOrderFromCart(skuIds, addressId, idempotencyKey, remark) {
   return request.post('/shop/orders', {
-    productIds,
+    skuIds,
     addressId,
     idempotencyKey,
     remark: remark || '',
@@ -77,15 +95,20 @@ export function createOrderFromCart(productIds, addressId, idempotencyKey, remar
  *
  * <p>⚠️ 而且这条路径<b>完全不碰购物车</b>：既不加进去，也不清空。
  *
- * @param {number} productId
+ * <p>★ 里程碑 15 阶段 4：参数是 <b>{@code skuId}</b>。
+ * 这条路上传的是「用户刚刚在详情页选中的那个规格」——
+ * 而 {@code Checkout.vue} 是从 URL 的 query 里拿的，
+ * 所以 {@code ProductDetail.vue} 跳过来时必须带上 skuId（不是商品 id）。
+ *
+ * @param {number} skuId
  * @param {number} quantity  1~999
  * @param {number} addressId
  * @param {string} idempotencyKey 见 {@code utils/checkoutIntent.js}
  * @param {string} [remark]
  */
-export function createOrderByBuyNow(productId, quantity, addressId, idempotencyKey, remark) {
+export function createOrderByBuyNow(skuId, quantity, addressId, idempotencyKey, remark) {
   return request.post('/shop/orders/buy-now', {
-    productId,
+    skuId,
     quantity,
     addressId,
     idempotencyKey,

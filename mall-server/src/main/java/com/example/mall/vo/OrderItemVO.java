@@ -17,7 +17,9 @@ import java.math.BigDecimal;
  *   id           → ★ 里程碑 12 起前端要用了：提交评价时要把它当 orderItemId 传回来
  *   orderId      → 属于哪一单，见下面「★ 为什么把它加回来」
  *   productId    → 需要 ✅ 前端要靠它跳到商品详情页
+ *   skuId        → ★ 里程碑 15 加的，可空；现在没有读者，留给售后退款
  *   productName  → 需要 ✅ 展示
+ *   skuSpec      → 需要 ✅ 展示（里程碑 15 加的，空串表示无规格）
  *   price        → 需要 ✅ 展示
  *   quantity     → 需要 ✅ 展示
  *   subtotal     → 需要 ✅ 展示
@@ -153,7 +155,42 @@ public class OrderItemVO {
 
     private Long productId;
 
+    /**
+     * 买的是哪个 SKU（{@code order_item.sku_id}）。★ 里程碑 15 加的。
+     *
+     * <p><b>⚠️ 它可以是 null，而且前端必须容忍</b>：历史订单（里程碑 13
+     * 之前下的）和商品已被硬删的孤儿明细都填不出真值，硬填就是造假。
+     * 详见 {@code OrderItem.skuId} 的注释。
+     *
+     * <p>⚠️⚠️ 于是它和 {@link #reviewId} 一样，遇到
+     * {@code default-property-inclusion: non_null} —— <b>null 时这个键整个消失</b>。
+     * 前端不要写 {@code it.skuId === null}。
+     *
+     * <p>★ 那前端拿它做什么？<b>现在什么也不做。</b>
+     * 展示规格用的是 {@link #skuSpec}（文本快照，永不为 null）。
+     * 它在这里是<b>留给下一个里程碑的接口</b>：售后退款要按 SKU 维度走，
+     * 而那时候必须知道退的是哪一行规格。提前加上是因为
+     * 「已经加过的字段不需要第二遍 SQL 改动」，而且它和 {@code productId}
+     * 一样属于「订单明细本身」的属性 —— 判据见 {@link #reviewId} 那段对照论证。
+     */
+    private Long skuId;
+
     private String productName;
+
+    /**
+     * 规格文本快照，形如 {@code "颜色:黑 / 内存:128G"}；无规格的商品是空串。
+     *
+     * <p>★ 里程碑 15 加的，订单页那一行商品名下显示它。
+     *
+     * <p><b>为什么是文本而不是 JSON</b>：理由在 {@code OrderItem.skuSpec} 里 ——
+     * 它是<b>快照</b>，商家后来改了规格名也不该影响历史订单的显示。
+     *
+     * <p>⚠️ 它是空串（不是 null）：{@code ''} 在 JS 里是 falsy，
+     * 所以前端写 {@code v-if="it.skuSpec"} 就够了，而且这个键<b>永远在</b> ——
+     * 这一点和 {@link #skuId} / {@link #reviewId} 恰好相反，
+     * 别把这三个字段的 null 规则记混。
+     */
+    private String skuSpec;
 
     /** 下单时的单价（快照，不是商品的当前价） */
     private BigDecimal price;

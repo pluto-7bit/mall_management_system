@@ -46,39 +46,112 @@ const categories = ref([])
 /** 图集上限。和后端 ProductSaveDTO 上的 @Size(max = 5) 是同一个数 */
 const MAX_IMAGES = 5
 
+/** 规格的几条上限。和后端 BusinessRules 里那几个常量是同一组数 —— 见下面 SKU 区的注释 */
+const MAX_DIMENSIONS = 3
+const MAX_VALUES_PER_DIM = 10
+const MAX_SKUS = 60
+const MAX_SPEC_NAME_LENGTH = 10
+const MAX_SPEC_VALUE_LENGTH = 20
+
+/**
+ * 给规格定义/组合行发本地唯一 key 的计数器。
+ *
+ * <p>★ <b>不是随机数，不是内容，就是一个自增的序号。</b>
+ * 这个「和内容无关的稳定 key」是里程碑 15 里最容易被写错的一处细节，
+ * 理由见 {@code specSchema} 的注释。
+ */
+let keySeq = 0
+function nextKey() {
+  return ++keySeq
+}
+
 /**
  * 表单数据。用 reactive 而不是 ref，这样模板里可以直接写 form.name
  *
- * <h3>★★ 里程碑 11：新增字段必须改【三处】，漏一处就是一个安静的 bug</h3>
+ * <h3>★★ 加一组字段必须改【六处】，漏一处就是一个安静的 bug</h3>
  *
  * <p>这个 form 是<b>逐字段列举</b>的（不是 {...detail}），
- * 而且 {@code resetForm()} 和编辑回填的 {@code Object.assign} 也各自列举了一遍。
- * 所以 {@code images} 要在三个地方同时出现：
+ * 而 {@code resetForm()}、编辑回填的 {@code Object.assign}、
+ * {@code handleSubmit()} 里的请求体也各自列举了一遍。所以任何一组字段
+ * （图集、规格）都要在六个地方同时出现：
  * <pre>
  *   1. 这里的初值
- *   2. resetForm()              ← 漏了：从「编辑 A」切到「新增」时会带着 A 的图集
- *   3. watch(visible) 的回填     ← 漏了：form.images 一直是 []，
- *                                  于是【每编辑一次商品就把它的图集清空一次】
+ *   2. resetForm()              ← 漏了：从「编辑 A」切到「新增」时会带着 A 的规格
+ *   3. watch(visible) 的回填     ← 漏了：form.skus 一直是 []，
+ *                                  于是【每编辑一次商品就把它现有的规格清空一次】
+ *   4. handleSubmit() 的请求体    ← 漏了：字段根本没发出去，后端拿不到规格
+ *   5. 模板里的 el-form-item
+ *   6. 后端的 ProductSaveDTO / Product / mapper XML
  * </pre>
  *
- * <p>后两个 bug <b>都不会报错</b>，而且症状要等到用户下次打开那个商品才看得见 ——
- * 保存时提示「修改成功」，图却没了。
+ * <p>前四个 bug <b>都不会报错</b>，症状要等到用户下次打开那个商品才看得见 ——
+ * 保存时提示「修改成功」，规格和价格却没了。
  *
- * <p>⚠️ 这不是新问题，是<b>同一个坑的第二次出现</b>：上面
- * {@code resetForm()} 的注释里已经写过「不用 resetFields()，
- * 因为它恢复到挂载那一刻的值」—— 那次踩的也是「字段列表要手工维护」这件事。
- * 只要这个 form 还是逐字段列举的，加字段就永远要改三处。
+ * <p>⚠️ 这条注释原来是「改三处」（里程碑 11 记的），现在是<b>六处</b>。
+ * 多出来的第 4 处是里程碑 15 带来的新情况：<b>form 不再等于请求体了</b>
+ * （见下面 {@code _k} / {@code vi} 的说明），所以提交时要显式挑字段。
+ * 而第 6 处提醒的是：一个字段从前端输入框到数据库列，中间隔着<b>三个</b>后端文件。
+ *
+ * <p>只要这个 form 还是逐字段列举的，加字段就永远要改这六处。
+ * 真正的解法是「声明式表单」（用一份 schema 生成 form / rules / 模板），
+ * 那是另一个规模的改造，明确推迟。
  */
 const form = reactive({
   categoryId: null,
   name: '',
-  price: null,
-  stock: 0,
   cover: '',
   description: '',
   status: 1,
   // 商品图集，按展示顺序。★ 永远是数组，永远不是 null —— 见 handleSubmit 的注释
   images: [],
+
+  /**
+   * 规格定义。每一项是一维：{@code { _k, name, values: [{ _k, text }] }}。
+   *
+   * <p>无规格的商品是空数组 —— <b>这仍然是一件合法的、有 SKU 的商品</b>，
+   * 它只有一条「默认 SKU」。
+   *
+   * <p>★ <b>{@code _k} 是这个文件里最容易被想当然的一个字段。</b>
+   * 它是 v-for 的 :key，必须是一个<b>和内容无关的稳定标识</b>。
+   * 为什么不能用 {@code :key="vi"}（数组下标）或 {@code :key="value.text"}`：
+   * <pre>
+   *   取值：[黑, 白, 灰]
+   *   用户删掉中间那个「白」→ 数组变成 [黑, 灰]
+   *   用下标当 key：下标 1 那一行的输入框【还是同一个 DOM】，
+   *                 里面显示的内容从「白」变成了「灰」——
+   *                 用户看到的是「我删了白，结果白还在、灰变成了灰灰」
+   *   用内容当 key：内容一变 key 就变，Vue 只能重建元素
+   * </pre>
+   * 前者是「串位」，后者是每次输入都重建输入框、<b>光标会跳到末尾</b>。
+   * 所以用一个自增序号：它不认识内容，也就不会被内容的变化影响。
+   *
+   * <p>⚠️ 图集那边用 {@code :key="img + index"} 是<b>安全</b>的，
+   * 因为图片不会被编辑（只能上移下移删除）。<b>这里会被逐字编辑</b>，
+   * 是同一件事在两个场景下的不同答案 —— 不是图集写错了。
+   */
+  specSchema: [],
+
+  /**
+   * 规格组合行。每一行 {@code { _k, vi, price, stock }}。
+   *
+   * <p>★★ <b>{@code vi} 存的是「每一维取第几个值」的下标数组，不是文字。</b>
+   * 这是这个编辑器里最重要的一个决定，理由是：
+   * <pre>
+   *   若存文字 [{name:'颜色',value:'黑'},...]：
+   *     商家把规格名「颜色」改成「颜色/」→ 12 行组合的 key 全变了
+   *     → 【12 行填好的价格全被清空】，而这是保存之前、没有任何提示
+   *
+   *   存在下标 [0,1]：
+   *     改名字、改取值文字 → 下标一个都没动 → 价格原封不动
+   *     显示用的是「拿下标去 specSchema 里查」，所以文字改动会立刻反映到每一行
+   * </pre>
+   * 一个字段（价格）能不能在无关的编辑里活下来，取决于它旁边挂的 key 是不是稳定的。
+   *
+   * <p>⚠️ 代价是「删掉中间一个取值」会让后面所有行的下标错位，
+   * 所以那个操作不能只调 splice —— 见 {@code removeValue()}，
+   * 它要把受影响的行一起挪。
+   */
+  skus: [],
 })
 
 /**
@@ -95,21 +168,16 @@ const rules = {
     { required: true, message: '请输入商品名称', trigger: 'blur' },
     { max: 100, message: '商品名称不能超过 100 个字符', trigger: 'blur' },
   ],
-  price: [
-    { required: true, message: '请输入价格', trigger: 'blur' },
-    {
-      // 自定义校验函数：校验价格必须大于 0
-      validator: (rule, value, callback) => {
-        if (value === null || value === undefined || value <= 0) {
-          callback(new Error('价格必须大于 0'))
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-  stock: [{ required: true, message: '请输入库存', trigger: 'blur' }],
+  // ★ 里程碑 15：price / stock 两条规则【删掉了】，连同下面模板里那两个输入框。
+  //
+  //   ⚠️ 只删输入框、忘了删这里的话，会得到一条【永远校验不过】的规则
+  //   （form.price 已经不存在了，rules 里却还要求它必填），
+  //   症状是点「确定」什么都不发生、红字也不出现 —— 因为 prop 已经没有了，
+  //   el-form 根本不知道该把这条规则的红字显示在哪个格子上。
+  //   双向都要删干净。
+  //
+  //   价格和库存现在挂在每一行 SKU 上，校验挪到了 handleSubmit 里的
+  //   checkSkusFilled()（那是「体验」层，真正的拦截在后端 Service）。
 }
 
 /**
@@ -122,15 +190,38 @@ const rules = {
 function resetForm() {
   form.categoryId = null
   form.name = ''
-  form.price = null
-  form.stock = 0
   form.cover = ''
   form.description = ''
   form.status = 1
-  // ★ 三处之一（见 form 的注释）。漏了这一行，图集会从上一个商品带过来
+  // ★ 六处之2（见 form 的注释）。漏了这一行，图集会从上一个商品带过来
   form.images = []
+  // ★ 新增商品的规格是【空的、但不是没有】—— 见 ensureDefaultSku()
+  form.specSchema = []
+  form.skus = []
+  ensureDefaultSku()
   // 清掉上一次遗留的校验红字，否则重新打开弹窗还留着「请输入商品名称」
   formRef.value?.clearValidate()
+}
+
+/**
+ * 保证「无规格」这件商品也有一条 SKU 行。
+ *
+ * <p>★ 这不是为了界面上好看，是后端的硬要求：{@code ProductSaveDTO.skus}
+ * 上有 {@code @NotEmpty}，因为 <b>SKU 是价格和库存的唯一真源</b> ——
+ * 一条 SKU 都没有的商品没有价格，那不是一个「简单商品」，
+ * 那是一件卖不了的商品。
+ *
+ * <p>所以「无规格商品」在界面上的样子是：规格定义那块空着，
+ * 下面的明细表里有<b>恰好一行</b>、规格列显示「默认」、填上价格和库存。
+ * 这一行对应后端 {@code spec_json = '[]'} 的默认 SKU。
+ *
+ * <p>⚠️ 它只在「一行都没有」时才补，不会去动已有的行 ——
+ * 否则用户在明细表里删光了行、还没来得及填，一切换焦点就被凭空塞回一行。
+ */
+function ensureDefaultSku() {
+  if (form.skus.length === 0) {
+    form.skus.push({ _k: nextKey(), vi: [], price: null, stock: null })
+  }
 }
 
 /** 加载分类下拉框数据 */
@@ -157,17 +248,25 @@ watch(visible, async (open) => {
   if (isEdit.value) {
     try {
       const detail = await getProductDetail(props.productId)
+      // ★ 规格定义要先转成界面形态，因为下面算 skus 的下标要用它。
+      //   接口返回的 specSchema 是 [{ name, values: ['黑','白'] }]（后端 SpecGroup），
+      //   界面用的是 [{ _k, name, values: [{ _k, text }] }] ——
+      //   多出来的两个 _k 是 v-for 的 key，见 form 的注释。
+      const schema = (detail.specSchema ?? []).map((group) => ({
+        _k: nextKey(),
+        name: group.name ?? '',
+        values: (group.values ?? []).map((text) => ({ _k: nextKey(), text })),
+      }))
+
       // 用 Object.assign 逐个覆盖，而不是 form = detail
       // —— reactive 对象不能整个替换，那样会丢掉响应式
       Object.assign(form, {
         categoryId: detail.categoryId,
         name: detail.name,
-        price: detail.price,
-        stock: detail.stock,
         cover: detail.cover ?? '',
         description: detail.description ?? '',
         status: detail.status,
-        // ★ 三处之三（见 form 的注释）。
+        // ★ 六处之3（见 form 的注释）。
         //   ?? [] 兜的是「接口没返回这个字段」—— 后端配了 non_null，
         //   理论上空图集返回的是 []，但这里多兜一层不亏。
         //
@@ -177,7 +276,24 @@ watch(visible, async (open) => {
         //   虽然这里 detail 是临时变量、改坏了也无所谓，
         //   但「表单编辑的是自己的一份副本」是更安全的心智模型。
         images: [...(detail.images ?? [])],
+        specSchema: schema,
+        // ★ 把后端回来的 skus 翻译成界面形态：specs 文字 → 下标数组。
+        //   这个翻译【不是可选的】：后端返回的 specs 是按规格名排过序的
+        //   （SpecJson.canonical 为了去重做的排序），
+        //   而界面要的是「第 0 维取第几个值」—— 两者顺序不一样，
+        //   直接把 specs 当下标用会把「黑色/128G」读成「128G/黑色」。
+        skus: (detail.skus ?? []).map((sku) => ({
+          _k: nextKey(),
+          vi: viOf(schema, sku.specs),
+          price: sku.price,
+          stock: sku.stock,
+        })),
       })
+      // 老数据兜底：万一这件商品一条 SKU 都没有（阶段 1 的迁移理论上
+      // 给 100 件都补了，但接口是可以被绕过的），界面不能是一片空白 ——
+      // 那会让商家以为「这商品没规格」，然后保存时被后端一句
+      // 「至少要有一个规格组合」顶回来，而他不知道该在哪填。
+      ensureDefaultSku()
     } catch {
       visible.value = false
     }
@@ -314,6 +430,231 @@ function setCover(url) {
   ElMessage.success('已设为封面')
 }
 
+// ======================================================================
+// 里程碑 15：规格矩阵编辑器
+//
+// 三组数据的形状（都在 form 上，见 form 的注释）：
+//   specSchema  规格定义   [{ _k, name, values: [{ _k, text }] }]   ← 商家填的
+//   skus        组合明细   [{ _k, vi: [0, 1], price, stock }]        ← 叉乘出来的
+//   vi          下标数组   「第 0 维取第 0 个值、第 1 维取第 1 个值」
+//
+// ★ 界面上的一切都是「vi → 去 specSchema 里查文字」推出来的，
+//   组合行自己【不存文字】。这样改规格名、改取值文字都不需要重建任何东西。
+// ======================================================================
+
+/** 叉乘出来的组合数 = 各维取值数之积。无规格时是 1（那条默认 SKU） */
+const combinationCount = computed(() => {
+  if (!form.specSchema.length) return 1
+  return form.specSchema.reduce((n, group) => n * group.values.length, 1)
+})
+
+const tooManyCombinations = computed(() => combinationCount.value > MAX_SKUS)
+
+/**
+ * 把后端回来的 {@code specs} 文字翻译成下标数组。
+ *
+ * <p>★ <b>按规格名逐项查，不能按下标对位。</b>
+ * 后端返回的 {@code specs} 是 {@code SpecJson.canonical()} 排过序的
+ * （它为了让唯一索引认得出「颜色:黑,内存:128G」和「内存:128G,颜色:黑」是同一个组合，
+ * 按名字排了序），而 {@code specSchema} 是商家定义的顺序 ——
+ * 两者经常不一样，按下标对位会把「黑色 / 128G」读成「128G / 黑色」。
+ *
+ * @returns {number[]} 每一维的下标；认不出来时是 -1
+ */
+function viOf(schema, specs) {
+  const byName = new Map((specs ?? []).filter(Boolean).map((s) => [s.name, s.value]))
+  return schema.map((group) => {
+    const text = byName.get(group.name)
+    // ★ 认不出来时返回 -1，而【不是】悄悄退回 0。
+    //   退 0 的话界面会显示一个看起来完全正常的组合，商家一保存
+    //   就把它真的写进库 —— 数据在谁都没发觉的情况下变了样。
+    //   -1 会让那一格显示「(未知)」，并且 checkSkusFilled() 会拒绝提交。
+    return group.values.findIndex((v) => v.text === text)
+  })
+}
+
+/** 叉乘出全部组合，每个是「每一维取第几个值」的下标数组 */
+function cartesianVi() {
+  // 无规格商品：恰好一条组合，下标是空数组 —— 它就是默认 SKU
+  if (!form.specSchema.length) return [[]]
+  let combos = [[]]
+  for (const group of form.specSchema) {
+    const next = []
+    for (const prefix of combos) {
+      for (let i = 0; i < group.values.length; i++) {
+        next.push([...prefix, i])
+      }
+    }
+    combos = next
+  }
+  return combos
+}
+
+/**
+ * 按当前的规格定义重新叉乘一遍明细行，<b>并把已经填好的价格和库存认领回来</b>。
+ *
+ * <p>★★ 这个函数存在的唯一理由是<a>「改一个规格值不能把填好的 12 行价格清空」</a>。
+ * 认领用的钥匙是 {@code vi.join(',')} —— <b>纯下标，不含任何文字</b>，
+ * 所以只要下标没变，价格就一定回得来。
+ *
+ * <p>⚠️ 它是「重建」而不是「增量修改」，所以调用它的地方必须<b>先把老行的 vi
+ * 调整到位</b>，否则认领会落空、价格会丢。加一维要 push(0)、删一维要 splice(d,1) ——
+ * 见 addDimension / removeDimension。这两处是唯一需要小心的地方，
+ * 也是为什么它们各自只有一行注释却很重要。
+ *
+ * <p>★ 认领不到的新组合，价格和库存留 {@code null} 而<b>不是 0</b>：
+ * 0 是一个合法的库存（卖光了），留 0 就等于「悄悄替商家填了一个卖掉的值」，
+ * 而 null 会在界面上显示成空、被 {@code checkSkusFilled()} 拦住并指出是第几行。
+ */
+function rebuildSkus() {
+  const old = new Map(form.skus.map((sku) => [sku.vi.join(','), sku]))
+  form.skus = cartesianVi().map((vi) => {
+    const prev = old.get(vi.join(','))
+    return {
+      _k: nextKey(),
+      vi,
+      price: prev?.price ?? null,
+      stock: prev?.stock ?? null,
+    }
+  })
+}
+
+/** 一行组合 → 要提交给后端的 specs。无规格时是空数组（后端认成默认 SKU） */
+function specsOf(sku) {
+  return form.specSchema.map((group, i) => ({
+    name: group.name.trim(),
+    value: (group.values[sku.vi[i]]?.text ?? '').trim(),
+  }))
+}
+
+/** 一行组合显示用的文字。★ 「默认」是给无规格商品那唯一一行用的 */
+function specTextOf(sku) {
+  const parts = specsOf(sku)
+    .filter((item) => item.name && item.value)
+    .map((item) => `${item.name}:${item.value}`)
+  return parts.length ? parts.join(' / ') : '默认'
+}
+
+/** 加一个规格维度 */
+function addDimension() {
+  if (form.specSchema.length >= MAX_DIMENSIONS) {
+    ElMessage.warning(`最多 ${MAX_DIMENSIONS} 个规格维度`)
+    return
+  }
+  // ★ 新取值默认是【空文字】，不是「规格值1」这种占位符。
+  //   占位符会被当成真值保存进库 —— 商家没注意就多了一个叫「规格值1」的规格。
+  //   空值会被 checkSkusFilled() 拦住，那才是它该有的下场。
+  form.specSchema.push({ _k: nextKey(), name: '', values: [{ _k: nextKey(), text: '' }] })
+  // ★ 新维度加在【末尾】，所以老行的 vi 前面几维位置不变，
+  //   只需要给每一行补一个「新维度取第 0 个值」。
+  //   漏了这一步，老行的 vi 长度和 cartesianVi() 对不上，认领全部落空 —— 价格全清空。
+  for (const sku of form.skus) sku.vi.push(0)
+  rebuildSkus()
+}
+
+/** 删掉第 d 维 */
+function removeDimension(d) {
+  form.specSchema.splice(d, 1)
+  for (const sku of form.skus) sku.vi.splice(d, 1)
+  rebuildSkus()
+}
+
+/** 给第 d 维加一个取值 */
+function addValue(d) {
+  const group = form.specSchema[d]
+  if (group.values.length >= MAX_VALUES_PER_DIM) {
+    ElMessage.warning(`一个规格最多 ${MAX_VALUES_PER_DIM} 个取值`)
+    return
+  }
+  group.values.push({ _k: nextKey(), text: '' })
+  // 新值加在末尾，老行的 vi 一个都没变，重建就能全部认领回来
+  rebuildSkus()
+}
+
+/**
+ * 删掉第 d 维的第 j 个取值。
+ *
+ * <p>★ <b>这里不能只调一次 splice。</b>
+ * 删掉中间那个取值之后，排在它后面的每一行的下标都往前挪了一格；
+ * 不跟着挪的话，{@code [0,2]} 那两行会去认领原本属于 {@code [0,1]} 的价格 ——
+ * <b>「灰色」的价格跑到「白色」身上，而且是静默的</b>。
+ *
+ * <p>所以：选中的就是被删那个值的行直接丢掉，排在后面的行下标减一。
+ */
+function removeValue(d, j) {
+  const group = form.specSchema[d]
+  if (group.values.length <= 1) {
+    ElMessage.warning('每一维至少要有一个取值；整维不要了请点「删除这一维」')
+    return
+  }
+  const kept = []
+  for (const sku of form.skus) {
+    if (sku.vi[d] === j) continue // 这一维选的就是被删掉的值 → 这个组合不存在了
+    if (sku.vi[d] > j) sku.vi[d] -= 1 // 排在它后面的往前挪一格
+    kept.push(sku)
+  }
+  group.values.splice(j, 1)
+  form.skus = kept
+}
+
+/**
+ * 提交前的自查。
+ *
+ * <p>★ 这一层管的是<b>「体验」而不是「安全」</b>——
+ * 和 {@code beforeUpload}、模板上的 {@code :min="0.01"} 是同一个位置的东西。
+ * 真正的拦截在后端 Service（叉乘、上限、不漏行、不重复都在那儿判一次）。
+ * 这里存在的价值只有一个：让商家知道<b>是哪一行</b>没填。
+ * 后端只会说「规格组合和规格定义对不上」，它看不见界面上的行号。
+ *
+ * @returns {boolean} false 表示不用提交了
+ */
+function checkSkusFilled() {
+  // 无规格的商品也要有那唯一一行默认 SKU
+  ensureDefaultSku()
+
+  const noName = form.specSchema.find((group) => !group.name.trim())
+  if (noName) {
+    ElMessage.warning('有规格还没有填名字')
+    return false
+  }
+  const emptyValue = form.specSchema.find((group) => group.values.some((v) => !v.text.trim()))
+  if (emptyValue) {
+    ElMessage.warning(`规格「${emptyValue.name.trim()}」里还有没填的取值`)
+    return false
+  }
+  if (tooManyCombinations.value) {
+    ElMessage.warning(
+      `规格组合有 ${combinationCount.value} 种，超过上限 ${MAX_SKUS}，请减少规格维度或取值`,
+    )
+    return false
+  }
+  // 下标为 -1 = 后端回来的组合和规格定义对不上（见 viOf）。这种情况不该被保存
+  if (form.skus.some((sku) => sku.vi.some((i) => i < 0))) {
+    ElMessage.warning('规格组合和规格定义对不上，请重新调整规格后再保存')
+    return false
+  }
+
+  // ★ 下面两条是「指出第几行」的。留空的价格/库存如果直接发出去，
+  //   后端会返回 400「价格不能为空」—— 那句话是对的，但商家不知道说的是哪一行。
+  const noPrice = form.skus.findIndex((sku) => sku.price === null || sku.price === undefined)
+  if (noPrice >= 0) {
+    ElMessage.warning(`第 ${noPrice + 1} 行还没有填价格`)
+    return false
+  }
+  const noStock = form.skus.findIndex((sku) => sku.stock === null || sku.stock === undefined)
+  if (noStock >= 0) {
+    ElMessage.warning(`第 ${noStock + 1} 行还没有填库存`)
+    return false
+  }
+  // 价格必须 ≥ 0.01。模板上的 :min="0.01" 管「不让点小箭头调下去」，
+  // 但输入框里是可以直接敲 0 的 —— 所以这里要再判一次
+  if (form.skus.some((sku) => Number(sku.price) < 0.01)) {
+    ElMessage.warning('价格必须大于 0')
+    return false
+  }
+  return true
+}
+
 /** 提交表单 */
 async function handleSubmit() {
   // validate() 返回 Promise：校验通过 resolve，不通过 reject。
@@ -324,26 +665,67 @@ async function handleSubmit() {
     return // 校验没通过，直接返回，让页面上的红字提示告诉用户哪里错了
   }
 
+  // ★ 规格和价格的自查。放在 submitting 之前 —— 校验不过就不该进入「提交中」状态
+  if (!checkSkusFilled()) return
+
   submitting.value = true
   try {
-    // ★ 提交的是 form 这个 reactive 对象本身，其中 form.images
-    //   【永远是一个数组】（哪怕是空的），永远不会是 null。
+    // ★★★ 里程碑 15：提交的【不再是 form 本身】了。
     //
-    //   这是刻意的，而且正好绕开了后端那个三态语义最容易踩的地方：
-    //     后端：null = 不改图集，[] = 清空图集
-    //     这里：永远传 []，也就是永远明确告诉后端「图集就应该是这些」
+    //   以前可以直接 createProduct(form)，因为 form 的字段和接口字段一一对应。
+    //   现在不是：form.specSchema 每一项多了 _k，
+    //   form.skus 每一行多了 _k 和 vi —— 三个都是【纯界面】的东西，
+    //   后端既没有这些字段，也不该有（vi 是本地下标，换个商品的规格定义就毫无意义）。
     //
-    //   ⚠️ 为什么这样就安全：编辑时 form.images 是从接口回填的真实图集，
-    //      它【已经】准确地表达了用户想要的最终状态。所以「总是提交」
-    //      既不会误清空（数组里有内容），也不会漏清空（用户删光了就是 []）。
-    //
-    //   反过来说，如果这里写成「images 为空就不传这个字段」，
-    //   用户删光所有图再保存就会【删不掉】—— 一次也不报错的静默失败。
+    //   ⚠️ 多传字段【不会报错】：Spring Boot 默认忽略请求体里不认识的字段。
+    //   所以「忘了挑字段」这个 bug 是无声的 —— 请求发出去、返回 200、提示保存成功，
+    //   而多出来的 _k/vi 去哪了没有任何人知道，也永远不会有人发现。
+    //   必须显式构造，一个界面专用字段都不能漏出去。
+    const payload = {
+      categoryId: form.categoryId,
+      name: form.name,
+      cover: form.cover,
+      description: form.description,
+      status: form.status,
+      // ★ images 传的永远是数组（哪怕是空的），永远不会是 null。
+      //
+      //   这是刻意的，而且正好绕开了后端那个三态语义最容易踩的地方：
+      //     后端：null = 不改图集，[] = 清空图集
+      //     这里：永远传 []，也就是永远明确告诉后端「图集就应该是这些」
+      //
+      //   ⚠️ 为什么这样就安全：编辑时 form.images 是从接口回填的真实图集，
+      //      它【已经】准确地表达了用户想要的最终状态。所以「总是提交」
+      //      既不会误清空（数组里有内容），也不会漏清空（用户删光了就是 []）。
+      //
+      //   反过来说，如果这里写成「images 为空就不传这个字段」，
+      //   用户删光所有图再保存就会【删不掉】—— 一次也不报错的静默失败。
+      images: form.images,
+      // 规格定义：去掉 _k，只留名字和取值
+      specSchema: form.specSchema.map((group) => ({
+        name: group.name.trim(),
+        values: group.values.map((v) => v.text.trim()),
+      })),
+      // 组合明细：把 vi 翻译回文字。
+      //
+      // ⚠️ 这里【没有】像图集那样保留三态语义 —— specSchema 和 skus 是
+      //    「一定有值」的，不是「null 表示不改」。理由：价格和库存只存在于
+      //    SKU 上，所以「这次保存不带价格」这句话没有意义。DTO 上的
+      //    @NotNull / @NotEmpty 也是同一个意思。
+      //
+      // ★ 无规格的商品：specSchema 是 []、skus 是恰好一条 specs 为 [] 的行，
+      //   后端拿它当默认 SKU（spec_json = '[]'）。
+      skus: form.skus.map((sku) => ({
+        specs: specsOf(sku),
+        price: sku.price,
+        stock: sku.stock,
+      })),
+    }
+
     if (isEdit.value) {
-      await updateProduct(props.productId, form)
+      await updateProduct(props.productId, payload)
       ElMessage.success('修改成功')
     } else {
-      await createProduct(form)
+      await createProduct(payload)
       ElMessage.success('新增成功')
     }
     // 通知父组件：成功了，该刷新列表了
@@ -361,7 +743,7 @@ async function handleSubmit() {
   <el-dialog
     v-model="visible"
     :title="isEdit ? '编辑商品' : '新增商品'"
-    width="640px"
+    width="780px"
     :close-on-click-modal="false"
   >
     <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
@@ -380,25 +762,118 @@ async function handleSubmit() {
         <el-input v-model="form.name" placeholder="请输入商品名称" maxlength="100" show-word-limit />
       </el-form-item>
 
-      <el-form-item label="价格" prop="price">
-        <!--
-          el-input-number 的 :min="0.01" 和 :precision="2" 只是 UI 层限制，
-          用户可以绕过页面直接调接口。真正的校验在后端的 @DecimalMin。
-          前端校验管体验，后端校验管安全，两者都要有
-        -->
-        <el-input-number
-          v-model="form.price"
-          :min="0.01"
-          :precision="2"
-          :step="10"
-          style="width: 200px"
-        />
-        <span class="unit">元</span>
+      <!--
+        规格定义（里程碑 15 新增）。
+
+        ★ 这里【替换掉了】原来的「价格」和「库存」两个 el-form-item ——
+          价格和库存搬到了下面每一行 SKU 上，商品的起售价和总库存
+          由后端从 SKU 汇总出来，不再由人填。
+
+        ⚠️ 只删这两个输入框、忘了删 rules 里那两条规则，
+          会得到一条永远校验不过的幽灵规则（见 rules 的注释）。
+
+        形状：一维一行，每行是「规格名 + 若干个取值」。
+        整个界面上看到的顺序就是数组顺序，后端按这个顺序存 spec_schema。
+      -->
+      <el-form-item label="规格">
+        <div class="spec-block">
+          <div v-for="(group, d) in form.specSchema" :key="group._k" class="spec-row">
+            <el-input
+              v-model="group.name"
+              class="spec-name"
+              :maxlength="MAX_SPEC_NAME_LENGTH"
+              placeholder="规格名，如 颜色"
+            />
+
+            <div class="spec-values">
+              <!--
+                ★ :key 用的是 value._k，不是下标也不是文字 —— 见 form 里
+                  specSchema 的注释。这里用下标或文字，删掉中间一个取值时
+                  输入框会「串位」（光标在原位，显示的值变成下一个）。
+              -->
+              <div v-for="(value, j) in group.values" :key="value._k" class="spec-value">
+                <el-input
+                  v-model="value.text"
+                  :maxlength="MAX_SPEC_VALUE_LENGTH"
+                  placeholder="取值，如 黑"
+                />
+                <el-button size="small" text type="danger" title="删除这个取值"
+                           @click="removeValue(d, j)">×</el-button>
+              </div>
+              <el-button size="small" text
+                         :disabled="group.values.length >= MAX_VALUES_PER_DIM"
+                         @click="addValue(d)">+ 加取值</el-button>
+            </div>
+
+            <el-button size="small" text type="danger"
+                       @click="removeDimension(d)">删除这一维</el-button>
+          </div>
+
+          <el-button v-if="form.specSchema.length < MAX_DIMENSIONS" size="small"
+                     @click="addDimension">+ 添加规格维度</el-button>
+
+          <div class="hint">
+            <template v-if="form.specSchema.length">
+              当前 {{ form.specSchema.length }} 维，叉乘出
+              <b :class="{ danger: tooManyCombinations }">{{ combinationCount }}</b>
+              种组合（上限 {{ MAX_SKUS }}）
+            </template>
+            <template v-else>
+              不填规格就是「无规格商品」—— 下面会自动有一条默认配置，价格和库存填在它上面
+            </template>
+          </div>
+        </div>
       </el-form-item>
 
-      <el-form-item label="库存" prop="stock">
-        <el-input-number v-model="form.stock" :min="0" :precision="0" style="width: 200px" />
-        <span class="unit">件</span>
+      <!--
+        规格明细表（里程碑 15 新增）。每一行是一个规格组合，价格和库存填在这里。
+
+        ★ 这一整张表的数据都是【算出来的】：规格列的文字由 vi 去规格定义里查，
+          增删维度/取值时由 rebuildSkus() 重新叉乘并认领已填的价格。
+          它不是一个可以自由增删行的表格 —— 行数由规格定义决定，
+          这也是「不许漏行」这条后端规则在界面上的样子。
+      -->
+      <el-form-item label="规格明细">
+        <div class="sku-block">
+          <el-table :data="form.skus" size="small" border>
+            <el-table-column label="规格" min-width="200">
+              <template #default="{ row }">{{ specTextOf(row) }}</template>
+            </el-table-column>
+
+            <el-table-column label="价格（元）" width="170">
+              <template #default="{ row }">
+                <!--
+                  :min="0.01" / :precision="2" 只是 UI 层限制，用户可以绕过页面
+                  直接调接口。真正的校验在后端的 @DecimalMin。
+                  前端校验管体验，后端校验管安全，两者都要有。
+                  （checkSkusFilled() 里还判了一次 —— 因为输入框里可以直接敲 0，
+                    :min 只挡小箭头）
+                -->
+                <el-input-number v-model="row.price" :min="0.01" :precision="2"
+                                 :step="10" :controls="false" style="width: 100%" />
+              </template>
+            </el-table-column>
+
+            <el-table-column label="库存" width="140">
+              <template #default="{ row }">
+                <el-input-number v-model="row.stock" :min="0" :precision="0"
+                                 :controls="false" style="width: 100%" />
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <!--
+            ⚠️ 这是本轮【已知的取舍】，不是没想到：
+               SKU 的保存是「全量覆盖」，不是「增量 ±N」。所以运营打开编辑页时
+               库存是 10、期间卖掉了 3 件、再点保存 —— 库存会回到 10，凭空多出 3 件。
+               真正的修法是「库存调整走增量」，明确推迟（见 README 的已知取舍）。
+               在这一行提示里说清楚，比让运营自己撞上去强。
+          -->
+          <div class="hint warn">
+            ⚠️ 保存会把这里的库存<b>原样覆盖</b>到数据库。如果打开本页之后卖出了商品，
+            请先关掉重开再改，否则会把库存改回去。
+          </div>
+        </div>
       </el-form-item>
 
       <!--
@@ -412,7 +887,7 @@ async function handleSubmit() {
         mall-shop/public/ 目录，在 mall-web 下【必然 404】——
         管理端的 public/ 里只有 favicon.svg。
         所以下面这个预览只对新上传的图有效，点开老商品会看到占位块。
-        这是【刻意不修】的：修它要么往 mall-web/public/ 复制 47 个文件，
+        这是【刻意不修】的：修它要么往 mall-web/public/ 复制 105 个文件，
         要么配一条跨工程代理（生产环境根本没有 5174）。
         生产环境 /images 和 /uploads 由同一个 nginx 托管，不存在这个问题。
       -->
@@ -542,11 +1017,6 @@ async function handleSubmit() {
 </template>
 
 <style scoped>
-.unit {
-  margin-left: 8px;
-  color: #909399;
-}
-
 /* ---------------- 里程碑 11：封面图 ---------------- */
 
 .cover-block {
@@ -666,5 +1136,79 @@ async function handleSubmit() {
   color: #c0c4cc;
   font-size: 12px;
   margin-bottom: 8px;
+}
+
+/* ---------------- 里程碑 15：规格定义 ---------------- */
+
+.spec-block {
+  width: 100%;
+}
+
+/* 一维一行：规格名 + 取值们 + 删除按钮。
+   ★ 用 flex-wrap 而不是固定分栏 —— 取值多了会自动换行，
+     不像表格那样把规格名挤成一列窄条 */
+.spec-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px dashed #ebeef5;
+}
+
+.spec-name {
+  width: 120px;
+  flex: none;
+}
+
+/* ★ 取值区是这里唯一会长高的部分（一行放不下就换行），
+   所以它吃掉所有剩余宽度，规格名和删除按钮保持固定 */
+.spec-values {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+  min-width: 200px;
+}
+
+/* 一个取值 = 输入框 + 一个 ×。
+   ★ 输入框宽度必须固定，否则每输入一个字宽度就变一点，整行都在抖 */
+.spec-value {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.spec-value .el-input {
+  width: 110px;
+}
+
+.spec-value :deep(.el-button) {
+  padding: 2px 4px;
+}
+
+.hint {
+  color: #909399;
+  font-size: 12px;
+  margin-top: 6px;
+  line-height: 1.6;
+}
+
+/* 组合数超上限时把它标红。★ 只标红不拦输入 ——
+   拦在「点确定」那一步（checkSkusFilled），因为商家可能是
+   先加维度再删取值，中途短暂超限是正常的编辑过程 */
+.danger {
+  color: #f56c6c;
+}
+
+/* ---------------- 里程碑 15：规格明细表 ---------------- */
+
+.sku-block {
+  width: 100%;
+}
+
+.hint.warn {
+  color: #e6a23c;
 }
 </style>

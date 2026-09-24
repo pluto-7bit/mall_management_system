@@ -104,15 +104,23 @@ export const useCartStore = defineStore('cart', () => {
    * 真正需要防的「重复提交」在<b>下单</b>场景（里程碑 8），
    * 那里必须由后端保证，因为涉及钱。
    *
+   * <p>★ 里程碑 15 阶段 4：参数是 <b>skuId（规格）</b>不是 productId。
+   * 「加购一件商品」这个说法从这一轮起就不准确了 ——
+   * 能加进购物车的永远是<b>一个具体的规格</b>。
+   * 无规格的商品也有一条默认 SKU（{@code spec_json = '[]'}），
+   * 所以调用方永远有得传，不需要为它写分支。
+   *
+   * @param {number} skuId    规格 id
+   * @param {number} quantity 要【增加】的数量（增量语义，不是目标值）
    * @returns {Promise<boolean>} 成功返回 true，失败返回 false（不抛异常）
    */
-  async function add(productId, quantity = 1) {
+  async function add(skuId, quantity = 1) {
     if (loading.value) {
       return false
     }
     loading.value = true
     try {
-      await addCartItem(productId, quantity)
+      await addCartItem(skuId, quantity)
       return true
     } catch {
       // 错误提示已由 request.js 统一弹出，这里只负责返回结果

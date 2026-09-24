@@ -288,14 +288,35 @@ def register(tag):
     return d["token"], d["id"]
 
 
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
+
+
 def create_product(name, price=19.90, stock=1000, status=1):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "categoryId": CATEGORY_ID, "name": name, "price": price,
-        "stock": stock, "status": status,
+        "categoryId": CATEGORY_ID, "name": name, "status": status,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
     }, token=ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
+    # ★ 里程碑 15 阶段 4：这里【保持】返回商品 id，和以前一样。
+    #   理由是这个脚本里 p1/p2/p3 主要在讲【评价】—— 评价是商品级的
+    #   （一件商品一个评价列表，和规格无关），所以商品详情、评论列表、
+    #   筛选项全都按商品 id 走。只有「下单/加购」那几步需要规格 id，
+    #   那里显式写 sku_of(...)，让两种 id 在每一行上都分得清。
     return r["data"]
+
+
+def sku_of(pid):
+    """商品 id → 它的默认 SKU id。
+
+    ★ 本脚本的测试商品都是无规格商品，所以各自只有一条默认 SKU。
+    """
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
 
 
 def create_address(token, receiver):
@@ -331,10 +352,10 @@ def items_of(order_no):
     return [int(r[0]) for r in rows]
 
 
-def buy_now(token, pid, qty, addr, tag):
+def buy_now(token, sku_id, qty, addr, tag):
     """下一个待付款的订单，返回 (orderNo, [orderItemId, ...])。"""
     st, r = call("POST", "/shop/orders/buy-now", {
-        "productId": pid, "quantity": qty,
+        "skuId": sku_id, "quantity": qty,
         "addressId": addr, "idempotencyKey": key_for(tag),
     }, token=token)
     if r.get("code") != 200:
@@ -343,15 +364,15 @@ def buy_now(token, pid, qty, addr, tag):
     return no, items_of(no)
 
 
-def cart_order(token, pids, addr, tag):
+def cart_order(token, sku_ids, addr, tag):
     """走购物车结算下一个订单（可以有多个明细）。"""
-    for pid in pids:
+    for sku in sku_ids:
         st, r = call("POST", "/shop/cart/items",
-                     {"productId": pid, "quantity": 1}, token=token)
+                     {"skuId": sku, "quantity": 1}, token=token)
         if r.get("code") != 200:
             raise SystemExit(f"加购失败：HTTP {st} / {r}")
     st, r = call("POST", "/shop/orders", {
-        "productIds": pids, "addressId": addr, "idempotencyKey": key_for(tag),
+        "skuIds": sku_ids, "addressId": addr, "idempotencyKey": key_for(tag),
     }, token=token)
     if r.get("code") != 200:
         raise SystemExit(f"购物车结算失败：HTTP {st} / {r}")
@@ -387,7 +408,7 @@ def order_at(pid, status, tag, token=None, addr=None):
     """造一条停在指定状态的订单，返回 (orderNo, orderItemId)。"""
     token = TOKEN_A if token is None else token
     addr = ADDR_A if addr is None else addr
-    no, ids = buy_now(token, pid, 1, addr, tag)
+    no, ids = buy_now(token, sku_of(pid), 1, addr, tag)
     advance(no, status, token=token)
     return no, ids[0]
 
@@ -446,6 +467,9 @@ def cleanup():
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE a FROM member_address a "
             f"JOIN member m ON m.id = a.member_id WHERE m.username LIKE '{PREFIX}%'")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
 
@@ -677,7 +701,7 @@ def main():
     #    这一条证明 uk_order_item 卡的是【明细】而不是【订单】——
     #    如果实现时把唯一索引建在 order_id 上（很自然的一种误写），
     #    这一节会立刻红。
-    no_m, items_m = cart_order(TOKEN_A, p_batch, ADDR_A, "multi")
+    no_m, items_m = cart_order(TOKEN_A, [sku_of(x) for x in p_batch], ADDR_A, "multi")
     check("（准备）一张订单里 10 条明细", len(items_m) == 10, f"实际 {items_m}")
     advance(no_m, COMPLETED)
 

@@ -5,9 +5,14 @@
 <h3>★ 这个脚本是干什么的？</h3>
 
 <p>它不是测试 —— 测试在 {@code sql/} 下。它是一台<b>造数据的机器</b>：
-用真实的 HTTP 接口建好一个会员、一件商品、一笔待付款订单、一笔已付款订单、
-一笔已取消订单，以及一笔<b>属于别人的</b>订单，
+用真实的 HTTP 接口建好两个会员、两件商品（其中一件有<b>两个规格、价格不同</b>）、
+一笔待付款订单、一笔已付款订单、一笔已取消订单，以及一笔<b>属于别人的</b>订单，
 然后把「token 和订单号」打印成可以直接粘进 {@code tools/shot.py} 的用法。
+
+<p>★ 里程碑 15 阶段 5：小商品那两个规格不是装饰。待付款那一单是
+<b>整轮 SKU 改造唯一能一眼看出来的证据</b> —— 明细里同一件商品占两行，
+规格和单价都不同。如果两件商品都只有默认 SKU，截出来的收银台
+和改造之前一模一样：页面是绿的，但什么也没验证到。
 
 <p>为什么需要它？因为 {@code /pay/:orderNo} 这个页面<b>没法凭空打开</b>：
 <ul>
@@ -123,6 +128,18 @@ def run_sql(sql):
     return [line.split("\t") for line in result.stdout.splitlines() if line]
 
 
+def scalar(sql):
+    """取一个格子的值，查不到返回 None。
+
+    <p>单独封一层不是为了少打字，是因为 {@code run_sql(...)[0][0]}
+    在<b>一行都没查到</b>时抛的是 {@code IndexError: list index out of range}——
+    它把「这行不存在」报成了「我下标取错了」，方向完全反了。
+    （同一类错这个文件里已经栽过一次，见 {@code new_address} 上面那段。）
+    """
+    rows = run_sql(sql)
+    return rows[0][0] if rows else None
+
+
 # ----------------------------------------------------------------------
 def build():
     if os.path.exists(STATE_FILE):
@@ -164,16 +181,80 @@ def build():
         save()
         return d["token"], d["id"]
 
-    def new_product(name, price, stock):
+    def post_product(name, spec_schema, skus):
+        """建一件商品，返回【商品 id】。
+
+        <p>★ 这里返回的是商品 id，而下面两个建商品的函数返回的是 <b>SKU id</b> ——
+        形状不一致<b>是刻意的</b>，因为「这件商品」和「这个规格」在这份夹具里
+        是两个不同用途的东西：商品 id 只用来记录和清理，SKU id 只用来下单加购。
+        <b>两个 id 都是自增数字，传错一个不会 404，会静默地操作另一行</b>，
+        所以每个返回值叫什么名字必须名副其实。
+        """
         st, r = call("POST", "/admin/products", {
-            "categoryId": category_id, "name": name, "price": price,
-            "stock": stock, "status": 1,
+            "categoryId": category_id, "name": name, "status": 1,
+            "specSchema": spec_schema, "skus": skus,
         }, token=admin)
-        # ⚠️ 建商品也返回【裸 id】，不是对象
+        # ⚠️ 建商品返回【裸 id】，不是对象
         pid = must(st, r, f"建商品 {name}")
         state["products"].append(pid)
         save()
         return pid
+
+    def default_sku_of(pid):
+        """查一件无规格商品的默认 SKU（{@code spec_json = '[]'} 的那一条）。"""
+        return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid} "
+                          f"AND spec_json = '[]'"))
+
+    def new_product(name, price, stock):
+        """建一件【没有规格】的商品，返回它的【默认 SKU id】。
+
+        <p>★ 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品
+        也要显式给一条「默认 SKU」（specs 为空数组），后端拿它的
+        price/stock 当作这件商品的价格和库存。
+
+        <p>⚠️ 返回值是 SKU id，不是商品 id。因为它只会被填进
+        「加购 / 下单」的请求体，而那两个接口现在收的是 skuId。
+        """
+        pid = post_product(name, [],
+                           [{"specs": [], "price": price, "stock": stock}])
+        return default_sku_of(pid)
+
+    def new_spec_product(name, dim, variants):
+        """建一件【单维规格】的商品，返回 {@code {规格值: SKU id}}。
+
+        <p>{@code variants} 是 {@code [(规格值, 价格, 库存)]}。
+        单维就够用了 —— 夹具要的是「同一件商品占两行」，不是把
+        3×3 的矩阵也搬过来（那种组合的验证在 {@code sql/test-sku.py} 里）。
+        """
+        pid = post_product(
+            name,
+            [{"name": dim, "values": [v for v, _, _ in variants]}],
+            [{"specs": [{"name": dim, "value": v}], "price": p, "stock": s}
+             for v, p, s in variants])
+
+        # 按规格值回查 id：不能靠「插入顺序」猜，更不能靠 pid + 1、pid + 2 推 ——
+        # SKU 的 id 是全表共用一个 AUTO_INCREMENT，跟商品 id 没有任何关系。
+        #
+        # ★ 这里把整件商品的 SKU 行<b>拉回来在 Python 里比</b>，而不是
+        #   下一条 `spec_json LIKE '%"黑色"'`。为什么？
+        #
+        #   我第一版就是那样写的，它<b>恒不匹配</b>：mysql 客户端在 Windows 上
+        #   自己解析命令行，参数里带 `"` 的那个 LIKE 模式传到服务端时已经不是
+        #   原来那串字符了 —— 查询合法、返回 0 行、不报任何错。
+        #   而 `LIKE '%黑色%'`（不带引号）是能匹配的，所以这个坑只在
+        #   "我想精确匹配 `"值"` 这个形状"时才踩得到，更难联想到编码。
+        #
+        #   教训不是"记住这个怪癖"，而是：**能不在 SQL 里拼字符串就别拼。**
+        #   拉回来比一次，既躲开了引号/编码，也比子串匹配更严格 ——
+        #   `%黑色%` 会连"规格名叫 黑色系"的行一起匹配上，逐项比较不会。
+        rows = run_sql(f"SELECT id, spec_json FROM product_sku "
+                       f"WHERE product_id = {pid}")
+        found = {}
+        for sku_id, spec_json in rows:
+            for item in json.loads(spec_json):
+                if item["name"] == dim:
+                    found[item["value"]] = int(sku_id)
+        return found
 
     def new_address(token, who):
         st, r = call("POST", "/shop/addresses", {
@@ -200,9 +281,12 @@ def build():
         save()
         return aid
 
-    def new_order(token, pid, qty, address_id, tag):
+    def new_order(token, sku, qty, address_id, tag):
+        # ★ 里程碑 15 阶段 4：立即购买的请求体从 productId 换成 skuId。
+        #   参数名一并跟着改 —— 留一个叫 pid 的形参收 skuId，
+        #   下一个读这段代码的人一定会把它当商品 id 用。
         st, r = call("POST", "/shop/orders/buy-now", {
-            "productId": pid, "quantity": qty, "addressId": address_id,
+            "skuId": sku, "quantity": qty, "addressId": address_id,
             "idempotencyKey": f"fx{RUN}{tag}",
         }, token=token)
         d = must(st, r, f"建订单 {tag}")
@@ -217,17 +301,23 @@ def build():
 
     # ★ 商品给足库存：这一轮只会扣掉几件，但万一你连着截几次图，
     #   库存不够会让建单失败，报错还不好懂（"库存不足"而不是"你没清上一次"）
-    pid_main = new_product(f"{PREFIX}收银台主商品{RUN}", "199.00", 500)
-    pid_small = new_product(f"{PREFIX}收银台小商品{RUN}", "9.90", 500)
+    sku_main = new_product(f"{PREFIX}收银台主商品{RUN}", "199.00", 500)
 
-    # ---- 1. 待付款：收银台的主场景（也要有明细可看，所以买了 2 件不同的商品）
-    #     —— 用购物车结算才能一单多件，正好让明细列表不是只有一行
-    for p, q in ((pid_main, 1), (pid_small, 3)):
-        st, r = call("POST", "/shop/cart/items", {"productId": p, "quantity": q},
+    # ★ 小商品做成【两个规格、价格不同】，这一单才是这一轮的证据。
+    #   单价刻意差得远（9.90 / 19.90）：金额算错时不会「碰巧相等」。
+    small = new_spec_product(f"{PREFIX}收银台小商品{RUN}", "颜色",
+                             [("黑色", "9.90", 500), ("白色", "19.90", 500)])
+
+    # ---- 1. 待付款：收银台的主场景（也要有明细可看，所以买了 3 行，
+    #     其中 2 行是同一件商品的两个规格）
+    #     —— 用购物车结算才能一单多行，正好让明细列表不是只有一行
+    cart_lines = [(sku_main, 1), (small["黑色"], 1), (small["白色"], 2)]
+    for sku, q in cart_lines:
+        st, r = call("POST", "/shop/cart/items", {"skuId": sku, "quantity": q},
                      token=token_a)
         ok(st, r, "加购物车")
     st, r = call("POST", "/shop/orders", {
-        "productIds": [pid_main, pid_small], "addressId": addr_a,
+        "skuIds": [sku for sku, _ in cart_lines], "addressId": addr_a,
         "idempotencyKey": f"fx{RUN}cart", "remark": "",
     }, token=token_a)
     d = must(st, r, "购物车结算")
@@ -236,17 +326,19 @@ def build():
     order_pending = d["orderNo"]
 
     # ---- 2. 已付款
-    order_paid = new_order(token_a, pid_main, 1, addr_a, "paid")
+    order_paid = new_order(token_a, sku_main, 1, addr_a, "paid")
     must(*call("POST", f"/shop/orders/{order_paid}/pay", {"payMethod": "WECHAT"},
                token=token_a), "支付")
 
-    # ---- 3. 已取消
-    order_cancelled = new_order(token_a, pid_small, 2, addr_a, "cancel")
+    # ---- 3. 已取消（买的是【白色】这一档）
+    #     取消时库存要还到「白色」自己那一行，不是这件商品的第一条 SKU ——
+    #     这是阶段 4 里最容易改错、错了也最看不出来的地方（接口 200，订单状态也对）。
+    order_cancelled = new_order(token_a, small["白色"], 2, addr_a, "cancel")
     must(*call("POST", f"/shop/orders/{order_cancelled}/cancel", None,
                token=token_a), "取消")
 
     # ---- 4. 别人的订单（用 B 的 token 打开 A 的订单号，应该看到空状态）
-    order_other = new_order(token_b, pid_main, 1, addr_b, "other")
+    order_other = new_order(token_b, sku_main, 1, addr_b, "other")
 
     state["token_a"] = token_a
     state["token_b"] = token_b
@@ -272,6 +364,12 @@ def build():
     print()
     print(f"  ① 待付款（收银台主场景：倒计时 + 选支付方式 + 两个按钮）")
     print(f"       {order_pending}")
+    print(f"       ↑ 明细应该【三行】，其中两行是同一件「小商品」的「黑色」和「白色」，")
+    print(f"         规格分别写着 颜色:黑色 / 颜色:白色，小计 9.90 和 39.80，")
+    print(f"         合计 248.70（= 199.00 + 9.90 + 19.90×2）。")
+    print(f"         ★ 这两行是整轮 SKU 改造唯一能一眼看出来的证据 ——")
+    print(f"           改造前它做不出来，改造后如果幂等键或购物车 field 改错了，")
+    print(f"           这里会先露馅。")
     print(f"  ② 已付款（应该【没有】取消按钮）")
     print(f"       {order_paid}")
     print(f"  ③ 已取消（显示取消时间）")
@@ -286,7 +384,7 @@ def build():
     print(f"        --setup \"localStorage.setItem('mall_member_token', '{token_a}')\" \\")
     print(f"        --wait 3")
     print()
-    print("  ⚠️ 验完记得清掉（这次建了 2 个会员 / 2 件商品 / 3 个地址 / 4 笔订单）：")
+    print("  ⚠️ 验完记得清掉（这次建了 2 个会员 / 2 件商品 / 3 个规格 / 2 个地址 / 4 笔订单）：")
     print()
     print(f"    /d/python/python.exe tools/fixture-pay.py --cleanup")
     print()
@@ -327,6 +425,8 @@ def cleanup():
     run_sql(f"DELETE FROM orders WHERE id IN ({ids('orders')}) "
             f"OR member_id IN ({member_ids})")
     run_sql(f"DELETE FROM member_address WHERE id IN ({ids('addresses')})")
+    # ★ 里程碑 15：product_sku 也没有外键，所以它同样要排在自己的父表之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN ({ids('products')})")
     # 商品即便还有订单明细指着它也无所谓 —— order_item 故意没有外键
     run_sql(f"DELETE FROM product WHERE id IN ({ids('products')})")
     run_sql(f"DELETE FROM member WHERE id IN ({ids('members')})")

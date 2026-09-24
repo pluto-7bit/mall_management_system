@@ -164,7 +164,7 @@ public interface OrderAdminMapper {
      * <h4>3. 不碰库存 —— 和 {@code markCompleted} 一样</h4>
      *
      * <p>发货只是「东西出库了」的状态变更，扣库存发生在下单那一刻
-     * （{@code decreaseStock}）。这里再去动库存就是重复扣减。
+     * （{@code decreaseSkuStock}）。这里再去动库存就是重复扣减。
      *
      * @return 影响行数。<b>1 = 发货成功；0 = 订单不存在 / 状态不是已付款</b> ——
      *         返回 0 时调用方要用 {@link #selectAdminByOrderNo} 重查一次，

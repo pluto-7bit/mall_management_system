@@ -36,6 +36,69 @@
       用 <sql> + <include> 抽出来，是因为列表查询和总数查询的 WHERE 条件
       必须完全一致（否则分页会错乱），抽成一份能保证它们不会写岔。
     -->
+    <!--
+      ==========================================================================
+       ★ 里程碑 15：把 SKU 的聚合下推到一个【派生表】
+      ==========================================================================
+
+      价格和库存的唯一真源是 product_sku，「起售价 / 总库存 / 几个规格」
+      都要从它身上算出来。写成下面这样一张派生表，而不是直接
+      LEFT JOIN + GROUP BY，理由是：
+
+        ★ 外层 SELECT / WHERE / ORDER BY 的形状一个字都不用动。
+          queryCondition、shopOrderBy 这些共用片段原样保留 ——
+          如果写成 JOIN + GROUP BY，ONLY_FULL_GROUP_BY（MySQL 8 的
+          服务端默认值，本项目没有任何地方关掉它）会逼着每一个共用片段
+          里的列都进 GROUP BY 或者套聚合函数，一处漏改就是启动后第一条
+          查询就 500。派生表把这件事关在下面这六行里。
+
+      ⚠️ 性能：这是「每查一次商品列表就把 product_sku 全表分组一遍」。
+        100 件商品、每件几条 SKU 的规模下是一次可以忽略的全表扫。
+        什么时候该翻案，见 migration-13b 脚本里的注释。
+
+      ⚠️ COALESCE：一件商品如果【一条 SKU 都没有】，LEFT JOIN 会让
+        min_price / total_stock / sku_count 全变成 NULL。
+        这里只给后两个兜 0，因为「0 个规格」「总库存 0」是【真答案】。
+        min_price 保持 NULL —— 空集合上的最小值没有答案，
+        一个回答不了的问题不该有一个假答案（前端会显示成「—」）。
+
+      ★★ 里程碑 15 阶段 3 补了 only_sku_id：单规格商品的「那唯一一个 SKU」。
+        用户端首页的卡片靠它直接加购 —— 只有一件商品恰好一个规格时，
+        「买这个商品」才等于「买这个 SKU」。
+        ⚠️ 用它的时候【必须】同时判 sku_count = 1：
+          MIN(id) 在多规格商品上会「随便挑一个」，而那不是答案。
+          给不出答案的问题就该留空（所以外面套 CASE WHEN 而不是直接给）。
+
+      ★★ 这个 join 是【有代价】的，加它之前先问一句「这条 SQL 还有谁在用」：
+        MySQL 8.0.22 起有 derived condition pushdown，但它
+        【只对不带聚合的派生表生效】—— 这里带 GROUP BY，
+        所以 WHERE p.id = ? 这种条件【不会】被推进去，
+        每次查询都要把整个 product_sku 分组一遍。
+
+        这就是为什么 selectShopById（被「加入购物车」复用）【没有】加它：
+        给那条 SQL 加等于让每次加购都多扫一遍 product_sku。
+        它的 SKU 相关字段由 Service 事后单独查、在 Java 里算出来 ——
+        做法和里程碑 11 的 images、里程碑 12 的 reviewSummary 一字不差。
+        ★ 给一个查询加 join 的代价，不取决于这个 join 本身，
+          而取决于【读它的那条 SQL 还有谁在用】。
+    -->
+    <sql id="skuAggregate">
+        LEFT JOIN (
+            SELECT product_id,
+                   MIN(price) AS min_price,
+                   SUM(stock) AS total_stock,
+                   COUNT(*)   AS sku_count,
+                   MIN(id)    AS only_sku_id
+            FROM product_sku
+            GROUP BY product_id
+        ) a ON a.product_id = p.id
+    </sql>
+
+    <!--
+      通用查询条件片段。
+      用 <sql> + <include> 抽出来，是因为列表查询和总数查询的 WHERE 条件
+      必须完全一致（否则分页会错乱），抽成一份能保证它们不会写岔。
+    -->
     <sql id="queryCondition">
         <where>
             <!--
@@ -73,16 +136,18 @@
             p.id,
             p.category_id,
             p.name,
-            p.price,
-            p.stock,
             p.cover,
             p.description,
             p.status,
             p.create_time,
             p.update_time,
-            c.name AS category_name
+            c.name AS category_name,
+            a.min_price                    AS min_price,
+            COALESCE(a.total_stock, 0)     AS total_stock,
+            COALESCE(a.sku_count, 0)       AS sku_count
         FROM product p
                  LEFT JOIN category c ON c.id = p.category_id
+                 <include refid="skuAggregate"/>
         <include refid="queryCondition"/>
         ORDER BY p.id DESC
         LIMIT #{offset}, #{pageSize}
@@ -141,17 +206,77 @@
             p.id,
             p.category_id,
             p.name,
-            p.price,
-            p.stock,
             p.cover,
             p.description,
             p.status,
             p.create_time,
             p.update_time,
-            c.name AS category_name
+            c.name AS category_name,
+            a.min_price                    AS min_price,
+            COALESCE(a.total_stock, 0)     AS total_stock,
+            COALESCE(a.sku_count, 0)       AS sku_count
         FROM product p
                  LEFT JOIN category c ON c.id = p.category_id
+                 <include refid="skuAggregate"/>
         WHERE p.id = #{id}
+    </select>
+
+    <!--
+      只查「规格定义」那一列。
+
+      ★ 里程碑 15 为什么要单独一条 SQL，而不是把它并进 selectById？
+
+        因为 selectById 的 resultType 是 AdminProductDetailVO，
+        而那个类上的 specSchema 字段是 List<SpecGroup>（已经解析好的数组），
+        不是 String。数据库里存的却是一段 VARCHAR 文本。
+        MyBatis 按【字段类型】挑 TypeHandler，List 找不到对应的处理器，
+        于是会退化成 rs.getObject() 再强转 —— 一个运行时的 ClassCastException。
+
+        要绕过去只有两条路：给这一列写一个 resultMap + 自定义 TypeHandler
+        （本项目【一个 resultMap 都没用过】，为了一个字段引入这套东西不划算），
+        或者让 Service 把「解析」这一步显式做掉。这里选后者。
+
+      ⚠️ 代价是管理端详情多一次只有一列的往返。这和图集的取舍是同一条：
+        详情页本来就不频繁，多一次往返换「解析这件事看得见」是划算的
+        （论证见 ProductServiceImpl.getById 的 javadoc）。
+
+      ⚠️ 它留在 ProductMapper 而不是 ProductSkuMapper：规则是「谁的表谁负责查」，
+        查的是 product 表。返回 null 表示这个 id 不存在 ——
+        但调用方（getById）在这之前已经用 selectById 确认过存在了。
+    -->
+    <select id="selectSpecSchema" resultType="string">
+        SELECT spec_schema
+        FROM product
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      ★ 里程碑 15 阶段 3：批量版，存在的唯一理由是【别写成 N+1】。
+
+      用户端要渲染一批 SKU 的 specText，而那句话里维度的显示顺序
+      来自各自商品的 spec_schema。逐个商品调上面那条就是
+      「购物车里 10 件商品发 10 条 SQL」—— 和 selectShopByIds 的
+      注释里写的是同一个道理：能一条 SQL 查完的绝不循环查。
+
+      ⚠️ 只 SELECT 两列：id 和 spec_schema。
+        它返回的 Product 是当【载体】用的，不是一个完整的实体 ——
+        其余字段全是 null。这一点在 ProductMapper.selectSpecSchemasByProductIds
+        的 javadoc 里也写了一遍，因为将来有人看到这个方法
+        很可能会想「顺手把 name 也查出来吧」，然后它就不再是一个
+        只有两列的窄查询了。
+
+      ★ 注意这里【不带 status 条件】：
+        调用方是「已经拿到了一批可买的 SKU，现在要渲染它们」，
+        过滤在那一步已经做完了。在这里再过一遍 status
+        只会让「商品刚下架」和「商品不存在」变成两种需要分别处理的缺失。
+    -->
+    <select id="selectSpecSchemasByProductIds" resultType="Product">
+        SELECT id, spec_schema
+        FROM product
+        WHERE id IN
+        <foreach collection="ids" item="pid" open="(" close=")" separator=",">
+            #{pid}
+        </foreach>
     </select>
 
     <!--
@@ -162,7 +287,7 @@
       如果方法有多个参数，就必须用 @Param 指定名字，否则只能用 param1/param2。
     -->
     <select id="selectEntityById" resultType="Product">
-        SELECT id, category_id, name, price, stock, cover, description, status, create_time, update_time
+        SELECT id, category_id, name, cover, description, spec_schema, status, create_time, update_time
         FROM product
         WHERE id = #{id}
     </select>
@@ -174,10 +299,25 @@
       MyBatis 会把数据库生成的自增主键回填到入参对象的 id 字段上。
       所以 Service 里调用完 insert，product.getId() 立刻就有值了，
       不需要再发一条 SELECT 去查。
+
+      ★★ 里程碑 15 阶段 6：price / stock 两列从这里消失了。
+
+      这不是「少写两个字段」，而是这张表的职责变小了：
+      **价格和库存的唯一真源是 product_sku，product 上不再有任何一份副本。**
+      建商品 = 这张表插一行 + product_sku 插 N 行，两件事在同一个事务里
+      （见 ProductServiceImpl.save），任何一半单独存在都是坏数据。
+
+      ⚠️ 反过来说：如果哪天有人想把 price 加回这张表「方便查列表」，
+        那就是**第二个写入者**回来了。库存在事务里被并发扣减
+        （20 线程抢库存的测试就在 test-order.py 里），
+        汇总副本一定漂移，而且漂移了没有任何一层会报错 ——
+        里程碑 15 阶段 5 实测到过一条（商品 683：product.stock=29 /
+        product_sku.stock=30，见 README）。删这一列就是为了让那件事
+        不可能再发生，而不是为了少写两行 SQL。
     -->
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO product (category_id, name, price, stock, cover, description, status)
-        VALUES (#{categoryId}, #{name}, #{price}, #{stock}, #{cover}, #{description}, #{status})
+        INSERT INTO product (category_id, name, cover, description, spec_schema, status)
+        VALUES (#{categoryId}, #{name}, #{cover}, #{description}, #{specSchema}, #{status})
     </insert>
 
     <!--
@@ -198,10 +338,37 @@
         <set>
             <if test="categoryId != null">category_id = #{categoryId},</if>
             <if test="name != null">name = #{name},</if>
-            <if test="price != null">price = #{price},</if>
-            <if test="stock != null">stock = #{stock},</if>
+            <!--
+              ★★ 里程碑 15 阶段 6：price / stock 两个 <if> 从这里删掉了。
+
+              它们原来表达的是「只改价格的时候别碰别的字段」。
+              这个语义现在**整件事搬去了 product_sku** ——
+              改价 = 改 SKU 行的 price，走的是一条完全不同的语句
+              （ProductSkuMapper 里那条窄 UPDATE）。
+
+              ⚠️ 所以「改商品」这个动作现在是【两条路径】：
+                - 改名字/分类/描述 → 这张表
+                - 改价格/库存      → product_sku 表
+              两者由同一次 PUT /admin/products/{id} 驱动、在同一个事务里，
+              但**它们不再是同一个 UPDATE 语句**。
+              加新字段时要想清楚它属于哪一边：属于「商品」的住这里，
+              属于「某个规格」的住 product_sku。
+            -->
             <if test="cover != null">cover = #{cover},</if>
             <if test="description != null">description = #{description},</if>
+            <!--
+              ★ 里程碑 15 加的。注意它和上面那些字段【有一处不同】：
+                description 传 null 表示「不改」，而 spec_schema 传 null
+                表示「这次不碰规格定义」，它【不是】「无规格」。
+
+                「无规格」必须显式传字符串 "[]"（SpecJson.EMPTY）。
+                如果让 null 也表示「无规格」，那么「不改规格定义」
+                和「清空规格定义」就成了同一件事 ——
+                一个只想改价格的 PUT 会顺手把商品的规格抹平。
+                这正是 images 那个字段用 tri-state 表达的同一件事，
+                结论也一致：字段缺席 = 不修改。
+            -->
+            <if test="specSchema != null">spec_schema = #{specSchema},</if>
             <if test="status != null">status = #{status},</if>
         </set>
         WHERE id = #{id}
@@ -285,16 +452,35 @@
     <sql id="shopOrderBy">
         <choose>
             <when test="sort == 'price_asc'">
-                ORDER BY p.price ASC, p.id DESC
+                ORDER BY a.min_price ASC, p.id DESC
             </when>
             <when test="sort == 'price_desc'">
-                ORDER BY p.price DESC, p.id DESC
+                ORDER BY a.min_price DESC, p.id DESC
             </when>
             <otherwise>
                 ORDER BY p.id DESC
             </otherwise>
         </choose>
     </sql>
+
+    <!--
+      ★★ 里程碑 15 阶段 3：这里的 p.price 换成了 a.min_price，两处都换。
+
+      ★ 为什么必须换，而不是「换个表而已」：
+        **排序用的价格必须等于列表上显示的那个价格。**
+        列表上现在显示的是起售价（sku 的 MIN(price)），
+        如果排序还按 product.price 排，用户在「价格从低到高」下会看到
+        [¥100, ¥80, ¥50] 这样一个明显没排序的列表 ——
+        看起来像分页坏了或者排序没生效，而两处都不会报错。
+
+      ⚠️ 两个值在阶段 1~5 期间【恰好相等】（product.price 那时是派生汇总副本），
+        所以这个 bug 在那时看不出来 —— 而这正是最危险的一类地方：
+        **一处写对了一处没写对、但结果碰巧一样**，谁来 review 都看不出问题。
+        ★ 阶段 6 跑完 migration-13b 之后，product.price 这一列已经【不存在】了，
+          于是「改回去」从「静默的错」变成了「当场 Unknown column」——
+          这不是顺带的好处，这是删列这件事值不值得做的主要判据之一。
+          （另一处同样的理由见 test-sku.py A 组那条静态断言。）
+    -->
 
     <!--
       ★ 上面每个分支都带了 "p.id DESC" 作为「第二排序键」，这不是多余的。
@@ -326,12 +512,30 @@
             p.id,
             p.category_id,
             p.name,
-            p.price,
-            p.stock,
             p.cover,
-            c.name AS category_name
+            c.name AS category_name,
+            a.min_price                AS min_price,
+            COALESCE(a.total_stock, 0) AS total_stock,
+            COALESCE(a.sku_count, 0)   AS sku_count,
+            <!--
+              ★ 只在【恰好一个规格】时才给出 skuId，多规格时是 NULL。
+
+              为什么不一并给一个「随便挑的默认规格」？因为那会是一个
+              【看起来像答案的假答案】：用户点「加入购物车」，
+              系统替他选了一个他根本没选的规格（可能是最贵的那档），
+              而页面上没有任何地方说过这件事。
+
+              ★ 一个回答不了的问题不应该有一个假答案 ——
+                前端拿到 null 会老老实实把按钮改成「选规格」跳详情页。
+
+              ⚠️ non_null 让这个 key 在多规格商品上【整个消失】，
+                而不是出现一个 null。前端判断要用 falsy（!p.defaultSkuId），
+                不要用「非要等于 null」。
+            -->
+            CASE WHEN a.sku_count = 1 THEN a.only_sku_id END AS default_sku_id
         FROM product p
                  LEFT JOIN category c ON c.id = p.category_id
+                 <include refid="skuAggregate"/>
         <include refid="shopQueryCondition"/>
         <include refid="shopOrderBy"/>
         LIMIT #{offset}, #{pageSize}
@@ -357,8 +561,6 @@
             p.id,
             p.category_id,
             p.name,
-            p.price,
-            p.stock,
             p.cover,
             p.description,
             c.name AS category_name
@@ -395,8 +597,6 @@
             p.id,
             p.category_id,
             p.name,
-            p.price,
-            p.stock,
             p.cover,
             c.name AS category_name
         FROM product p
@@ -409,67 +609,13 @@
     </select>
 
     <!--
-      ★★ 扣库存：本项目里防超卖的唯一一道真正的防线。
+      ★ 里程碑 15 阶段 4：decreaseStock / increaseStock 两条 <update> 【已删除】，
+        连同上面那两大段注释一起搬去了 ProductSkuMapper.xml。
+        理由见 ProductMapper.java 末尾那段。
 
-      看这条 SQL 的 WHERE 有两个条件，缺一不可：
-
-        id = #{id}            →  扣哪一行
-        stock >= #{quantity}  →  ★ 只在这个条件成立时才扣
-
-      第二个条件是全部关键。InnoDB 执行 UPDATE 时会给这一行加排他锁，
-      「检查 stock >= ?」和「stock = stock - ?」在同一次加锁中完成，
-      中间没有任何缝隙可以让别人插进来。
-
-      所以调用方不需要（也不应该）先 SELECT 一次库存再判断 ——
-      那样反而会引入竞态。**影响行数就是答案**：
-        1 行 = 扣减成功
-        0 行 = 库存不够，什么都没改，调用方抛「库存不足」
-
-      ★ 顺带说一个写法上的细节：stock = stock - #{quantity}
-        不是 stock = #{newStock}。
-        后者要求 Java 先算出"扣完是多少"，那又变成了"先查后改"——
-        查到的旧值和 UPDATE 时的真实值可能已经不一样了。
-        **让数据库基于它当下的值去算，才是安全的**
-        （这也是 SQL 里的 i++ 和 i = i + 1 之争的同一个问题）。
-
-      ⚠️ 这里【没有】status = 1 条件，是刻意的：
-        下架判定放在 Service 里做（下单前会批量查一次上架商品）。
-        如果这里也加上，那么「影响 0 行」就有两种原因
-        （库存不够 / 已下架），调用方无法区分该报哪个错。
-        这类"把判断集中在能给出好错误信息的那一层"是个常见取舍。
+      ⚠️ 注意 selectShopByIds 上面这段注释【原样留着】—— 它讲的是
+        <foreach> 的写法和 status = 1 的归属，和库存没关系。
+        阶段 3 的 ShopSkuServiceImpl 还要靠这条 SQL 判断「这件商品可不可买」。
     -->
-    <update id="decreaseStock">
-        UPDATE product
-        SET stock = stock - #{quantity}
-        WHERE id = #{id}
-          AND stock >= #{quantity}
-    </update>
-
-    <!--
-      归还库存（取消订单 / 订单超时自动取消时用）。
-
-      ★★ 注意这里【故意没有】任何附加条件 —— 不要为了和 decreaseStock
-         对称而加上 `AND status = 1` 或者 `AND stock >= 0` 之类的东西。
-
-         扣减要 AND stock >= #{quantity}，是因为它有一个前置条件要守：
-         「库存够不够」。归还【没有】前置条件：库存是多少都能还，
-         商品已下架也照样要还（东西本来就没发出去，凭什么不还）。
-
-         更要紧的是：归还走的是「订单取消」这条【出错路径】。
-         在出错路径上多加一个判断，就多一种「连取消都取消不掉」的可能 ——
-         订单卡在待付款、库存永远占着、用户还看得见自己的订单。
-         **条件越少，越不容易在异常路径上卡住。**
-
-      同样地，stock = stock + #{quantity} 不是 stock = #{newStock}：
-      让数据库基于它当下的值去算，不要用 Java 里查到的旧值去算。
-
-      ⚠️ 影响 0 行（商品已被硬删，order_item 故意没有外键）不算错误，
-         调用方记一条 warn 就继续，不能因此让取消失败。
-    -->
-    <update id="increaseStock">
-        UPDATE product
-        SET stock = stock + #{quantity}
-        WHERE id = #{id}
-    </update>
 
 </mapper>

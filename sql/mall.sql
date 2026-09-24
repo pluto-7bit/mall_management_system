@@ -11,7 +11,30 @@
 -- ============================================================================
 
 SET NAMES utf8mb4;
-CREATE DATABASE IF NOT EXISTS mall DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+
+-- ⚠️ 这里的 COLLATE 必须是 utf8mb4_0900_ai_ci，不能写成 utf8mb4_general_ci。
+--
+--   ★ 表定义里写的是 `DEFAULT CHARSET = utf8mb4` 而【没有】写 COLLATE，
+--     所以每张表的排序规则继承的是【库】的排序规则 —— 这一行决定了全部 11 张表。
+--
+--   ★ 而线上开发库里的表全都是 utf8mb4_0900_ai_ci。之前这里写的是 general_ci，
+--     于是「全新装库」和「跟着迁移走的库」在排序规则上分叉了。
+--     这不是学究问题，两者的差别是能看见的：
+--       · general_ci 是 **PAD SPACE**，0900_ai_ci 是 **NO PAD** ——
+--         所以 '黑' 和 '黑 ' 在两边【是不是同一个值】都不一样。
+--         这正是 uk_product_spec（product_sku）拦不拦得住重复的前提，
+--         也是 uk_name（category）拦不拦得住的前提。
+--       · 中文按 name 排序的顺序两边也不同。
+--     ★ 这正是本项目一直在防的那类事故：「我本地是好的」。
+--
+--   ⚠️ 对【已经存在】的库，CREATE DATABASE IF NOT EXISTS 是空操作，
+--     不会改任何东西 —— 所以这一行改的只是「新装出来的库」。
+--     已经存在的库要改排序规则得走 ALTER DATABASE / ALTER TABLE，那是另一件事。
+--
+--   ★ 全库排序规则这件事在 category 那一节的注释里也提到过
+--     （「name 的排序规则是 utf8mb4_0900_ai_ci …… 这是 MySQL 8 的默认排序规则」）
+--     —— 之前那句话和这一行是矛盾的，现在对上了。
+CREATE DATABASE IF NOT EXISTS mall DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE mall;
 
 DROP TABLE IF EXISTS product_review_image;
@@ -20,6 +43,7 @@ DROP TABLE IF EXISTS order_item;
 DROP TABLE IF EXISTS product_image;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS member_address;
+DROP TABLE IF EXISTS product_sku;
 DROP TABLE IF EXISTS product;
 DROP TABLE IF EXISTS category;
 DROP TABLE IF EXISTS member;
@@ -27,8 +51,18 @@ DROP TABLE IF EXISTS admin_user;
 
 -- ⚠️ DROP 的顺序是「子表在前、主表在后」
 --    （product_review_image 依赖 product_review，order_item/product_image 依赖 orders/product，
---      product_review 依赖 order_item/product/member）。
+--      product_review 依赖 order_item/product/member，
+--      product_sku 依赖 product）。
 --    加表的时候如果不是追加在末尾，就要想一下这个顺序。
+--
+--    ★ product_sku 排在这里，是为了让「product 的子孙都清干净了，才轮到 product」
+--      这个读法成立。它的位置比上面几张表【深一层】：
+--      order_item / product_image / product_review 挂的是 product.id，
+--      而 product_sku 自己也被 order_item.sku_id 指着。
+--      所以删商品时的级联是五级（晒图 → 评价 → 图集 → **SKU** → 商品），
+--      SKU 必须排在商品前一步 —— 商品一没，这些 SKU 行就再也没人能按 id 找到了。
+--      ⚠️ 但这会留下悬空的 order_item.sku_id（历史订单的快照还在，指的那行没了），
+--         所以 increaseSkuStock 必须容忍「影响 0 行」，见那个方法的 javadoc。
 --
 --    ★ 尤其是 product_image 和 product_review：
 --      product.id 是 AUTO_INCREMENT，而这个脚本是 DROP 重建脚本 ——
@@ -43,7 +77,7 @@ DROP TABLE IF EXISTS admin_user;
 -- ---------------------------------------------------------------------------
 --  全库约定：★ 故意不加任何外键
 -- ---------------------------------------------------------------------------
---  10 张表一个 FOREIGN KEY 都没有，这是刻意的，不是漏了。
+--  11 张表一个 FOREIGN KEY 都没有，这是刻意的，不是漏了。
 --
 --  一句话理由：
 --    **加外键之后，「删主表那一行」会变成一条可能失败的语句，
@@ -63,15 +97,28 @@ DROP TABLE IF EXISTS admin_user;
 --
 --  ⚠️ 顺带说明这里的 order_item / product_image / product_review 为什么是「明细表」：
 --     它们都持有 product_id，但都没有外键 —— 所以【商品可以被硬删除】
---     而明细行留下来。order_item 靠快照（product_name / price）自洽，
---     ProductMapper.increaseStock 在商品已不存在时影响 0 行、记 warn 后继续。
+--     而明细行留下来。order_item 靠快照（product_name / sku_spec / price）自洽，
+--     ProductSkuMapper.increaseSkuStock 在那行 SKU 已不存在时影响 0 行、记 warn 后继续。
 --     product_image / product_review 不能这样：它们没有任何快照，
 --     商品没了它们就只是垃圾行，所以 ProductServiceImpl.delete 必须先把它们删掉。
 --     ★ 而且 product_review 是【两级】的：晒图挂在评价下面，
---       所以删商品是四级（晒图 → 评价 → 图集 → 商品），一层都不能反。
+--       所以删商品是五级（晒图 → 评价 → 图集 → SKU → 商品），一层都不能反。
+--       SKU 是里程碑 13 加进来的一级 —— 它排在图集之后、商品之前：
+--       商品一没，这些 SKU 行就再也没人按 id 找得到了。
+--       ⚠️ 这一级会留下悬空的 order_item.sku_id（历史订单的快照还在），
+--          这正是上面那句「记 warn 后继续」要处理的第二种情形
+--          （第一种是里程碑 8 起就有的「商品被硬删」，注释里记着真的漏过 32 行）。
 --
---  这份说明被 ProductMapper.increaseStock 的 javadoc 引用
+--  这份说明被 ProductSkuMapper.increaseSkuStock 的 javadoc 引用
 --  （「见 mall.sql 里那段说明」）—— 改这里的时候留意那边。
+--
+--  ★ 上面这段描述的是【里程碑 13 全部跑完之后】的形态（migration-13 +
+--     migration-13b 都跑过）。13 和 13b 之间那段中间状态已经过去了 ——
+--     在 13b 之前，product.stock 还在，真正跑的仍是
+--     ProductMapper.increaseStock 那条老路径，而那条路径只在 product 上扣，
+--     于是留下了一条汇总漂移（商品 683，见 product 那一节）。
+--     ⚠️ 读这条注释时留意：它是【当前状态】的描述，不是历史记录；
+--        历史那一段在 sql/migration-13-sku.sql 的开头。
 
 
 -- ---------------------------------------------------------------------------
@@ -120,21 +167,39 @@ CREATE TABLE category (
 -- ---------------------------------------------------------------------------
 -- 3. product  商品表
 --
---    价格用 DECIMAL(10,2) 而不是 FLOAT/DOUBLE：
+--    ★★ 里程碑 13：这张表上【没有价格，也没有库存】。
+--
+--       起因是「一件商品只能有一个价格、一个库存」—— 同一件 T 恤
+--       黑色 M 码 99 元、白色 L 码 109 元，在这个模型里根本无法表达。
+--       migration-13 把价格和库存搬去了 product_sku，
+--       migration-13b 把这张表上留下的那两列删掉了。
+--       **product_sku 是它们的【唯一真源】。**
+--
+--       ⚠️ 一个字段只能有一个定义者：留一份「汇总库存」就立刻产生第二个写入者，
+--          而库存在事务里被并发扣减（sql/test-sku.py 有 20 线程抢库存的用例），
+--          汇总必然漂移。
+--          ★ 这不是推理，是实测过的：阶段 5 跑全量测试时库里真的出现过
+--            商品 683（卫龙辣条）product.stock=29 / product_sku.stock=30，
+--            两个数不同、页面照常显示、接口全部 200。
+--            详见 README 的「汇总库存一定会漂移」那一节。
+--
+--    ⚠️ 所以这里【不要】再给商品加 price / stock 列，也不要加任何
+--       「从 SKU 汇总出来的缓存列」。要展示起售价和总库存，
+--       用查询时聚合（见 ProductMapper.xml 的 skuAggregate）——
+--       聚合是【算出来的】，缓存是【写出来的】，只有后者会漂移。
+--
+--    price 用 DECIMAL(10,2) 而不是 FLOAT/DOUBLE 这条规矩没有变，
+--    它现在管的是 product_sku.price：
 --    浮点数存不下 0.1 这种十进制小数，累加会出误差（0.1+0.2 != 0.3），
 --    钱绝对不能用浮点存，这是硬性规矩。
---
---    stock 扣减靠 "UPDATE ... WHERE stock >= ?" 配合行锁保证不超卖，
---    详见后续下单流程的实现。
 -- ---------------------------------------------------------------------------
 CREATE TABLE product (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
     category_id BIGINT UNSIGNED NOT NULL                COMMENT '所属分类 id',
     name        VARCHAR(100)    NOT NULL                COMMENT '商品名称',
-    price       DECIMAL(10, 2)  NOT NULL                COMMENT '售价（元）',
-    stock       INT             NOT NULL DEFAULT 0      COMMENT '库存数量',
     cover       VARCHAR(255)    DEFAULT NULL            COMMENT '封面图 URL',
     description VARCHAR(500)    DEFAULT NULL            COMMENT '商品描述',
+    spec_schema VARCHAR(500)    DEFAULT NULL            COMMENT '规格定义 JSON，形如 [{"name":"颜色","values":["黑","白"]}]，值的顺序就是前端展示顺序；[] = 无规格（该商品只有一条默认 SKU）',
     status      TINYINT         NOT NULL DEFAULT 1      COMMENT '状态：1=上架 0=下架',
     create_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     update_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -142,7 +207,7 @@ CREATE TABLE product (
     KEY idx_category_id (category_id),
     KEY idx_name (name),
     KEY idx_status (status)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '商品表';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '商品表（价格与库存【不】在这张表上，唯一真源是 product_sku）';
 
 
 -- ---------------------------------------------------------------------------
@@ -297,12 +362,55 @@ CREATE TABLE orders (
 --    —— 这在真实业务里是重大事故。
 --
 --    subtotal 同理，存下来避免每次重算，也避免精度问题。
+--
+--    ★ 里程碑 13 的 SKU 化：四列排成【引用 / 快照】两组 ——
+--      引用：product_id、sku_id     （指向哪件商品、哪个规格）
+--      快照：product_name、sku_spec （当时它叫什么、当时什么规格）
+--      一眼能看出哪个会过期、哪个永远不变。
+--      ⚠️ 列序要和 migration-13-sku.sql 的 ALTER 结果完全一致，
+--         不一致就是两份 schema 悄悄分叉。
+--
+--    ★ 为什么多了 sku_spec 这个文本快照，而不是只存 sku_id 去 join product_sku？
+--      和 product_name / price 是同一条理由：**订单是快照，不是视图。**
+--      SKU 行会被改价、会被删掉、商品会被改规格，而三个月后用户打开
+--      「我的订单」，必须看到【他当时买的那件东西】，不是「现在那个 sku_id
+--      恰好指向的东西」—— 后者可能已经不存在了。
+--
+--    ★ sku_id 为什么可空（而 sku_spec 不可空）：判据是【这一行刚插入时有值吗】。
+--      新订单一定有 sku_id；但里程碑 13 之前下的历史订单没有，
+--      而且这个项目里真实存在「商品被硬删、明细成了孤儿」的行
+--      （见上面「故意不加任何外键」那段）。给它们硬填一个值就是造假。
+--      NULL 是诚实的，而且它已经有代码路径：increaseSkuStock 影响 0 行 → 记 warn 后继续。
+--      sku_spec 不可空，而且【没有默认值】。
+--      历史行里那些空串确实是它们的真值（那时还没有规格这回事），
+--      数据保持原样；但**将来的 INSERT 必须显式给出这个值**。
+--
+--      ★ 这里有一段值得留档的过程。里程碑 13 当时【刻意留着】 DEFAULT ''：
+--        那一刻 OrderItemMapper 的插入语句里还没有这一列，
+--        一个 NOT NULL 且无默认值的列被漏掉，MySQL 严格模式会报
+--          ERROR 1364: Field 'sku_spec' doesn't have a default value
+--        也就是【每一次下单都 500】。这是实测出来的，测试跑出来过。
+--        而去掉默认值要等 Java 侧每一条写 order_item 的路径都填了它，
+--        所以那一步被拆去了 migration-13b。
+--
+--      ★ 为什么值得拆成两步、值得为它单独写一段注释？
+--        因为这两步的**方向相同、时机相反**：
+--          留着默认值 → 忘了赋值的路径静默写空串 → 订单页显示
+--                        「这个商品没规格」，没有任何一层报错；
+--          去掉默认值 → 那种路径当场报 SQL 错。
+--        「加列不影响任何现有代码，收紧约束【必然】影响」——
+--        把这两件事混在一步里，就是上面那个 500 的来源。
+--
+--      ⚠️ 这份 mall.sql 和迁移链必须永远一致：mall.sql 里改这一列时，
+--         去看一眼 migration-13b 里那条 MODIFY COLUMN 写了什么。
 -- ---------------------------------------------------------------------------
 CREATE TABLE order_item (
     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
     order_id     BIGINT UNSIGNED NOT NULL                COMMENT '所属订单 id',
     product_id   BIGINT UNSIGNED NOT NULL                COMMENT '商品 id',
+    sku_id       BIGINT UNSIGNED DEFAULT NULL            COMMENT 'SKU id（取消订单时按它归还库存）。NULL = 里程碑 13 之前下的单，或商品已被硬删、查不到当时指向哪个 SKU',
     product_name VARCHAR(100)    NOT NULL                COMMENT '商品名称（下单时快照）',
+    sku_spec     VARCHAR(255)    NOT NULL                COMMENT '规格文本快照，形如「颜色:黑 / 内存:128G」；空串 = 无规格（默认 SKU）',
     price        DECIMAL(10, 2)  NOT NULL                COMMENT '单价（下单时快照）',
     quantity     INT             NOT NULL                COMMENT '购买数量',
     subtotal     DECIMAL(10, 2)  NOT NULL                COMMENT '小计 = price * quantity',
@@ -436,11 +544,15 @@ CREATE TABLE product_review (
 --      评价是用户产生的，全新装出来的库一条评价都不该有
 --      （和 product_image「图集只能由上传产生」是同一条理由）。
 --
---      顺带绕开一个陷阱：sync-mall-seed.py 的自检里数「product 的 INSERT」
---      用的是【子串匹配】，而这两张表的名字都以 product 开头 ——
---      它们一旦有了插入语句，就会触发「product 的 INSERT 不止一处」
+--      顺带绕开一个陷阱：sync-mall-seed.py 的自检里数「商品表的插入语句」
+--      用的是【子串匹配】，而以 product 开头的表有五张 ——
+--      它们一旦有了插入语句，就会撞上它，报出「product 的 INSERT 不止一处」
 --      这个和真实原因毫无关系的提示。不写种子数据，这个坑就根本不存在。
 --      （⚠️ 和上面第 8 节末尾同一个警告：写注释时也不能把那串字符原样写出来。）
+--
+--      ★ 里程碑 13 之后这个坑【换了形态】，见下面 product_sku 那段：
+--        product_sku 必须有种子数据（100 条默认 SKU），
+--        所以改用「把匹配串收窄」来绕，而不是「不写种子数据」。
 -- ---------------------------------------------------------------------------
 CREATE TABLE product_review_image (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
@@ -450,6 +562,69 @@ CREATE TABLE product_review_image (
     PRIMARY KEY (id),
     KEY idx_review_id (review_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '评价晒图';
+
+
+-- ---------------------------------------------------------------------------
+-- 11. product_sku  商品 SKU 表（里程碑 13）
+--
+--    ★★ 这张表是【价格与库存的唯一真源】。product 上那两列是一段过渡，
+--       migration-13b 之后就没有了。
+--
+--    ★ 为什么必需：到里程碑 12 为止「一件商品」= 一行 product，
+--      价格和库存直接挂在那行上 —— 这意味着【一件商品只能有一个价格、
+--      一个库存】。同一件 T 恤黑色 M 码 99 元、白色 L 码 109 元，
+--      这件事在这个模型里根本无法表达。
+--
+--    ★ “每一件商品都至少有一条 SKU”，这是本轮的铁律。
+--      没有规格的商品（比如卫龙辣条）也有一条 —— spec_json 是 '[]'，
+--      也就是一条【默认 SKU】。**代码里只有一条路径**，
+--      不需要在每个 service 里判断「这件商品有没有规格」。
+--
+--    ★★★ uk_product_spec 是这张表存在的理由，不是附带的优化。
+--      「同一件商品不能有两个一模一样的规格组合」这件事
+--      **只有数据库能真的保证** —— Service 里那句「先查有没有重复」挡不住并发：
+--      两个请求可以【同时】查到「没有重复」，然后两个都往下走。
+--      这和 uk_order_item（里程碑 12）、uk_member_idempotency（里程碑 8）
+--      是同一个手法：**把「不可能发生」交给数据库。**
+--
+--      ⚠️ 但这个索引能不能拦住，完全取决于【写入端拼出来的字符串是否一致】：
+--        - utf8mb4_0900_ai_ci 是 **NO PAD** 的：'黑' 和 '黑 ' 是两个不同的字符串。
+--        - 维度顺序不同也是两个不同的字符串：
+--          [颜色:黑, 内存:128G] ≠ [内存:128G, 颜色:黑]
+--        所以「规范化」（维度按定义顺序排、去掉首尾空白）不是锦上添花，
+--        它是这个唯一索引【唯一的前提】。规范化由 java 侧的 SpecJson 一个类负责。
+--
+--    ★ 为什么 spec_json 是 NOT NULL，而且「无规格」必须是恰好 '[]'：
+--      MySQL 的唯一索引【把多个 NULL 当成互不相等】—— 允许 NULL 就等于
+--      允许同一件商品插出两条「默认 SKU」，而后果是静默的：
+--      起售价会取到更低的那条，前端规格选择器永远匹配不上。'' 也不行，
+--      那是「有人忘了赋值」的形态，和「这件商品真的没有规格」是两件事。
+--
+--    ★ 为什么 idx_product_id 不单独建：uk_product_spec 的最左前缀就是 product_id，
+--      再建一个只会增加写入代价。按主键查/改走的是 PRIMARY KEY。
+--
+--    ★ spec_json 长度：VARCHAR(500) 在 utf8mb4 下最多 2000 字节（+2 字节长度前缀），
+--      而 InnoDB 的索引键前缀上限是 3072 字节（本库行格式 Dynamic），建得起来。
+--      不写 TEXT —— TEXT 上建唯一索引必须指定前缀长度，而前缀索引只能保证
+--      「前 N 个字符不重复」，正是这个索引最不该有的性质。
+--
+--    ⚠️ 这个文件里【任何一行注释】都不能把「商品表插入语句 + 左括号」
+--      那串字符原样写出来：sync-mall-seed.py 的自检数的就是它，
+--      而下面种子区里 product_sku 的插入语句也算一处「以 product 开头」的
+--      插入语句 —— 那个自检的匹配串已经因此收窄成带左括号的形式。
+--      所以这里只能这么绕着说，见 sync-mall-seed.py 里那段注释。
+-- ---------------------------------------------------------------------------
+CREATE TABLE product_sku (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    product_id  BIGINT UNSIGNED NOT NULL                COMMENT '所属商品 id',
+    spec_json   VARCHAR(500)    NOT NULL                COMMENT '规格组合 JSON，形如 [{"name":"颜色","value":"黑"},{"name":"内存","value":"128G"}]，按规格定义顺序排列、无多余空白（规范化由 SpecJson 保证，因为 uk_product_spec 靠它才拦得住重复）；无规格的商品只有一条 spec_json = [] 的默认 SKU',
+    price       DECIMAL(10, 2)  NOT NULL                COMMENT '售价（元）—— 价格与库存的唯一真源',
+    stock       INT             NOT NULL DEFAULT 0      COMMENT '库存数量',
+    create_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    update_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_product_spec (product_id, spec_json)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '商品 SKU 表（价格与库存的唯一真源）';
 
 
 -- ============================================================================
@@ -473,49 +648,210 @@ INSERT INTO category (name, sort, status) VALUES
 
 -- 商品
 -- ⚠️ '优衣库轻型羽绒服' 的库存是故意写成 0 的（不是线上值 2）：这是全新装库时用来手动验「已售罄」的夹具。见 MALL_SEED_STOCK_OVERRIDE。
-INSERT INTO product (category_id, name, price, stock, cover, description, status) VALUES
-  ((SELECT id FROM category WHERE name = '手机数码'), '小米 15 Pro 手机', 4999.00, 100, '/images/phone-03.svg', '6.73 英寸 2K 全等深微曲屏，龙晶玻璃 2.0\n徕卡光学镜头，支持可变光圈与长焦微距\n第三代骁龙 8 平台，5400mAh 电池\n90W 有线 + 50W 无线快充', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), 'iPad Air 11 英寸', 4799.00, 50, '/images/tablet-02.svg', '11 英寸 Liquid 视网膜屏，P3 广色域\nM 系列芯片，剪辑和多任务都从容\n支持 Apple Pencil 与妙控键盘\n横向前置摄像头，视频通话更自然', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '联想 ThinkPad X1 Carbon', 9999.00, 30, '/images/laptop-02.svg', '14 英寸 2.8K OLED 屏，100% DCI-P3\n碳纤维机身，重量仅 1.09kg\n经典小红帽与背光键盘，键程舒适\n通过 12 项军标测试，耐用可靠', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '罗技 MX Master 3S 鼠标', 699.00, 200, '/images/mouse-01.svg', '8000DPI 传感器，几乎可在任何表面使用\nMagSpeed 电磁滚轮，一秒滚动千行\n静音按键，点击噪音降低 90%\n可同时连接三台设备并一键切换', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '戴森 V12 吸尘器', 3699.00, 40, '/images/vacuum-01.svg', '激光探测功能，让微尘无处藏身\n整机过滤系统，锁住 99.99% 微尘\n续航最长 60 分钟，可替换电池\n多款吸头覆盖地板、床褥与缝隙', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '美的电饭煲 4L', 399.00, 150, '/images/rice_cooker-01.svg', '4L 容量，适合 3~5 人家庭\nIH 电磁加热，米粒受热更均匀\n12 种预设菜单，支持 24 小时预约\n内胆可拆卸，清洗方便', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库轻型羽绒服', 598.00, 0, '/images/jacket-02.svg', '轻量设计，可收纳进随身小袋\n90% 羽绒填充，保暖效率高\n防泼水表面，应付小雨小雪\n内搭外穿都合适，通勤旅行皆宜', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), 'iPhone duo', 15999.00, 100, '/images/phone-04.svg', '双卡双待，工作生活两个号码分开\n超视网膜 XDR 显示屏，HDR 显示出色\nA 系列芯片，日常使用流畅省电\n支持无线充电与 IP68 防水', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), 'iPhone 18 pro 256G', 9999.00, 1000, '/images/phone-05.svg', '256GB 存储，照片视频随便存\nPro 级三摄系统，支持 ProRAW 与 ProRes\n钛金属中框，强度高且更轻\nProMotion 自适应刷新率，最高 120Hz', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '联想拯救者Y9000P', 9999.00, 999, '/images/laptop-03.svg', '16 英寸 2.5K 电竞屏，240Hz 刷新率\n满血版独立显卡，3A 大作高帧运行\n霜刃散热系统，双风扇多热管\n支持独显直连，游戏延迟更低', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '卫龙辣条', 9.90, 100, '/images/snack_bag-03.svg', '经典麻辣味，面筋筋道有嚼劲\n独立小包装，干净卫生不脏手\n非油炸工艺，解馋无负担\n追剧办公的国民小零食', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '床单', 99.00, 100, '/images/bedding-02.svg', '100% 纯棉，亲肤透气\n高支高密织造，触感细腻\n可机洗，越洗越柔软\n适合 1.5~1.8 米床', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), '华为 Mate 70 Pro', 6499.00, 80, '/images/phone-01.svg', '6.8 英寸 OLED 曲面屏，1-120Hz 自适应刷新率\n麒麟芯片 + 鸿蒙系统，支持双向北斗卫星消息\n后置 5000 万可变光圈主摄，支持 4K 视频录制\n5300mAh 电池，100W 有线快充', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), '荣耀 Magic7', 4499.00, 120, '/images/phone-02.svg', '6.7 英寸护眼直屏，4320Hz 高频调光\n第三代骁龙 8 移动平台，性能释放稳定\n5650mAh 青海湖电池，支持 100W 快充\nAI 抓拍引擎，运动场景成片率更高', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), '小米平板 7', 1999.00, 90, '/images/tablet-01.svg', '11.2 英寸 3.2K 超清屏，144Hz 刷新率\n支持手写笔与磁吸键盘，办公娱乐两用\n8850mAh 大电池，连续看视频约 14 小时\n金属一体化机身，厚度 6.18mm', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), '索尼 WH-1000XM5 头戴式耳机', 1899.00, 60, '/images/headphones-01.svg', '业内标杆级主动降噪，8 麦克风系统\n30mm 碳纤维驱动单元，支持 LDAC 高解析音频\n智能免摘对话，开口说话自动暂停音乐\n续航 30 小时，充电 3 分钟可听 3 小时', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), 'Apple Watch Series 10 智能手表', 3199.00, 45, '/images/watch-01.svg', '更大更薄的广视角 OLED 屏，边框进一步收窄\n支持睡眠呼吸暂停检测与心电图功能\n50 米防水，可记录游泳与浮潜数据\n快充设计，约 30 分钟充至 80%', 1),
-  ((SELECT id FROM category WHERE name = '手机数码'), '大疆 Osmo Action 5 Pro 运动相机', 2299.00, 35, '/images/camera-01.svg', '1/1.3 英寸传感器，低光画质明显提升\n前后双触摸屏，自拍构图方便\n裸机 20 米防水，无需额外防水壳\n超强防抖，骑行滑雪等剧烈场景也稳定', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), 'MacBook Air 13 英寸 M4', 7999.00, 40, '/images/laptop-01.svg', 'M4 芯片，10 核 CPU + 8 核 GPU\n13.6 英寸 Liquid 视网膜屏，500 尼特亮度\n无风扇设计，运行全程安静\n续航最长 18 小时，重量仅 1.24kg', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '戴尔 U2723QE 27 英寸 4K 显示器', 2999.00, 55, '/images/monitor-01.svg', '3840×2160 分辨率，IPS Black 面板\n98% DCI-P3 色域，出厂逐台校色\n支持 90W Type-C 反向供电，一根线连笔记本\n可升降旋转支架，自带 USB 集线器', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '罗技 K380 多设备无线键盘', 199.00, 300, '/images/keyboard-01.svg', '可同时连接 3 台设备，一键切换\n圆形静音键帽，打字手感轻快\n两节 AAA 电池可用约 2 年\n重量 423g，方便随身携带', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '惠普 LaserJet 无线激光打印机', 1099.00, 25, '/images/printer-01.svg', '黑白激光打印，每分钟 22 页\n支持无线直连与手机 App 打印\n首页输出仅需 8.3 秒\n鼓粉一体设计，更换耗材简单', 1),
-  ((SELECT id FROM category WHERE name = '电脑办公'), '金士顿 128G 金属 U 盘', 89.00, 500, '/images/usb-01.svg', 'USB 3.2 接口，读取速度最高 200MB/s\n金属外壳，抗摔耐磨\n内置钥匙环孔，可挂在钥匙扣上\n五年质保，全国联保', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '格力 1.5 匹变频挂机空调', 2899.00, 30, '/images/ac-01.svg', '新一级能效，APF 值 5.26\n56℃ 高温自清洁，出风更干净\n独立除湿模式，梅雨季很实用\n适用面积 16~20 平方米', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '海尔 465L 十字对开门冰箱', 3599.00, 20, '/images/fridge-01.svg', '十字四门设计，冷藏冷冻分区明确\n风冷无霜，无需手动除冰\n一级双变频，日耗电约 0.85 度\n干湿分储，蔬果和干货各得其所', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '小天鹅 10 公斤滚筒洗衣机', 2199.00, 25, '/images/washer-01.svg', '10kg 大容量，可洗四件套和窗帘\nBLDC 变频电机，静音且寿命长\n95℃ 高温筒自洁，抑菌率 99.9%\n15 分钟快洗模式，应急很方便', 1),
-  ((SELECT id FROM category WHERE name = '家用电器'), '小米空气净化器 4', 899.00, 60, '/images/purifier-01.svg', '颗粒物 CADR 500m³/h，适用 60 平方米\nOLED 触控屏，实时显示 PM2.5\n三层复合滤芯，更换周期约一年\n支持 App 与语音助手控制', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库全棉圆领 T 恤', 79.00, 500, '/images/tshirt-01.svg', '100% 纯棉，克重扎实不透\n领口加固不易变形\n版型regular fit，男女同款\n多色可选，日常百搭打底', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '李宁䨻科技跑鞋', 399.00, 200, '/images/shoe-01.svg', '䨻科技中底，回弹明显且轻量\n透气网布鞋面，长时间跑不闷脚\n橡胶大底，湿地抓地力好\n适合日常慢跑与通勤', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '李维斯 511 修身牛仔裤', 459.00, 150, '/images/pants-01.svg', '511 版型，修身不紧绷\n弹力棉面料，活动自如\n经典五袋设计，水洗色自然\n四季可穿，配 T 恤衬衫都行', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '新秀丽商务双肩背包', 599.00, 80, '/images/bag-01.svg', '可放 15.6 英寸笔记本，独立隔层\n背部透气网垫，久背不闷\n防泼水面料，小雨无压力\n行李箱拉杆带，出差可直接挂上', 1),
-  ((SELECT id FROM category WHERE name = '服饰鞋包'), '波司登中长款羽绒服', 1299.00, 40, '/images/jacket-01.svg', '90% 白鸭绒填充，蓬松度 600+\n中长款过膝设计，保暖范围更大\n防钻绒工艺，久穿不下绒\n可拆卸连帽，两种穿法', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '三只松鼠每日坚果 750g', 79.90, 300, '/images/pouch-01.svg', '30 小袋独立包装，一天一袋\n含核桃、巴旦木、腰果等多种坚果\n搭配蔓越莓干与蓝莓干，口感有层次\n原料当季采购，锁鲜包装', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '良品铺子猪肉脯 200g', 39.90, 400, '/images/snack_bag-01.svg', '原切后腿肉，肉纤维清晰可见\n炭火烘烤工艺，外焦里嫩\n独立小包装，开袋即食\n甜咸适口，追剧办公都合适', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '乐事薯片家庭分享装', 29.90, 500, '/images/snack_bag-02.svg', '家庭分享装，含 5 小包多种口味\n马铃薯切片均匀，酥脆不油腻\n原味、黄瓜味、烧烤味随机搭配\n密封小包装，一次一包不返潮', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '伊利金典纯牛奶 250ml×12', 69.90, 260, '/images/bottle-01.svg', '每 100ml 含 3.8g 优质乳蛋白\n120mg 原生高钙，日常补钙方便\n超高温灭菌，常温保存 6 个月\n12 盒整箱装，学生和上班族常备', 1),
-  ((SELECT id FROM category WHERE name = '休闲零食'), '费列罗榛果威化巧克力 24 粒', 109.00, 150, '/images/box-01.svg', '整颗榛果夹心，外层威化与巧克力\n24 粒礼盒装，送人体面\n原装进口，冷链运输\n独立金箔包装，常温存放即可', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '泰国天然乳胶枕', 199.00, 180, '/images/pillow-01.svg', '93% 天然乳胶含量，回弹支撑好\n波浪造型贴合颈椎，侧睡仰睡都合适\n蜂窝透气孔，夏季不闷热\n内外双层枕套，均可拆洗', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '水星家纺蚕丝被', 899.00, 45, '/images/quilt-01.svg', '100% 桑蚕丝填充，轻盈贴身\n蚕丝被芯可水洗，打理省心\n子母被设计，一床应对四季\n面料亲肤，敏感肌也能用', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '全棉四件套 1.8 米床', 399.00, 120, '/images/bedding-01.svg', '100% 新疆长绒棉，60 支高密\n含被套、床单、枕套两只\n活性印染，不易掉色\n适合 1.8 米床，可直接机洗', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '珊瑚绒加厚盖毯', 129.00, 200, '/images/quilt-02.svg', '双面珊瑚绒，触感柔软\n加厚设计，秋冬保暖效果好\n不掉毛不起球，机洗不变形\n午睡毯、沙发毯、旅行毯都合适', 1),
-  ((SELECT id FROM category WHERE name = '床上用品'), '记忆棉床垫 1.8 米', 1499.00, 30, '/images/mattress-01.svg', '记忆棉贴合身体曲线，分散压力\n独立袋装弹簧，翻身不互相干扰\n7 区支撑，护腰护颈\n可拆洗床垫套，厚度 20cm', 1);
+INSERT INTO product (category_id, name, cover, description, status) VALUES
+  ((SELECT id FROM category WHERE name = '手机数码'), '小米 15 Pro 手机', '/images/phone-03.svg', '6.73 英寸 2K 全等深微曲屏，龙晶玻璃 2.0\n徕卡光学镜头，支持可变光圈与长焦微距\n第三代骁龙 8 平台，5400mAh 电池\n90W 有线 + 50W 无线快充', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'iPad Air 11 英寸', '/images/tablet-02.svg', '11 英寸 Liquid 视网膜屏，P3 广色域\nM 系列芯片，剪辑和多任务都从容\n支持 Apple Pencil 与妙控键盘\n横向前置摄像头，视频通话更自然', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '联想 ThinkPad X1 Carbon', '/images/laptop-02.svg', '14 英寸 2.8K OLED 屏，100% DCI-P3\n碳纤维机身，重量仅 1.09kg\n经典小红帽与背光键盘，键程舒适\n通过 12 项军标测试，耐用可靠', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '罗技 MX Master 3S 鼠标', '/images/mouse-01.svg', '8000DPI 传感器，几乎可在任何表面使用\nMagSpeed 电磁滚轮，一秒滚动千行\n静音按键，点击噪音降低 90%\n可同时连接三台设备并一键切换', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '戴森 V12 吸尘器', '/images/vacuum-01.svg', '激光探测功能，让微尘无处藏身\n整机过滤系统，锁住 99.99% 微尘\n续航最长 60 分钟，可替换电池\n多款吸头覆盖地板、床褥与缝隙', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '美的电饭煲 4L', '/images/rice_cooker-01.svg', '4L 容量，适合 3~5 人家庭\nIH 电磁加热，米粒受热更均匀\n12 种预设菜单，支持 24 小时预约\n内胆可拆卸，清洗方便', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库轻型羽绒服', '/images/jacket-02.svg', '轻量设计，可收纳进随身小袋\n90% 羽绒填充，保暖效率高\n防泼水表面，应付小雨小雪\n内搭外穿都合适，通勤旅行皆宜', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'iPhone duo', '/images/phone-04.svg', '双卡双待，工作生活两个号码分开\n超视网膜 XDR 显示屏，HDR 显示出色\nA 系列芯片，日常使用流畅省电\n支持无线充电与 IP68 防水', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'iPhone 18 pro 256G', '/images/phone-05.svg', '256GB 存储，照片视频随便存\nPro 级三摄系统，支持 ProRAW 与 ProRes\n钛金属中框，强度高且更轻\nProMotion 自适应刷新率，最高 120Hz', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '联想拯救者Y9000P', '/images/laptop-03.svg', '16 英寸 2.5K 电竞屏，240Hz 刷新率\n满血版独立显卡，3A 大作高帧运行\n霜刃散热系统，双风扇多热管\n支持独显直连，游戏延迟更低', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '卫龙辣条', '/images/snack_bag-03.svg', '经典麻辣味，面筋筋道有嚼劲\n独立小包装，干净卫生不脏手\n非油炸工艺，解馋无负担\n追剧办公的国民小零食', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '床单', '/images/bedding-02.svg', '100% 纯棉，亲肤透气\n高支高密织造，触感细腻\n可机洗，越洗越柔软\n适合 1.5~1.8 米床', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '华为 Mate 70 Pro', '/images/phone-01.svg', '6.8 英寸 OLED 曲面屏，1-120Hz 自适应刷新率\n麒麟芯片 + 鸿蒙系统，支持双向北斗卫星消息\n后置 5000 万可变光圈主摄，支持 4K 视频录制\n5300mAh 电池，100W 有线快充', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '荣耀 Magic7', '/images/phone-02.svg', '6.7 英寸护眼直屏，4320Hz 高频调光\n第三代骁龙 8 移动平台，性能释放稳定\n5650mAh 青海湖电池，支持 100W 快充\nAI 抓拍引擎，运动场景成片率更高', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '小米平板 7', '/images/tablet-01.svg', '11.2 英寸 3.2K 超清屏，144Hz 刷新率\n支持手写笔与磁吸键盘，办公娱乐两用\n8850mAh 大电池，连续看视频约 14 小时\n金属一体化机身，厚度 6.18mm', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '索尼 WH-1000XM5 头戴式耳机', '/images/headphones-01.svg', '业内标杆级主动降噪，8 麦克风系统\n30mm 碳纤维驱动单元，支持 LDAC 高解析音频\n智能免摘对话，开口说话自动暂停音乐\n续航 30 小时，充电 3 分钟可听 3 小时', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'Apple Watch Series 10 智能手表', '/images/watch-01.svg', '更大更薄的广视角 OLED 屏，边框进一步收窄\n支持睡眠呼吸暂停检测与心电图功能\n50 米防水，可记录游泳与浮潜数据\n快充设计，约 30 分钟充至 80%', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '大疆 Osmo Action 5 Pro 运动相机', '/images/camera-01.svg', '1/1.3 英寸传感器，低光画质明显提升\n前后双触摸屏，自拍构图方便\n裸机 20 米防水，无需额外防水壳\n超强防抖，骑行滑雪等剧烈场景也稳定', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), 'MacBook Air 13 英寸 M4', '/images/laptop-01.svg', 'M4 芯片，10 核 CPU + 8 核 GPU\n13.6 英寸 Liquid 视网膜屏，500 尼特亮度\n无风扇设计，运行全程安静\n续航最长 18 小时，重量仅 1.24kg', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '戴尔 U2723QE 27 英寸 4K 显示器', '/images/monitor-01.svg', '3840×2160 分辨率，IPS Black 面板\n98% DCI-P3 色域，出厂逐台校色\n支持 90W Type-C 反向供电，一根线连笔记本\n可升降旋转支架，自带 USB 集线器', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '罗技 K380 多设备无线键盘', '/images/keyboard-01.svg', '可同时连接 3 台设备，一键切换\n圆形静音键帽，打字手感轻快\n两节 AAA 电池可用约 2 年\n重量 423g，方便随身携带', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '惠普 LaserJet 无线激光打印机', '/images/printer-01.svg', '黑白激光打印，每分钟 22 页\n支持无线直连与手机 App 打印\n首页输出仅需 8.3 秒\n鼓粉一体设计，更换耗材简单', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '金士顿 128G 金属 U 盘', '/images/usb-01.svg', 'USB 3.2 接口，读取速度最高 200MB/s\n金属外壳，抗摔耐磨\n内置钥匙环孔，可挂在钥匙扣上\n五年质保，全国联保', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '格力 1.5 匹变频挂机空调', '/images/ac-01.svg', '新一级能效，APF 值 5.26\n56℃ 高温自清洁，出风更干净\n独立除湿模式，梅雨季很实用\n适用面积 16~20 平方米', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '海尔 465L 十字对开门冰箱', '/images/fridge-01.svg', '十字四门设计，冷藏冷冻分区明确\n风冷无霜，无需手动除冰\n一级双变频，日耗电约 0.85 度\n干湿分储，蔬果和干货各得其所', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '小天鹅 10 公斤滚筒洗衣机', '/images/washer-01.svg', '10kg 大容量，可洗四件套和窗帘\nBLDC 变频电机，静音且寿命长\n95℃ 高温筒自洁，抑菌率 99.9%\n15 分钟快洗模式，应急很方便', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '小米空气净化器 4', '/images/purifier-01.svg', '颗粒物 CADR 500m³/h，适用 60 平方米\nOLED 触控屏，实时显示 PM2.5\n三层复合滤芯，更换周期约一年\n支持 App 与语音助手控制', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库全棉圆领 T 恤', '/images/tshirt-01.svg', '100% 纯棉，克重扎实不透\n领口加固不易变形\n版型regular fit，男女同款\n多色可选，日常百搭打底', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '李宁䨻科技跑鞋', '/images/shoe-01.svg', '䨻科技中底，回弹明显且轻量\n透气网布鞋面，长时间跑不闷脚\n橡胶大底，湿地抓地力好\n适合日常慢跑与通勤', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '李维斯 511 修身牛仔裤', '/images/pants-01.svg', '511 版型，修身不紧绷\n弹力棉面料，活动自如\n经典五袋设计，水洗色自然\n四季可穿，配 T 恤衬衫都行', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '新秀丽商务双肩背包', '/images/bag-01.svg', '可放 15.6 英寸笔记本，独立隔层\n背部透气网垫，久背不闷\n防泼水面料，小雨无压力\n行李箱拉杆带，出差可直接挂上', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '波司登中长款羽绒服', '/images/jacket-01.svg', '90% 白鸭绒填充，蓬松度 600+\n中长款过膝设计，保暖范围更大\n防钻绒工艺，久穿不下绒\n可拆卸连帽，两种穿法', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '三只松鼠每日坚果 750g', '/images/pouch-01.svg', '30 小袋独立包装，一天一袋\n含核桃、巴旦木、腰果等多种坚果\n搭配蔓越莓干与蓝莓干，口感有层次\n原料当季采购，锁鲜包装', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '良品铺子猪肉脯 200g', '/images/snack_bag-01.svg', '原切后腿肉，肉纤维清晰可见\n炭火烘烤工艺，外焦里嫩\n独立小包装，开袋即食\n甜咸适口，追剧办公都合适', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '乐事薯片家庭分享装', '/images/snack_bag-02.svg', '家庭分享装，含 5 小包多种口味\n马铃薯切片均匀，酥脆不油腻\n原味、黄瓜味、烧烤味随机搭配\n密封小包装，一次一包不返潮', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '伊利金典纯牛奶 250ml×12', '/images/bottle-01.svg', '每 100ml 含 3.8g 优质乳蛋白\n120mg 原生高钙，日常补钙方便\n超高温灭菌，常温保存 6 个月\n12 盒整箱装，学生和上班族常备', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '费列罗榛果威化巧克力 24 粒', '/images/box-01.svg', '整颗榛果夹心，外层威化与巧克力\n24 粒礼盒装，送人体面\n原装进口，冷链运输\n独立金箔包装，常温存放即可', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '泰国天然乳胶枕', '/images/pillow-01.svg', '93% 天然乳胶含量，回弹支撑好\n波浪造型贴合颈椎，侧睡仰睡都合适\n蜂窝透气孔，夏季不闷热\n内外双层枕套，均可拆洗', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '水星家纺蚕丝被', '/images/quilt-01.svg', '100% 桑蚕丝填充，轻盈贴身\n蚕丝被芯可水洗，打理省心\n子母被设计，一床应对四季\n面料亲肤，敏感肌也能用', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '全棉四件套 1.8 米床', '/images/bedding-01.svg', '100% 新疆长绒棉，60 支高密\n含被套、床单、枕套两只\n活性印染，不易掉色\n适合 1.8 米床，可直接机洗', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '珊瑚绒加厚盖毯', '/images/quilt-02.svg', '双面珊瑚绒，触感柔软\n加厚设计，秋冬保暖效果好\n不掉毛不起球，机洗不变形\n午睡毯、沙发毯、旅行毯都合适', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '记忆棉床垫 1.8 米', '/images/mattress-01.svg', '记忆棉贴合身体曲线，分散压力\n独立袋装弹簧，翻身不互相干扰\n7 区支撑，护腰护颈\n可拆洗床垫套，厚度 20cm', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '三星 Galaxy S25 Ultra', '/images/phone-06.svg', '6.9 英寸动态 AMOLED 2X 屏，1-120Hz 自适应刷新\n2 亿像素主摄，支持 5 倍光学变焦\n内置 S Pen，随手记笔记很方便\n钛金属边框，支持 IP68 防水', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'OPPO Find X8 Pro', '/images/phone-07.svg', '6.78 英寸 1.5K 曲面屏，峰值亮度 4500 尼特\n双潜望长焦，人像和远景都拿手\n5910mAh 电池，80W 有线闪充\n支持无线充电与红外遥控', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'vivo X200 Pro', '/images/phone-08.svg', '蔡司 2 亿像素长焦，远摄解析力强\n6000mAh 蓝海电池，重度用一天无压力\n旗舰平台，游戏帧率稳定\n支持 IP69 防尘防水', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '红米 K80 Pro', '/images/phone-09.svg', '第二代 2K 直屏，支持全亮度 DC 调光\n骁龙旗舰平台，性能释放激进\n6000mAh 电池 + 120W 秒充\n超声波指纹，湿手也能解锁', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '一加 13', '/images/phone-10.svg', '6.82 英寸 2K 东方屏，护眼认证齐全\n哈苏影像系统，人像色彩自然\n6000mAh 冰川电池，100W 有线快充\n支持 50W 无线闪充', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '华为 MatePad Pro 13.2', '/images/tablet-03.svg', '13.2 英寸柔性 OLED 屏，屏占比 94%\n支持星闪手写笔，书写延迟低\n重量 580g，同尺寸里属于轻的一档\n可与手机、耳机多设备协同', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '小米手环 9 Pro', '/images/watch-02.svg', '1.74 英寸大屏，亮度提升到 1200 尼特\n支持全天心率、血氧与睡眠监测\n内置 GPS，跑步不用带手机\n续航最长 21 天', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '索尼 WF-1000XM5 真无线降噪耳机', '/images/headphones-02.svg', '双处理器降噪，通勤地铁里效果明显\n8.4mm 驱动单元，低频有力\n单次续航 8 小时，配充电盒共 24 小时\n支持 LDAC 高解析音频', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), 'Bose QuietComfort 45 头戴式耳机', '/images/headphones-03.svg', '经典主动降噪，四麦克风阵列\n三档降噪模式，室内室外都能用\n续航 24 小时，快充 15 分钟用 3 小时\n可折叠收纳，附带硬壳包', 1),
+  ((SELECT id FROM category WHERE name = '手机数码'), '佳能 EOS R50 微单套机', '/images/camera-02.svg', '2420 万像素 APS-C 画幅传感器\n支持 4K 30P 无裁切视频录制\n双像素对焦，人物眼睛自动追踪\n机身约 375g，适合入门和旅拍', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '联想小新 Pro 16 2025', '/images/laptop-04.svg', '16 英寸 2.5K 高刷屏，100% sRGB\n标压处理器 + 独显，办公剪辑都够用\n84Wh 大电池，续航约 10 小时\n全功能 Type-C 接口，支持 PD 充电', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '华硕 ROG 魔霸新锐', '/images/laptop-05.svg', '16 英寸 2.5K 240Hz 电竞屏\n满血独显，支持独显直连\n冰川散热架构，长时间游戏不降频\nRGB 背光键盘，键程 1.7mm', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '华为 MateBook 14', '/images/laptop-06.svg', '14.2 英寸 2.8K 触控屏，3:2 显示比例\n重量 1.31kg，金属机身\n超级终端，与华为手机一碰互传\n隐藏式摄像头，保护隐私', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '宏碁 掠夺者 擎 Neo', '/images/laptop-07.svg', '16 英寸 2.5K 165Hz 高刷屏\n双风扇四热管，散热余量充足\n内存与硬盘均可自行扩展\n带独立数字小键盘，录入方便', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '明基 GW2790 27 英寸护眼显示器', '/images/monitor-02.svg', '27 英寸 IPS 屏，三面窄边框\n硬件级低蓝光，长时间办公更舒服\n支持 100Hz 刷新率，滚动更顺滑\n内置音箱，桌面更简洁', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), 'AOC 24G2 24 英寸电竞显示器', '/images/monitor-03.svg', '24 英寸 165Hz 电竞屏，1ms 响应\n支持 FreeSync 防撕裂\n可升降旋转支架，竖屏看代码方便\n双 HDMI + DP 接口', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '雷蛇 黑寡妇蜘蛛 V4 键盘', '/images/keyboard-02.svg', '机械轴体，段落感清晰\n独立多媒体控制键与旋钮\n支持 RGB 灯效自定义\n附带磁吸式手托', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '罗技 G502 Hero 游戏鼠标', '/images/mouse-02.svg', '25600 DPI HERO 传感器\n11 个可编程按键\n可调配重块，手感自己调\n支持板载内存保存配置', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '微软 Surface 精准鼠标', '/images/mouse-03.svg', '蓝影技术，玻璃桌面也能用\n三档按键力度可调\n支持同时配对三台设备\n续航约 3 个月', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '闪迪 1TB 移动固态硬盘', '/images/usb-02.svg', '读取速度最高 1050MB/s\n金属外壳，抗冲击防跌落\nType-C 与 USB-A 双接口\n附带加密软件，保护隐私', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '爱普生 L3253 墨仓式一体机', '/images/printer-02.svg', '打印、复印、扫描三合一\n墨仓式设计，单页成本低\n支持无线打印与小程序打印\n黑白彩色同速，每分钟 10 页', 1),
+  ((SELECT id FROM category WHERE name = '电脑办公'), '得力 5 级保密碎纸机', '/images/box-02.svg', '5 级保密等级，碎纸尺寸 2×12mm\n单次可碎 8 张 A4 纸\n连续工作 30 分钟不卡纸\n静音设计，办公室用不吵', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '美的 1.5 匹酷省电空调', '/images/ac-02.svg', '新一级能效，省电模式下更省\n56℃ 高温自清洁，出风更干净\n独立除湿模式，梅雨季实用\n适用面积 16~20 平方米', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '松下 506L 多门冰箱', '/images/fridge-02.svg', '多门分区，冷藏冷冻独立控温\n风冷无霜，无需手动除冰\n一级能效，日耗电约 0.9 度\n纳诺怡除菌，蔬果保鲜更久', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '西门子 10 公斤洗烘一体机', '/images/washer-02.svg', '10 公斤大容量，被套一次洗完\n洗烘一体，阴雨天不用晾\n变频电机，运行安静\n高温筒自洁，减少异味', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '九阳 破壁料理机', '/images/blender-01.svg', '高转速破壁，豆浆细腻少渣\n可做米糊、果汁、辅食\n预约功能，早上起来就能喝\n杯体可拆洗，不易藏污', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '苏泊尔 IH 电饭煲 5L', '/images/rice_cooker-02.svg', '5L 容量，适合 4~6 人家庭\nIH 电磁加热，受热更均匀\n支持 24 小时预约\n内胆可拆卸，清洗方便', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '莱克 立式吸尘器', '/images/vacuum-02.svg', '立式设计，推着走不费腰\n大吸力电机，地毯深处的灰也能吸\n多档吸力，按地面材质切换\n集尘盒可水洗，不用买耗材', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '飞利浦 声波电动牙刷', '/images/toothbrush-01.svg', '声波震动清洁，牙缝刷得更干净\n三种模式，敏感牙龈也能用\n两分钟计时，分区提醒换区\n一次充电用约 14 天', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '米家 空气净化器 Ultra', '/images/purifier-02.svg', 'CADR 值高，大客厅也能带动\n高效滤芯，可过滤 PM2.5 与甲醛\n自动模式按空气质量调节风量\n支持手机 App 查看滤芯寿命', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '格兰仕 微波炉 20L', '/images/box-03.svg', '20L 容量，日常加热够用\n机械旋钮，老人也会用\n解冻、加热两档火力\n内胆易擦洗，不留油渍', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '摩飞 便携榨汁杯', '/images/blender-02.svg', '杯机一体，榨完直接喝\n充电式设计，出门也能用\n一次可榨一杯，约 300ml\n杯体可拆下水洗', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '追觅 扫地机器人', '/images/vacuum-03.svg', '激光导航，自动规划清扫路线\n扫拖一体，边扫边拖\n自动集尘，一个月不用倒垃圾\n支持 App 划区清扫与禁扫区', 1),
+  ((SELECT id FROM category WHERE name = '家用电器'), '海尔 60 升电热水器', '/images/box-04.svg', '60 升容量，够两三个人连续洗\n3000W 加热，等待时间短\n防电墙技术，用电更安心\n可预约加热，避开用电高峰', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库 摇粒绒外套', '/images/jacket-03.svg', '摇粒绒面料，保暖又轻\n立领设计，脖子不进风\n两侧口袋带拉链，不怕掉东西\n可机洗，打理省事', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '耐克 Air Force 1 板鞋', '/images/shoe-02.svg', '经典低帮板鞋，百搭不挑裤型\n头层皮鞋面，耐穿易清洁\n气垫缓震，久站也舒服\n橡胶大底，防滑耐磨', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '阿迪达斯 三条纹运动裤', '/images/pants-02.svg', '经典三条纹设计，运动休闲都能穿\n针织面料带弹力，活动不受限\n收口裤脚，显腿长\n侧边口袋带拉链', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '安踏 冠军跑鞋', '/images/shoe-03.svg', '缓震中底，落地冲击小\n网布鞋面透气，夏天不闷脚\n后跟稳定片，长距离支撑好\n重量轻，适合日常训练', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '太平鸟 男士休闲夹克', '/images/jacket-04.svg', '翻领设计，通勤休闲都合适\n面料挺括，不易起皱\n内里加薄绒，春秋能穿\n两侧斜插口袋，放手机方便', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '海澜之家 纯棉长袖衬衫', '/images/tshirt-02.svg', '100% 纯棉，贴身不扎\n免烫处理，洗完挂着就平整\n标准版型，塞进裤腰不臃肿\n多色可选，适合日常通勤', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '波司登 轻薄羽绒马甲', '/images/jacket-05.svg', '轻薄羽绒马甲，室内外都好搭\n90% 绒子含量，保暖效率高\n可收纳进随身小袋\n外穿内搭都不显臃肿', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '李宁 运动双肩包', '/images/bag-02.svg', '大容量主袋，可放 15.6 英寸笔记本\n独立鞋仓，健身换鞋分开放\n透气背垫，夏天背着不闷\n侧袋可放水杯和雨伞', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '迪卡侬 20L 徒步背包', '/images/bag-03.svg', '20L 容量，一日徒步刚好\n背部通风设计，出汗少\n腰带分担重量，走久了肩膀不酸\n自带防雨罩，突然下雨也不怕', 1),
+  ((SELECT id FROM category WHERE name = '服饰鞋包'), '优衣库 高腰直筒牛仔裤', '/images/pants-03.svg', '高腰直筒版型，显腿直\n弹力牛仔面料，蹲坐不勒\n水洗工艺，颜色自然不假\n四季都能穿的厚度', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '卫龙 魔芋爽 20 包', '/images/snack_bag-04.svg', '酸辣爽脆，口感弹牙\n独立小包装，一次一包不脏手\n低热量解馋，追剧好搭档\n整盒 20 包，办公室囤货合适', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '洽洽 每日坚果 30 包', '/images/pouch-02.svg', '混合坚果与果干，一天一包\n独立分装，随手带出门\n低温烘焙，不额外油炸\n整箱 30 包，一个月的量', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '旺旺 雪饼整箱', '/images/snack_bag-05.svg', '经典米饼，咸甜适口\n蓬松酥脆，一咬就化\n整箱装，家里来客人不慌\n独立小包，受潮也不怕', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '奥利奥 夹心饼干分享装', '/images/box-05.svg', '经典可可饼干配奶油夹心\n分享装分量足，聚会合适\n泡牛奶吃更香\n密封包装，开封后不易受潮', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '农夫山泉 天然水 550ml×24', '/images/bottle-02.svg', '天然水源，入口甘冽\n550ml 常规瓶型，一次喝完不浪费\n整箱 24 瓶，办公室常备\n瓶身可回收，环保包装', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '蒙牛 特仑苏纯牛奶 250ml×16', '/images/bottle-03.svg', '每 100ml 含 3.6g 优质蛋白\n250ml 利乐包，早餐一盒刚好\n整箱 16 盒，常温存放\n不添加防腐剂，开盒尽快喝完', 1),
+  ((SELECT id FROM category WHERE name = '休闲零食'), '好想你 红枣夹核桃 500g', '/images/pouch-03.svg', '红枣去核夹核桃仁，一口两样\n独立小包，随身带着补能量\n选料饱满，甜度自然\n500g 袋装，办公室常备', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '富安娜 全棉四件套 1.5 米', '/images/bedding-03.svg', '100% 全棉，亲肤透气\n被套床单枕套四件齐备\n活性印染，不易掉色\n适合 1.5 米床', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '罗莱 抗菌纤维被', '/images/quilt-03.svg', '填充纤维带抗菌处理，潮季更安心\n重量适中，春秋冬都能用\n被芯可整体水洗，不用送干洗\n四角带固定带，不跑被', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '网易严选 乳胶记忆枕', '/images/pillow-02.svg', '乳胶与记忆棉复合，回弹刚好\n贴合颈部曲线，早上起来脖子不酸\n透气孔设计，夏天不闷\n枕套可拆洗，内芯不用水洗', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '恒源祥 羊毛被', '/images/quilt-04.svg', '羊毛填充，保暖且透气\n重量轻，压在身上不闷\n被面纯棉，贴身不扎\n适合冬季或空调房使用', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '水星 全棉床笠 1.8 米', '/images/bedding-04.svg', '全棉面料，柔软亲肤\n松紧包边，套上不滑动\n深度 25cm，厚床垫也能包住\n适合 1.8 米床', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '梦洁 记忆棉护颈枕', '/images/pillow-03.svg', '慢回弹记忆棉，承托颈部\n中间低两侧高的护颈造型\n枕套可拆洗，机洗不变形\n适合侧睡与仰睡', 1),
+  ((SELECT id FROM category WHERE name = '床上用品'), '南极人 加厚床垫 1.5 米', '/images/mattress-02.svg', '加厚填充，软硬适中\n底面防滑颗粒，不易移位\n可直接铺在旧床垫上翻新\n适合 1.5 米床', 1);
+
+-- 商品 SKU（每一件商品都至少一条；'[]' = 默认 SKU，也就是「这件商品没有规格」）
+INSERT INTO product_sku (product_id, spec_json, price, stock) VALUES
+  ((SELECT id FROM product WHERE name = '小米 15 Pro 手机'), '[]', 4999.00, 100),
+  ((SELECT id FROM product WHERE name = 'iPad Air 11 英寸'), '[]', 4799.00, 50),
+  ((SELECT id FROM product WHERE name = '联想 ThinkPad X1 Carbon'), '[]', 9999.00, 30),
+  ((SELECT id FROM product WHERE name = '罗技 MX Master 3S 鼠标'), '[]', 699.00, 200),
+  ((SELECT id FROM product WHERE name = '戴森 V12 吸尘器'), '[]', 3699.00, 40),
+  ((SELECT id FROM product WHERE name = '美的电饭煲 4L'), '[]', 399.00, 150),
+  ((SELECT id FROM product WHERE name = '优衣库轻型羽绒服'), '[]', 598.00, 0),
+  ((SELECT id FROM product WHERE name = 'iPhone duo'), '[]', 15999.00, 100),
+  ((SELECT id FROM product WHERE name = 'iPhone 18 pro 256G'), '[]', 9999.00, 1000),
+  ((SELECT id FROM product WHERE name = '联想拯救者Y9000P'), '[]', 9999.00, 999),
+  ((SELECT id FROM product WHERE name = '卫龙辣条'), '[]', 9.90, 100),
+  ((SELECT id FROM product WHERE name = '床单'), '[]', 99.00, 100),
+  ((SELECT id FROM product WHERE name = '华为 Mate 70 Pro'), '[]', 6499.00, 80),
+  ((SELECT id FROM product WHERE name = '荣耀 Magic7'), '[]', 4499.00, 120),
+  ((SELECT id FROM product WHERE name = '小米平板 7'), '[]', 1999.00, 90),
+  ((SELECT id FROM product WHERE name = '索尼 WH-1000XM5 头戴式耳机'), '[]', 1899.00, 60),
+  ((SELECT id FROM product WHERE name = 'Apple Watch Series 10 智能手表'), '[]', 3199.00, 45),
+  ((SELECT id FROM product WHERE name = '大疆 Osmo Action 5 Pro 运动相机'), '[]', 2299.00, 35),
+  ((SELECT id FROM product WHERE name = 'MacBook Air 13 英寸 M4'), '[]', 7999.00, 40),
+  ((SELECT id FROM product WHERE name = '戴尔 U2723QE 27 英寸 4K 显示器'), '[]', 2999.00, 55),
+  ((SELECT id FROM product WHERE name = '罗技 K380 多设备无线键盘'), '[]', 199.00, 300),
+  ((SELECT id FROM product WHERE name = '惠普 LaserJet 无线激光打印机'), '[]', 1099.00, 25),
+  ((SELECT id FROM product WHERE name = '金士顿 128G 金属 U 盘'), '[]', 89.00, 500),
+  ((SELECT id FROM product WHERE name = '格力 1.5 匹变频挂机空调'), '[]', 2899.00, 30),
+  ((SELECT id FROM product WHERE name = '海尔 465L 十字对开门冰箱'), '[]', 3599.00, 20),
+  ((SELECT id FROM product WHERE name = '小天鹅 10 公斤滚筒洗衣机'), '[]', 2199.00, 25),
+  ((SELECT id FROM product WHERE name = '小米空气净化器 4'), '[]', 899.00, 60),
+  ((SELECT id FROM product WHERE name = '优衣库全棉圆领 T 恤'), '[]', 79.00, 500),
+  ((SELECT id FROM product WHERE name = '李宁䨻科技跑鞋'), '[]', 399.00, 200),
+  ((SELECT id FROM product WHERE name = '李维斯 511 修身牛仔裤'), '[]', 459.00, 150),
+  ((SELECT id FROM product WHERE name = '新秀丽商务双肩背包'), '[]', 599.00, 80),
+  ((SELECT id FROM product WHERE name = '波司登中长款羽绒服'), '[]', 1299.00, 40),
+  ((SELECT id FROM product WHERE name = '三只松鼠每日坚果 750g'), '[]', 79.90, 300),
+  ((SELECT id FROM product WHERE name = '良品铺子猪肉脯 200g'), '[]', 39.90, 400),
+  ((SELECT id FROM product WHERE name = '乐事薯片家庭分享装'), '[]', 29.90, 500),
+  ((SELECT id FROM product WHERE name = '伊利金典纯牛奶 250ml×12'), '[]', 69.90, 260),
+  ((SELECT id FROM product WHERE name = '费列罗榛果威化巧克力 24 粒'), '[]', 109.00, 150),
+  ((SELECT id FROM product WHERE name = '泰国天然乳胶枕'), '[]', 199.00, 180),
+  ((SELECT id FROM product WHERE name = '水星家纺蚕丝被'), '[]', 899.00, 45),
+  ((SELECT id FROM product WHERE name = '全棉四件套 1.8 米床'), '[]', 399.00, 120),
+  ((SELECT id FROM product WHERE name = '珊瑚绒加厚盖毯'), '[]', 129.00, 200),
+  ((SELECT id FROM product WHERE name = '记忆棉床垫 1.8 米'), '[]', 1499.00, 30),
+  ((SELECT id FROM product WHERE name = '三星 Galaxy S25 Ultra'), '[]', 9699.00, 45),
+  ((SELECT id FROM product WHERE name = 'OPPO Find X8 Pro'), '[]', 5299.00, 70),
+  ((SELECT id FROM product WHERE name = 'vivo X200 Pro'), '[]', 5499.00, 65),
+  ((SELECT id FROM product WHERE name = '红米 K80 Pro'), '[]', 2999.00, 150),
+  ((SELECT id FROM product WHERE name = '一加 13'), '[]', 4499.00, 80),
+  ((SELECT id FROM product WHERE name = '华为 MatePad Pro 13.2'), '[]', 4999.00, 40),
+  ((SELECT id FROM product WHERE name = '小米手环 9 Pro'), '[]', 399.00, 300),
+  ((SELECT id FROM product WHERE name = '索尼 WF-1000XM5 真无线降噪耳机'), '[]', 1699.00, 90),
+  ((SELECT id FROM product WHERE name = 'Bose QuietComfort 45 头戴式耳机'), '[]', 1499.00, 55),
+  ((SELECT id FROM product WHERE name = '佳能 EOS R50 微单套机'), '[]', 4799.00, 30),
+  ((SELECT id FROM product WHERE name = '联想小新 Pro 16 2025'), '[]', 5299.00, 60),
+  ((SELECT id FROM product WHERE name = '华硕 ROG 魔霸新锐'), '[]', 8999.00, 25),
+  ((SELECT id FROM product WHERE name = '华为 MateBook 14'), '[]', 5999.00, 45),
+  ((SELECT id FROM product WHERE name = '宏碁 掠夺者 擎 Neo'), '[]', 7499.00, 30),
+  ((SELECT id FROM product WHERE name = '明基 GW2790 27 英寸护眼显示器'), '[]', 1099.00, 70),
+  ((SELECT id FROM product WHERE name = 'AOC 24G2 24 英寸电竞显示器'), '[]', 899.00, 85),
+  ((SELECT id FROM product WHERE name = '雷蛇 黑寡妇蜘蛛 V4 键盘'), '[]', 999.00, 60),
+  ((SELECT id FROM product WHERE name = '罗技 G502 Hero 游戏鼠标'), '[]', 349.00, 200),
+  ((SELECT id FROM product WHERE name = '微软 Surface 精准鼠标'), '[]', 599.00, 90),
+  ((SELECT id FROM product WHERE name = '闪迪 1TB 移动固态硬盘'), '[]', 699.00, 130),
+  ((SELECT id FROM product WHERE name = '爱普生 L3253 墨仓式一体机'), '[]', 899.00, 40),
+  ((SELECT id FROM product WHERE name = '得力 5 级保密碎纸机'), '[]', 499.00, 35),
+  ((SELECT id FROM product WHERE name = '美的 1.5 匹酷省电空调'), '[]', 2399.00, 35),
+  ((SELECT id FROM product WHERE name = '松下 506L 多门冰箱'), '[]', 6999.00, 15),
+  ((SELECT id FROM product WHERE name = '西门子 10 公斤洗烘一体机'), '[]', 4599.00, 20),
+  ((SELECT id FROM product WHERE name = '九阳 破壁料理机'), '[]', 599.00, 110),
+  ((SELECT id FROM product WHERE name = '苏泊尔 IH 电饭煲 5L'), '[]', 699.00, 95),
+  ((SELECT id FROM product WHERE name = '莱克 立式吸尘器'), '[]', 1899.00, 45),
+  ((SELECT id FROM product WHERE name = '飞利浦 声波电动牙刷'), '[]', 299.00, 220),
+  ((SELECT id FROM product WHERE name = '米家 空气净化器 Ultra'), '[]', 2499.00, 40),
+  ((SELECT id FROM product WHERE name = '格兰仕 微波炉 20L'), '[]', 399.00, 140),
+  ((SELECT id FROM product WHERE name = '摩飞 便携榨汁杯'), '[]', 199.00, 260),
+  ((SELECT id FROM product WHERE name = '追觅 扫地机器人'), '[]', 3499.00, 22),
+  ((SELECT id FROM product WHERE name = '海尔 60 升电热水器'), '[]', 1299.00, 30),
+  ((SELECT id FROM product WHERE name = '优衣库 摇粒绒外套'), '[]', 249.00, 300),
+  ((SELECT id FROM product WHERE name = '耐克 Air Force 1 板鞋'), '[]', 799.00, 120),
+  ((SELECT id FROM product WHERE name = '阿迪达斯 三条纹运动裤'), '[]', 329.00, 180),
+  ((SELECT id FROM product WHERE name = '安踏 冠军跑鞋'), '[]', 459.00, 160),
+  ((SELECT id FROM product WHERE name = '太平鸟 男士休闲夹克'), '[]', 599.00, 90),
+  ((SELECT id FROM product WHERE name = '海澜之家 纯棉长袖衬衫'), '[]', 199.00, 220),
+  ((SELECT id FROM product WHERE name = '波司登 轻薄羽绒马甲'), '[]', 499.00, 110),
+  ((SELECT id FROM product WHERE name = '李宁 运动双肩包'), '[]', 269.00, 150),
+  ((SELECT id FROM product WHERE name = '迪卡侬 20L 徒步背包'), '[]', 149.00, 240),
+  ((SELECT id FROM product WHERE name = '优衣库 高腰直筒牛仔裤'), '[]', 299.00, 200),
+  ((SELECT id FROM product WHERE name = '卫龙 魔芋爽 20 包'), '[]', 29.90, 500),
+  ((SELECT id FROM product WHERE name = '洽洽 每日坚果 30 包'), '[]', 99.00, 260),
+  ((SELECT id FROM product WHERE name = '旺旺 雪饼整箱'), '[]', 39.90, 400),
+  ((SELECT id FROM product WHERE name = '奥利奥 夹心饼干分享装'), '[]', 25.90, 450),
+  ((SELECT id FROM product WHERE name = '农夫山泉 天然水 550ml×24'), '[]', 45.00, 300),
+  ((SELECT id FROM product WHERE name = '蒙牛 特仑苏纯牛奶 250ml×16'), '[]', 79.00, 280),
+  ((SELECT id FROM product WHERE name = '好想你 红枣夹核桃 500g'), '[]', 59.90, 220),
+  ((SELECT id FROM product WHERE name = '富安娜 全棉四件套 1.5 米'), '[]', 499.00, 100),
+  ((SELECT id FROM product WHERE name = '罗莱 抗菌纤维被'), '[]', 429.00, 90),
+  ((SELECT id FROM product WHERE name = '网易严选 乳胶记忆枕'), '[]', 249.00, 160),
+  ((SELECT id FROM product WHERE name = '恒源祥 羊毛被'), '[]', 899.00, 60),
+  ((SELECT id FROM product WHERE name = '水星 全棉床笠 1.8 米'), '[]', 139.00, 220),
+  ((SELECT id FROM product WHERE name = '梦洁 记忆棉护颈枕'), '[]', 199.00, 180),
+  ((SELECT id FROM product WHERE name = '南极人 加厚床垫 1.5 米'), '[]', 599.00, 70);
 
 -- 会员
 INSERT INTO member (username, password, nickname, phone, status) VALUES

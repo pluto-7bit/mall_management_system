@@ -124,17 +124,35 @@ def redis_cmd(*args):
     return [l for l in result.stdout.strip().splitlines() if l]
 
 
-def stock_of(pid):
-    rows = run_sql(f"SELECT stock FROM product WHERE id = {pid}")
+def stock_of(sku_id):
+    """★ 里程碑 15 阶段 4：库存的唯一真源是 product_sku.stock。
+
+    以前读的是 product.stock。阶段 2~5 期间那列还在（回滚预案），
+    所以读错了【不会报错】—— 只是数字永远停在阶段 1 迁移时的那个值，
+    所有「库存扣了 1」的断言会集体红，而原因看起来会是「扣库存没生效」。
+    """
+    rows = run_sql(f"SELECT stock FROM product_sku WHERE id = {sku_id}")
     return int(rows[0][0]) if rows else None
 
 
-def set_stock(pid, stock):
-    run_sql(f"UPDATE product SET stock = {stock} WHERE id = {pid}")
+def set_stock(sku_id, stock):
+    run_sql(f"UPDATE product_sku SET stock = {stock} WHERE id = {sku_id}")
 
 
 def set_status(pid, status):
+    """⚠️ 参数是【商品 id】：下架是商品级操作（整个商品连同它的全部规格
+    一起不可售），所以它必须走 product 表。调用处要写 pid_of_sku(...)。"""
     run_sql(f"UPDATE product SET status = {status} WHERE id = {pid}")
+
+
+def default_sku_of(pid):
+    """无规格商品的那唯一一条「默认 SKU」的 id。"""
+    return int(scalar(f"SELECT id FROM product_sku WHERE product_id = {pid}"))
+
+
+def pid_of_sku(sku_id):
+    """SKU id → 商品 id。只给「按商品整体」的操作（下架、删除）用。"""
+    return int(scalar(f"SELECT product_id FROM product_sku WHERE id = {sku_id}"))
 
 
 def order_rows(member_id):
@@ -151,19 +169,24 @@ def order_count(member_id):
 
 def item_rows(order_no):
     return run_sql(
-        f"SELECT i.product_name, i.price, i.quantity, i.subtotal "
+        f"SELECT i.product_name, i.price, i.quantity, i.subtotal, i.sku_id, i.sku_spec "
         f"FROM order_item i JOIN orders o ON o.id = i.order_id "
         f"WHERE o.order_no = '{order_no}' ORDER BY i.id")
 
 
 def cart_keys_for(member_id):
-    """这个会员购物车里剩下的商品 id（空列表表示车是空的）。"""
+    """这个会员购物车里剩下的【规格 id】（空列表表示车是空的）。
+
+    ★ 里程碑 15 阶段 4：field 从商品 id 换成了规格 id。
+      无规格商品一一对应，所以这个函数的返回值在【数量】上和以前一样，
+      只是数字的含义变了。
+    """
     out = redis_cmd("HKEYS", f"mall:cart:{member_id}")
     return sorted(int(x) for x in out) if out else []
 
 
-def cart_qty(member_id, pid):
-    out = redis_cmd("HGET", f"mall:cart:{member_id}", str(pid))
+def cart_qty(member_id, sku_id):
+    out = redis_cmd("HGET", f"mall:cart:{member_id}", str(sku_id))
     return int(out[0]) if out else 0
 
 
@@ -190,6 +213,11 @@ def register(tag):
     return d["token"], d["id"]
 
 
+def scalar(sql, default=None):
+    rows = run_sql(sql)
+    return rows[0][0] if rows else default
+
+
 def cleanup():
     # ★ 顺序：晒图 → 评价 → 明细 → 订单 → 地址 → 会员。
     #   虽然没加外键（故意不加），但按这个顺序删读起来最清楚。
@@ -210,6 +238,9 @@ def cleanup():
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE a FROM member_address a "
             f"JOIN member m ON m.id = a.member_id WHERE m.username LIKE '{PREFIX}%'")
+    # ★ 里程碑 15：product_sku 同样【没有外键】，所以它也必须排在商品之前。
+    run_sql(f"DELETE FROM product_sku WHERE product_id IN "
+            f"(SELECT id FROM product WHERE name LIKE '{PREFIX}%')")
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
     run_sql(f"DELETE FROM member WHERE username LIKE '{PREFIX}%'")
 
@@ -222,13 +253,18 @@ def cleanup_redis():
 
 
 def create_product(name, price, stock, status=1):
+    # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
+    # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
     st, r = call("POST", "/admin/products", {
-        "categoryId": CATEGORY_ID, "name": name, "price": price,
-        "stock": stock, "status": status,
+        "categoryId": CATEGORY_ID, "name": name, "status": status,
+        "specSchema": [],
+        "skus": [{"specs": [], "price": price, "stock": stock}],
     }, token=ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
-    return r["data"]
+    # ★ 里程碑 15 阶段 4：返回的是【SKU id】—— 下单、扣库存、购物车
+    #   现在全都按规格走。需要商品 id 的地方显式写 pid_of_sku(...)。
+    return default_sku_of(r["data"])
 
 
 def create_address(token, receiver, phone, region, detail):
@@ -250,24 +286,24 @@ def key_for(tag):
     return f"k{RUN}{tag}"
 
 
-def buy_now(token, pid, qty, address_id, idem_key, remark=None):
-    body = {"productId": pid, "quantity": qty,
+def buy_now(token, sku_id, qty, address_id, idem_key, remark=None):
+    body = {"skuId": sku_id, "quantity": qty,
             "addressId": address_id, "idempotencyKey": idem_key}
     if remark is not None:
         body["remark"] = remark
     return call("POST", "/shop/orders/buy-now", body, token=token)
 
 
-def cart_order(token, product_ids, address_id, idem_key, remark=None):
-    body = {"productIds": product_ids,
+def cart_order(token, sku_ids, address_id, idem_key, remark=None):
+    body = {"skuIds": sku_ids,
             "addressId": address_id, "idempotencyKey": idem_key}
     if remark is not None:
         body["remark"] = remark
     return call("POST", "/shop/orders", body, token=token)
 
 
-def cart_add(token, pid, qty):
-    return call("POST", "/shop/cart/items", {"productId": pid, "quantity": qty},
+def cart_add(token, sku_id, qty):
+    return call("POST", "/shop/cart/items", {"skuId": sku_id, "quantity": qty},
                 token=token)
 
 
@@ -304,9 +340,9 @@ def main():
     section("1. ★ 订单接口必须登录（路径没被排除出拦截器）")
 
     for method, path, body in [
-        ("POST", "/shop/orders", {"productIds": [1], "addressId": 1,
+        ("POST", "/shop/orders", {"skuIds": [1], "addressId": 1,
                                   "idempotencyKey": "anonkey12345678"}),
-        ("POST", "/shop/orders/buy-now", {"productId": 1, "quantity": 1,
+        ("POST", "/shop/orders/buy-now", {"skuId": 1, "quantity": 1,
                                           "addressId": 1,
                                           "idempotencyKey": "anonkey12345678"}),
     ]:
@@ -326,17 +362,17 @@ def main():
     section("2. 参数校验")
 
     cases = [
-        ({"productIds": [p1], "addressId": addr_a}, "不传幂等键"),
-        ({"productIds": [p1], "idempotencyKey": key_for("v1")}, "不传收货地址"),
-        ({"productIds": [], "addressId": addr_a, "idempotencyKey": key_for("v2")}, "商品列表为空"),
+        ({"skuIds": [p1], "addressId": addr_a}, "不传幂等键"),
+        ({"skuIds": [p1], "idempotencyKey": key_for("v1")}, "不传收货地址"),
+        ({"skuIds": [], "addressId": addr_a, "idempotencyKey": key_for("v2")}, "规格列表为空"),
         ({"addressId": addr_a, "idempotencyKey": key_for("v3")}, "不传商品列表"),
-        ({"productIds": [p1], "addressId": addr_a, "idempotencyKey": "短"},
+        ({"skuIds": [p1], "addressId": addr_a, "idempotencyKey": "短"},
          "幂等键太短（<8）"),
-        ({"productIds": [p1], "addressId": addr_a, "idempotencyKey": "有中文的键啊啊啊"},
+        ({"skuIds": [p1], "addressId": addr_a, "idempotencyKey": "有中文的键啊啊啊"},
          "幂等键含非法字符"),
-        ({"productIds": [p1], "addressId": addr_a, "idempotencyKey": "k" * 65},
+        ({"skuIds": [p1], "addressId": addr_a, "idempotencyKey": "k" * 65},
          "幂等键超 64 位"),
-        ({"productIds": [p1], "addressId": addr_a, "idempotencyKey": key_for("v4"),
+        ({"skuIds": [p1], "addressId": addr_a, "idempotencyKey": key_for("v4"),
           "remark": "备" * 256}, "备注超 255 字"),
     ]
     for body, desc in cases:
@@ -696,7 +732,7 @@ def main():
 
     p_off = create_product(f"{PREFIX}待下架", 66.00, 100)
     cart_add(TOKEN_A, p_off, 1)
-    set_status(p_off, 0)     # 加完购物车之后再下架
+    set_status(pid_of_sku(p_off), 0)     # 加完购物车之后再下架
 
     st, r = cart_order(TOKEN_A, [p_off], addr_a, key_for("offline"))
     check("★★ 结算已下架的商品 → 业务码 1003",

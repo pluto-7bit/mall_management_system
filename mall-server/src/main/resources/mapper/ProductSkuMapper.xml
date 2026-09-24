@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  namespace 必须写 Mapper 接口的全限定名，MyBatis 靠它绑定 XML 和接口，
+  然后按「标签 id == 接口方法名」配对。写错了启动就报 Invalid bound statement。
+-->
+<mapper namespace="com.example.mall.mapper.ProductSkuMapper">
+
+    <!--
+      ============================================================
+       ★ 这张表的写操作【故意】很窄，只有五条：
+         insert / updatePriceStock / deleteByIds / decreaseSkuStock / increaseSkuStock。
+         这里【没有】通用的 updateById，那是刻意的，不是还没写。
+      ============================================================
+
+      通用版 updateById 会把 spec_json 也变成「可以改的字段」，
+      而 spec_json 是这一行的【身份】—— 它和 product_id 一起构成唯一索引
+      uk_product_spec，是「这是哪个规格」的答案。
+
+      允许原地改 spec_json，就等于允许把「黑色 128G」这一行改成「白色 256G」：
+        · 那两行本来是两个不同的商品规格，各自可能已经被订单引用着
+          （order_item.sku_id 指着这一行）
+        · 改完之后，历史订单会说「用户买的是白色 256G」，
+          而他当时买的是黑色 128G —— 快照被就地篡改了
+
+      【换规格 = 插一条新的 + 删一条旧的】，正如下面 replaceSkus 的做法。
+      窄语句本身就是文档：它让「不该发生的事」写不出来。
+    -->
+
+    <!--
+      查一个商品下的全部 SKU。
+
+      ★ 按 id 排序而不是按 price 排序：id 是插入顺序，
+        也就是「组合被创建出来的顺序」，它是稳定的。
+        按 price 排的话，管理员改一次价格，列表顺序就跳一次 ——
+        编辑到一半的表格自己重排，是最容易被当成「页面坏了」的那种 bug。
+        真正的展示顺序在 product.spec_schema 里，不在这个查询里。
+
+      ⚠️ 这个方法【不过滤库存为 0 的 SKU】。缺货的规格必须能被看见
+        （前端要把它标灰、要能说清楚「这个规格缺货」），
+        而不是让它从列表里消失 —— 消失的规格看起来像「不存在」。
+    -->
+    <select id="selectByProductId" resultType="ProductSku">
+        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        FROM product_sku
+        WHERE product_id = #{productId}
+        ORDER BY id
+    </select>
+
+    <!-- 按主键查一行 SKU。查不到返回 null，由 Service 决定怎么处理 -->
+    <select id="selectById" resultType="ProductSku">
+        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        FROM product_sku
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      按一组主键批量查 SKU（★ 里程碑 15 阶段 3，给购物车用）。
+
+      <foreach> 的属性含义见 ProductMapper.xml 里 selectShopByIds 上面那段。
+      参数用了 @Param("ids")，所以 collection 写 ids。
+
+      ★★ 注意这条 SQL 【没有 JOIN product、也没有 status 条件】——
+        这是刻意的，而且理由不是「省一次 join」：
+
+        「用户端只能看下架商品之外的东西」是一条【安全规则】，
+        而它现在只写在【一个地方】：ProductMapper 的 shop* 那一组
+        （WHERE p.status = 1）。如果这里也 JOIN 一次 product 加上那个条件，
+        同一条规则就有了两处定义，而它们迟早会分叉 ——
+        分叉的表现是「购物车里显示得出来、一点结算就说商品不存在」。
+
+        Service 拿到这里的行之后，去 ProductMapper.selectShopByIds 查它们的商品，
+        【查不到商品的那些就是不可买的】。差集就是购物车的「失效商品」。
+
+      ★ 不加 ORDER BY：顺序由调用方在 Java 里决定（购物车按加入时间排）。
+        让 SQL 少做点事 —— 「展现顺序」这类需求改得勤，改 Java 比改 SQL 省事。
+
+      ⚠️ 调用方必须保证 ids 非空，理由同 deleteByIds 的注释：空的 IN () 是语法错误。
+    -->
+    <select id="selectByIds" resultType="ProductSku">
+        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        FROM product_sku
+        WHERE id IN
+        <foreach collection="ids" item="sid" open="(" close=")" separator=",">
+            #{sid}
+        </foreach>
+    </select>
+
+    <!--
+      新增一行 SKU。
+
+      useGeneratedKeys + keyProperty 把自增主键回填到入参对象的 id 上，
+      所以 Service 调完 insert 就能拿到新行的 id，不用再查一次。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO product_sku (product_id, spec_json, price, stock)
+        VALUES (#{productId}, #{specJson}, #{price}, #{stock})
+    </insert>
+
+    <!--
+      改一行的价格和库存。
+
+      ★ 只有这两列能改，而且【只能按 id 改】——
+        因为这是管理员在规格矩阵里编辑已有的一行，不是「换一个规格」。
+        见文件开头那段：spec_json 是身份，不参与更新。
+    -->
+    <update id="updatePriceStock">
+        UPDATE product_sku
+        SET price = #{price}, stock = #{stock}
+        WHERE id = #{id}
+    </update>
+
+    <!--
+      按 id 批量删除。
+
+      ⚠️ 调用方必须保证 ids 非空。空集合会拼出 IN ()，
+        那是一个 SQL 语法错误 —— MyBatis 不会替我们跳过
+        （<foreach> 没有「一个都没有就整体不生成」的语义，那是 <if> 的活）。
+        Service 里那行 `if (ids.isEmpty()) { return; }` 不是优化，是必需。
+
+      ⚠️ 删 SKU 行不会报「这行被订单引用着」—— 全库零外键，
+        数据库不会拦。被删掉的 SKU 在历史 order_item.sku_id 里会变成
+        一个悬空的 id，而取消那张订单时 increaseSkuStock 会更新 0 行、
+        只打一条 warn 日志。这是【已知取舍】，和商品被硬删是同一个后果。
+    -->
+    <delete id="deleteByIds">
+        DELETE FROM product_sku
+        WHERE id IN
+        <foreach collection="ids" item="id" open="(" close=")" separator=",">
+            #{id}
+        </foreach>
+    </delete>
+
+    <!--
+      删掉一个商品下的全部 SKU。
+
+      给 ProductServiceImpl.delete 的五级级联用，必须排在 DELETE FROM product 之前：
+      全库零外键，顺序错了不报错，只会留下一批查不到也删不掉的孤儿行。
+    -->
+    <delete id="deleteByProductId">
+        DELETE FROM product_sku
+        WHERE product_id = #{productId}
+    </delete>
+
+    <!--
+      ★★ 扣库存：本项目里防超卖的唯一一道真正的防线。
+
+      ★ 里程碑 15 阶段 4 从 ProductMapper.xml 整段搬过来。
+        下面每个字都还是原来的字，唯一变的是 FROM 后面那张表：
+        product → product_sku。论证的对象从「商品行」换成了「SKU 行」，
+        而理由对两者完全一样 —— 所以一个字都不用改。
+
+      看这条 SQL 的 WHERE 有两个条件，缺一不可：
+
+        id = #{id}            →  扣哪一行
+        stock >= #{quantity}  →  ★ 只在这个条件成立时才扣
+
+      第二个条件是全部关键。InnoDB 执行 UPDATE 时会给这一行加排他锁，
+      「检查 stock >= ?」和「stock = stock - ?」在同一次加锁中完成，
+      中间没有任何缝隙可以让别人插进来。
+
+      所以调用方不需要（也不应该）先 SELECT 一次库存再判断 ——
+      那样反而会引入竞态。**影响行数就是答案**：
+        1 行 = 扣减成功
+        0 行 = 库存不够，什么都没改，调用方抛「库存不足」
+
+      ★ 顺带说一个写法上的细节：stock = stock - #{quantity}
+        不是 stock = #{newStock}。
+        后者要求 Java 先算出"扣完是多少"，那又变成了"先查后改"——
+        查到的旧值和 UPDATE 时的真实值可能已经不一样了。
+        **让数据库基于它当下的值去算，才是安全的**
+        （这也是 SQL 里的 i++ 和 i = i + 1 之争的同一个问题）。
+
+      ⚠️ 这里【没有】status = 1 条件，是刻意的：
+        下架判定放在 Service 里做（下单前会批量查一次上架商品）。
+        如果这里也加上，那么「影响 0 行」就有两种原因
+        （库存不够 / 已下架），调用方无法区分该报哪个错。
+        这类"把判断集中在能给出好错误信息的那一层"是个常见取舍。
+        ★ 阶段 4 之后这一条更微妙：product_sku 表上【根本没有 status 列】，
+          「能不能买」仍然只由 product.status 定义 —— 所以想加也加不了。
+    -->
+    <update id="decreaseSkuStock">
+        UPDATE product_sku
+        SET stock = stock - #{quantity}
+        WHERE id = #{id}
+          AND stock >= #{quantity}
+    </update>
+
+    <!--
+      归还库存（取消订单 / 订单超时自动取消时用）。
+
+      ★ 同样是从 ProductMapper.xml 整段搬过来的，只换了表名。
+
+      ★★ 注意这里【故意没有】任何附加条件 —— 不要为了和 decreaseSkuStock
+         对称而加上 `AND product_id = ?` 或者 `AND stock >= 0` 之类的东西。
+
+         扣减要 AND stock >= #{quantity}，是因为它有一个前置条件要守：
+         「库存够不够」。归还【没有】前置条件：库存是多少都能还，
+         商品已下架也照样要还（东西本来就没发出去，凭什么不还）。
+
+         更要紧的是：归还走的是「订单取消」这条【出错路径】。
+         在出错路径上多加一个判断，就多一种「连取消都取消不掉」的可能 ——
+         订单卡在待付款、库存永远占着、用户还看得见自己的订单。
+         **条件越少，越不容易在异常路径上卡住。**
+
+      同样地，stock = stock + #{quantity} 不是 stock = #{newStock}：
+      让数据库基于它当下的值去算，不要用 Java 里查到的旧值去算。
+
+      ⚠️ 影响 0 行不算错误。两种情况下会 0 行，而且两种都是【正常形态】：
+        1. SKU 已被硬删（order_item 故意没有外键）—— 和商品被硬删同一个后果
+        2. id 传进来就是 NULL —— 历史订单的 order_item.sku_id 本来就可空
+           （里程碑 13 之前下的单、以及商品已被硬删的孤儿明细都填不出真值）
+           ★ 注意 `WHERE id = NULL` 在 SQL 里【永远匹配不到任何行】——
+             NULL 的相等比较结果是 UNKNOWN 而不是 TRUE。
+             所以这里不需要 `id IS NULL` 的特判，0 行本身就是答案。
+         调用方记一条 warn 就继续，不能因此让取消失败。
+    -->
+    <update id="increaseSkuStock">
+        UPDATE product_sku
+        SET stock = stock + #{quantity}
+        WHERE id = #{id}
+    </update>
+
+</mapper>

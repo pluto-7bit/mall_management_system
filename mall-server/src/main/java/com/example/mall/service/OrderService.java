@@ -20,7 +20,7 @@ import com.example.mall.vo.OrderVO;
  *       两个用户同时买最后一件商品，是必然发生的事，不是"万一"。
  *       「先查库存再扣」这种写法平时看着好好的，
  *       一到真实并发就会超卖 —— 而且超卖是**已经发货了才发现**，
- *       损失是真的钱。见 {@code ProductMapper.decreaseStock}。</li>
+ *       损失是真的钱。见 {@code ProductSkuMapper.decreaseSkuStock}。</li>
  *
  *   <li><b>用户会重复点。</b>
  *       网络卡了、手抖了、浏览器刷新了，用户都会再点一次提交。

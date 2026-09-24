@@ -266,15 +266,8 @@ function goShopping() {
 
 /*
  * ★ 里程碑 10：本地的 formatAmount 已经删掉，改成从 utils/format.js import。
- *
- *   这个函数上一个版本就写明了判据：「三份重复已经到临界点了 ——
- *   如果出现第四处，就该把它提到 utils/ 里去了。」
- *   「我的订单」页（Orders.vue）就是第四处，所以提了。
- *
- *   为什么这次的改动范围【只到这里】：{@code Cart.vue:164} 的那份
- *   内联在 selectedAmount 这个 computed 里、{@code Checkout.vue:422}
- *   的在钱最容易出错的一页上 —— 动它们属于「顺手改掉别人依赖的东西」，
- *   要单独一轮再做。理由完整写在 utils/format.js 的开头。
+ *   里程碑 14 又把购物车和结算页那两份也收了 —— mall-shop 只剩那一份实现。
+ *   当初为什么只改到这里、那笔账后来是怎么还的，完整写在 utils/format.js 的开头。
  */
 
 onMounted(() => load())
@@ -337,6 +330,26 @@ onBeforeUnmount(stopCountdown)
           <ul class="item-list">
             <li v-for="(it, i) in order.items" :key="i" class="item-row">
               <span class="item-name">{{ it.productName }}</span>
+              <!--
+                ★ 规格文本（{@code sku_spec} 的快照）。里程碑 15 阶段 5 补上。
+
+                ★ 为什么收银台【也】要显示它：和 {@code Orders.vue} 同一个理由 ——
+                  下单时同一件商品可能占了两行明细（「黑色」和「白色」），
+                  只显示商品名的话这两行长得一模一样，用户看着
+                  ¥9.90 × 1 和 ¥39.80 × 2 两行，<b>没法确定哪一行是自己选的哪个规格</b>，
+                  而这一页正是他按下「立即支付」之前最后能核对的地方。
+
+                ⚠️ 位置和 Orders.vue 不同：这里放在 {@code .item-name} 的<b>外面</b>。
+                  因为这一页的 .item-name 是 nowrap + ellipsis 的，
+                  嵌进去的话长商品名会把规格一起截掉 —— 而规格恰恰是这一行
+                  唯一能和相邻那行区分开的信息。**截断必须截在次要信息上。**
+
+                ⚠️ 判断用宽松真值：{@code sku_spec} 是 NOT NULL DEFAULT ''，
+                  无规格商品和历史订单都是空串（显示空串等于不显示）。
+                  同一个对象里 {@code it.skuId} 却是【可能整个 key 消失】的 ——
+                  两者的 null 规则不同，别顺手写成 === null。
+              -->
+              <span v-if="it.skuSpec" class="item-spec">{{ it.skuSpec }}</span>
               <span class="item-qty">× {{ it.quantity }}</span>
               <span class="item-sub">¥{{ formatAmount(it.subtotal) }}</span>
             </li>
@@ -612,6 +625,17 @@ onBeforeUnmount(stopCountdown)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/*
+  ★ 规格。flex: none 是必须的：默认值 flex-shrink: 1 会让它在商品名
+    被挤的时候跟着收缩，而规格比名字重要（见上面模板里的注释）。
+    写死不让它缩，宁可让本来就带省略号的商品名先短。
+*/
+.item-spec {
+  flex: none;
+  font-size: 12px;
+  color: #909399;
 }
 
 .item-qty {

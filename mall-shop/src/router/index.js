@@ -73,8 +73,12 @@ const routes = [
     // 确认订单页。
     //
     // ★ 只有【一个】路由，但服务两种下单来源，靠 query 参数区分：
-    //     /checkout?ids=3,7                 购物车结算
-    //     /checkout?productId=5&quantity=2  立即购买
+    //     /checkout?ids=204,311             购物车结算
+    //     /checkout?skuId=204&quantity=2    立即购买
+    //
+    //   ⚠️ 里程碑 15 阶段 4：这两组参数里的数字都从商品 id 换成了规格 id。
+    //      参数名 {@code ids} 没改（它本来就是中性的），
+    //      但 {@code productId} 换成了 {@code skuId}。
     //
     //   为什么不拆成两个页面？因为两个页面的界面几乎完全一样，
     //   差别只有"商品从哪来"和"提交时调哪个接口"两处。

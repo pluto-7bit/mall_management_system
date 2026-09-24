@@ -1,17 +1,17 @@
 package com.example.mall.service.impl;
 
 import com.example.mall.common.BusinessException;
+import com.example.mall.common.BusinessRules;
 import com.example.mall.common.LoginUser;
 import com.example.mall.common.ResultCode;
 import com.example.mall.common.UserContext;
 import com.example.mall.dto.CartAddDTO;
 import com.example.mall.dto.CartQuantityDTO;
-import com.example.mall.mapper.ProductMapper;
 import com.example.mall.service.CartService;
+import com.example.mall.service.ShopSkuService;
 import com.example.mall.vo.CartItemVO;
 import com.example.mall.vo.CartVO;
-import com.example.mall.vo.ShopProductDetailVO;
-import com.example.mall.vo.ShopProductVO;
+import com.example.mall.vo.ShopSkuVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.HashOperations;
@@ -34,13 +34,13 @@ import java.util.Map;
  *
  * <pre>
  *   key    mall:cart:1          ← 会员 id = 1 的购物车
- *   field  "5"                  ← 商品 id（字符串）
+ *   field  "204"                ← skuId（字符串）★ 里程碑 15 阶段 4 前是 productId
  *   value  "3"                  ← 数量
  *
  *   用 redis-cli 看：
  *     HGETALL mall:cart:1
- *     1) "5"    2) "3"
- *     3) "7"    4) "1"
+ *     1) "204"  2) "3"
+ *     3) "311"  4) "1"          ← 同一件商品的两个规格，两行
  * </pre>
  *
  * <p>为什么是 Hash 而不是「一个 key 一个商品」（{@code cart:1:5 = 3}）？
@@ -65,9 +65,36 @@ import java.util.Map;
 public class CartServiceImpl implements CartService {
 
     private final StringRedisTemplate redisTemplate;
-    private final ProductMapper productMapper;
+    private final ShopSkuService shopSkuService;
 
-    /** key 前缀。提成常量，避免在六七个方法里各写一遍字符串 */
+    /**
+     * key 前缀。提成常量，避免在六七个方法里各写一遍字符串。
+     *
+     * <h3>⚠️⚠️ 里程碑 15 阶段 4：换 field 的那一天，这里的老数据【必须清掉】</h3>
+     *
+     * <p>field 从 productId 换成 skuId 是一次<b>语义变化</b>，而不是「改了参数名」。
+     * 老数据不会报错，它会<b>换个意思继续存在</b>：
+     * <pre>
+     *   Redis 里还躺着 field = "5"（老数据，意思是「商品 5」）
+     *   新的代码读它，理解成「SKU 5」
+     *   → 购物车里出现一件用户从来没加过的商品
+     * </pre>
+     * 而这两张表的 id 都从 1 开始自增，<b>撞车几乎是必然的</b>。
+     *
+     * <p><b>★ 为什么不写个脚本把老数据转换过来？</b>
+     * 因为那需要一张「productId → 该商品的默认 SKU id」的映射，
+     * 而对<b>已被删除的商品</b>和<b>有多规格的商品</b>这个映射是错的 ——
+     * 脚本会静默地改错、或者默默丢掉那些行，
+     * 而这两种结果都不会有任何报错。
+     *
+     * <p>所以处理方式是：<b>一次性的 {@code KEYS mall:cart:*} 看一眼条数 → {@code DEL}</b>。
+     * 代价是所有用户丢一次购物车；收益是<b>没有一行数据带着错误的意思活着</b>。
+     * 购物车本来就是「临时意图」（见 {@code CartService} 的类注释），
+     * 丢了重新加就是 —— 这也正是它敢放 Redis 的同一个理由。
+     *
+     * <p>⚠️ 日常运营里 {@code KEYS} 是禁用命令（会阻塞整个 Redis），
+     * 这里是<b>一次性的人工操作</b>，不是代码。别把这段抄进任何定时任务。
+     */
     private static final String KEY_PREFIX = "mall:cart:";
 
     /**
@@ -94,37 +121,54 @@ public class CartServiceImpl implements CartService {
     private static final Duration CART_TTL = Duration.ofDays(30);
 
     /**
-     * 单个商品在购物车里的数量上限。
+     * 单个规格在购物车里的数量上限。
      *
-     * <p><b>★ 这个数字只在这里定义一次，这就是刻意的。</b>
+     * <p><b>★ 里程碑 15 阶段 4：这个私有副本【已经删掉了】，
+     * 现在用的是 {@link BusinessRules#MAX_QUANTITY_PER_ITEM}。</b>
      *
-     * <p>最初 {@code CartAddDTO} 和 {@code CartQuantityDTO} 上也各写了
-     * 一个 {@code @Max(99)}，看起来是「双重保险」，实际有两个坏处：
-     * <pre>
-     *   1. 「最多买 99 件」这条规则有了三个出处。哪天运营说改成 50，
-     *      改了两个漏了一个，就出现「加不进去但改得上去」的矛盾现象
-     *   2. 更要命的是，DTO 上的 @Max 会在【参数绑定阶段】就把请求拒掉，
-     *      于是这里判 99 上限的代码永远执行不到 —— 变成死代码。
-     *      读代码的人会以为它在生效，实际上它在骗人
-     * </pre>
+     * <p>它本来在这里的理由写得很足（「只定义一次」「DTO 上那两个 @Max 让
+     * 这段变成死代码」），也确实把 DTO 上那两份收掉了 ——
+     * <b>但它自己没走</b>。于是从里程碑 7 到 15，
+     * 「最多买几件」在 Service 层一直是两份：这里一份、
+     * {@code BusinessRules} 里一份，两个值都是 99。
      *
-     * <p>现在的分工：DTO 只做协议层的合理性检查（不为空、是正数、
-     * 不是 999999999 这种明显乱填的），业务上限一律由这里说了算。
+     * <p><b>★ 两个值恰好相等，所以没有任何测试能发现它。</b>
+     * 这正是「同一规则两处定义」最阴的形态 ——
+     * 值不等的话早就有人撞上去了，值相等的话它可以一直错下去，
+     * 而两份注释都写着「只有一处」。
      *
-     * <p><b>为什么这个上限必须放在 Service 而不是 DTO？</b>
-     * 三个理由，缺一不可：
+     * <p>为什么会变成两份？因为里程碑 8 的订单模块也要用这个数字，
+     * 而它不该去引用购物车的私有常量（方向反了），
+     * 于是那个数字被提到了 {@code BusinessRules} ——
+     * <b>提上去的那一刻，这里就应该被删掉，但没有。</b>
+     * 「提取一个共用的常量」这个动作里，最容易被忘掉的一步是<b>删掉原来的那份</b>。
+     *
+     * <p>所以现在这里没有常量了，直接用 {@code BusinessRules} 里那一个。
+     * 「上限只有一个出处」这句话，到此才真的成立。
+     */
+    // ★ 这里本来有一个 private static final int MAX_QUANTITY_PER_ITEM = 99;（已删除，见上）
+
+    /**
+     * 算出「这个规格这次最多能买多少件」= min(业务上限, 该规格库存)。
+     *
+     * <p><b>为什么这条规则必须留在 Service 而不是 DTO？</b>三个理由，缺一不可：
      * <ul>
      *   <li>DTO 只拦得住「单次请求传了 500」，拦不住「传两次 60」——
      *       上限要基于<b>累加后</b>的总数判断</li>
-     *   <li>它还得和<b>库存</b>取最小值（{@code Math.min}），
-     *       而库存要查库才知道，DTO 里根本拿不到</li>
+     *   <li>它还得和<b>库存</b>取最小值，而库存要查库才知道，DTO 里根本拿不到</li>
      *   <li>绕过页面直接调接口的请求，走的也是这里</li>
      * </ul>
      *
      * <p><b>DTO 校验是给用户看的友好提示，Service 里的校验才是真的规则。</b>
      * 两者都要有，但管的不是同一件事。
+     *
+     * <p>★ 里程碑 15 阶段 4 顺手把「取 min」这一步也收进了这个方法：
+     * 加购和改数量原来各写了一遍 {@code Math.min(99, stock)}，
+     * 两处都对着同一份库存语义 —— 今天它们一致，但要改的时候就未必了。
      */
-    private static final int MAX_QUANTITY_PER_ITEM = 99;
+    private int quantityLimit(int skuStock) {
+        return Math.min(BusinessRules.MAX_QUANTITY_PER_ITEM, skuStock);
+    }
 
     // ==========================================================================
     // 写操作
@@ -133,15 +177,22 @@ public class CartServiceImpl implements CartService {
     @Override
     public void add(CartAddDTO dto) {
         Long memberId = currentMemberId();
-        Long productId = dto.getProductId();
+        Long skuId = dto.getSkuId();
 
-        // ① 先确认这个商品真的能买。
-        //    这一步查的是 MySQL（有 status = 1 的过滤），
-        //    所以「往购物车里塞一个不存在的商品 id」是做不到的
-        ShopProductDetailVO product = requireAvailableProduct(productId);
+        // ① 先确认这个规格真的能买。
+        //    这一步查的是 MySQL —— getAvailable 内部会查 SKU 行、
+        //    再用商品那条带 status = 1 的查询确认它所属商品在架上，
+        //    所以「往购物车里塞一个不存在的 skuId」是做不到的。
+        //
+        //    ★ 这个判断在阶段 4 之前叫 requireAvailableProduct，
+        //      是【这个类】的私有方法。搬到 ShopSkuServiceImpl 是因为
+        //      它现在有三个调用者：加购、改数量、以及 GET /shop/skus/{id}。
+        //      留在这里的话，另外两个地方就得各抄一份 ——
+        //      「什么算可买」这条规则会变成三份。
+        ShopSkuVO sku = shopSkuService.getAvailable(skuId);
 
         String key = cartKey(memberId);
-        String field = String.valueOf(productId);
+        String field = String.valueOf(skuId);
 
         // ② ★ 用 HINCRBY 原子累加，而不是「先 HGET 读出来，加一下，再 HSET 写回去」。
         //
@@ -163,7 +214,7 @@ public class CartServiceImpl implements CartService {
         // ③ 累加之后才判断上限。顺序反过来（先读、判断、再写）就又回到竞态了。
         //    所以宁可「先写下去，发现超了再改回来」——
         //    这样即使并发，最终值也是被修正过的
-        int limit = Math.min(MAX_QUANTITY_PER_ITEM, product.getStock());
+        int limit = quantityLimit(sku.getStock());
         if (newQty != null && newQty > limit) {
             // 超过库存时，把数量【压到能买的上限】而不是直接拒绝。
             //
@@ -174,29 +225,29 @@ public class CartServiceImpl implements CartService {
             if (limit <= 0) {
                 // 把刚才 HINCRBY 加上去的数字扣回来，别让非法数量留在车里
                 rollbackIncrement(key, field, dto.getQuantity());
-                throw new BusinessException(ResultCode.STOCK_NOT_ENOUGH, "该商品已售罄");
+                throw new BusinessException(ResultCode.STOCK_NOT_ENOUGH, "该规格已售罄");
             }
             redisTemplate.opsForHash().put(key, field, String.valueOf(limit));
             touch(key);
-            log.info("加购数量超过上限，已压到上限: memberId={}, productId={}, 请求后={}, 上限={}",
-                    memberId, productId, newQty, limit);
+            log.info("加购数量超过上限，已压到上限: memberId={}, skuId={}, 请求后={}, 上限={}",
+                    memberId, skuId, newQty, limit);
             throw new BusinessException(ResultCode.CART_QUANTITY_LIMIT,
                     "最多只能买 " + limit + " 件，已为你调整");
         }
 
         touch(key);
-        log.info("加入购物车: memberId={}, productId={}, +{}, 现在={}", memberId, productId, dto.getQuantity(), newQty);
+        log.info("加入购物车: memberId={}, skuId={}, +{}, 现在={}", memberId, skuId, dto.getQuantity(), newQty);
     }
 
     @Override
-    public void updateQuantity(Long productId, CartQuantityDTO dto) {
+    public void updateQuantity(Long skuId, CartQuantityDTO dto) {
         Long memberId = currentMemberId();
         String key = cartKey(memberId);
-        String field = String.valueOf(productId);
+        String field = String.valueOf(skuId);
 
-        // ★ 先确认这件商品【已经在车里】。
+        // ★ 先确认这个规格【已经在车里】。
         //
-        //   如果不检查，PUT 一个从没加过的商品就会凭空创建一条记录 ——
+        //   如果不检查，PUT 一个从没加过的规格就会凭空创建一条记录 ——
         //   那 PUT 就默默变成了 POST，"改了数量"和"新增商品"混在一起，
         //   接口就没法只靠 URL 和方法表达意图了。
         //
@@ -206,14 +257,17 @@ public class CartServiceImpl implements CartService {
         //     判断一个竞态要不要处理，标准是【后果有多严重】，不是【存不存在】。
         Boolean exists = redisTemplate.opsForHash().hasKey(key, field);
         if (!Boolean.TRUE.equals(exists)) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "购物车里没有这个商品");
+            throw new BusinessException(ResultCode.NOT_FOUND, "购物车里没有这个规格");
         }
 
-        ShopProductDetailVO product = requireAvailableProduct(productId);
+        // ★ 注意改数量也要重新确认「可买」，不能只看 Redis。
+        //   这一行的价格和库存都可能已经变了，而检查的依据必须是
+        //   「数据库里现在是多少」——Redis 里只有数量，没有真相。
+        ShopSkuVO sku = shopSkuService.getAvailable(skuId);
 
-        int limit = Math.min(MAX_QUANTITY_PER_ITEM, product.getStock());
+        int limit = quantityLimit(sku.getStock());
         if (limit <= 0) {
-            throw new BusinessException(ResultCode.STOCK_NOT_ENOUGH, "该商品已售罄");
+            throw new BusinessException(ResultCode.STOCK_NOT_ENOUGH, "该规格已售罄");
         }
         if (dto.getQuantity() > limit) {
             throw new BusinessException(ResultCode.CART_QUANTITY_LIMIT, "最多只能买 " + limit + " 件");
@@ -224,19 +278,19 @@ public class CartServiceImpl implements CartService {
         // 两次同样的请求结果相同，本身是幂等的
         redisTemplate.opsForHash().put(key, field, String.valueOf(dto.getQuantity()));
         touch(key);
-        log.info("修改购物车数量: memberId={}, productId={}, -> {}", memberId, productId, dto.getQuantity());
+        log.info("修改购物车数量: memberId={}, skuId={}, -> {}", memberId, skuId, dto.getQuantity());
     }
 
     @Override
-    public void remove(Long productId) {
+    public void remove(Long skuId) {
         Long memberId = currentMemberId();
         String key = cartKey(memberId);
 
         // ★ 返回值是「实际删掉了几条」，0 表示本来就不在车里。
         //   我们【不】把它当错误 —— 幂等语义，见 CartService.remove 的注释
-        Long removed = redisTemplate.opsForHash().delete(key, String.valueOf(productId));
+        Long removed = redisTemplate.opsForHash().delete(key, String.valueOf(skuId));
         touch(key);
-        log.info("从购物车移除: memberId={}, productId={}, 实际删除={}", memberId, productId, removed);
+        log.info("从购物车移除: memberId={}, skuId={}, 实际删除={}", memberId, skuId, removed);
     }
 
     @Override
@@ -279,24 +333,24 @@ public class CartServiceImpl implements CartService {
             return vo;
         }
 
-        // 把 field（商品 id）转成 Long。
+        // 把 field（skuId）转成 Long。
         // ★ 这里用了 LinkedHashMap 保留 Redis 返回的顺序 ——
         //   注意这只是「尽量」，Redis 不保证 Hash 的顺序稳定
         //   （元素少时用 listpack 编码恰好有序，元素多了会变成 hashtable 就无序了）。
         //   所以下面会显式排序，不依赖这个顺序。
         Map<Long, Integer> cartMap = new LinkedHashMap<>();
         for (Map.Entry<Object, Object> e : raw.entrySet()) {
-            Long pid = parseLongOrNull(e.getKey());
+            Long sid = parseLongOrNull(e.getKey());
             Integer qty = parseIntOrNull(e.getValue());
             // Redis 里理论上不会出现脏数据（只有本类会写它），
             // 但「理论上不会」和「一定不会」是两回事。
             // 读到无法解析的值时跳过并记一条 warn，别让整个购物车打不开
-            if (pid == null || qty == null || qty <= 0) {
+            if (sid == null || qty == null || qty <= 0) {
                 log.warn("购物车里有无法解析的记录，已跳过: memberId={}, key={}, field={}, value={}",
                         memberId, key, e.getKey(), e.getValue());
                 continue;
             }
-            cartMap.put(pid, qty);
+            cartMap.put(sid, qty);
         }
 
         if (cartMap.isEmpty()) {
@@ -306,11 +360,20 @@ public class CartServiceImpl implements CartService {
             return vo;
         }
 
-        // 一条 SQL 把所有商品捞出来，而不是循环查（N+1 查询）
-        List<ShopProductVO> products = productMapper.selectShopByIds(new ArrayList<>(cartMap.keySet()));
-        Map<Long, ShopProductVO> productMap = new HashMap<>();
-        for (ShopProductVO p : products) {
-            productMap.put(p.getId(), p);
+        // ★ 两条 SQL 把所有 SKU 连同它们的商品、规格定义一次捞出来，不是循环查。
+        //
+        //   阶段 4 之前这里是一句 productMapper.selectShopByIds(...)，
+        //   现在换成 shopSkuService.listAvailable(...) —— 它内部就是
+        //   原来那条 SQL 加一次「按 productId 查商品」和一次「查 spec_schema」，
+        //   仍然是常数条（3 条），和车里有多少件无关。
+        //
+        //   ★ 它【只返回可买的】，不可买的那些不会出现在结果里 ——
+        //     所以下面用「在 cartMap 里但不在 skuMap 里」当失效判据。
+        //     这个「差集 = 失效」的设计是阶段 3 就定下来的，见 ShopSkuVO 的注释。
+        List<ShopSkuVO> skus = shopSkuService.listAvailable(new ArrayList<>(cartMap.keySet()));
+        Map<Long, ShopSkuVO> skuMap = new HashMap<>();
+        for (ShopSkuVO s : skus) {
+            skuMap.put(s.getId(), s);
         }
 
         List<CartItemVO> items = new ArrayList<>();
@@ -318,17 +381,19 @@ public class CartServiceImpl implements CartService {
         BigDecimal totalAmount = BigDecimal.ZERO;
 
         for (Map.Entry<Long, Integer> e : cartMap.entrySet()) {
-            Long pid = e.getKey();
+            Long sid = e.getKey();
             Integer qty = e.getValue();
 
             CartItemVO item = new CartItemVO();
-            item.setProductId(pid);
+            item.setSkuId(sid);
             item.setQuantity(qty);
 
-            ShopProductVO p = productMap.get(pid);
-            if (p == null) {
-                // ★★ 这就是「购物车里有，但商品表里查不到」的情况 ——
-                //    商品下架了或者被删了。
+            ShopSkuVO s = skuMap.get(sid);
+            if (s == null) {
+                // ★★ 这就是「购物车里有，但查不出可买的 SKU」的情况 ——
+                //    两种原因，而这里【刻意不区分】：
+                //      · 商品下架了或者被删了（product.status ≠ 1）
+                //      · 这个 SKU 行本身被删了（管理员改了规格定义）
                 //
                 //    这是购物车功能【必然会遇到】的场景，不是异常情况：
                 //    运营下架一个商品，所有把它加进购物车的用户都会进入这个分支。
@@ -340,37 +405,51 @@ public class CartServiceImpl implements CartService {
                 //      - 更糟的是，如果用户加购后一直在等降价，
                 //        东西悄悄消失了他根本不知道发生过什么
                 //    显示成灰色的「已失效」并告诉他原因，用户才知道该怎么办。
+                //
+                //    ⚠️ 这一行上【只有 skuId 和 quantity】有值，
+                //       商品 id、名称、价格、规格文本全是 null。
+                //       理由（不为它另开一条绕过 status = 1 的查询）见
+                //       CartItemVO.specText 的注释。
                 item.setAvailable(false);
                 item.setUnavailableReason("商品已下架");
                 items.add(item);
                 continue;
             }
 
-            item.setName(p.getName());
-            item.setPrice(p.getPrice());
-            item.setCover(p.getCover());
-            item.setCategoryName(p.getCategoryName());
-            item.setStock(p.getStock());
+            // ★ 下面这一段的每个字段都换了个来源：
+            //   阶段 4 之前从 ShopProductVO 取（商品级），现在从 ShopSkuVO 取（规格级）。
+            //   价格和库存的唯一真源是 product_sku，商品级那两个数已经不存在了。
+            item.setProductId(s.getProductId());
+            item.setSpecText(s.getSpecText());
+            item.setName(s.getProductName());
+            item.setPrice(s.getPrice());
+            item.setCover(s.getCover());
+            item.setCategoryName(s.getCategoryName());
+            item.setStock(s.getStock());
 
-            if (p.getStock() <= 0) {
-                // 商品还在，但卖光了。
+            if (s.getStock() <= 0) {
+                // 规格还在，但这一档卖光了。
                 // 注意【保留 price】：用户有权知道自己当初想买的东西多少钱
+                //
+                // ★ 文案从「已售罄」改成「该规格已售罄」不是措辞讲究：
+                //   同一件商品可能别的规格还有货，说「已售罄」会让用户
+                //   以为整件商品都买不了了，直接离开页面。
                 item.setAvailable(false);
-                item.setUnavailableReason("已售罄");
+                item.setUnavailableReason("该规格已售罄");
                 items.add(item);
                 continue;
             }
 
-            if (qty > p.getStock()) {
-                // 商品还在、还有货，但【不够用户加购的数量】。
+            if (qty > s.getStock()) {
+                // 规格还在、还有货，但【不够用户加购的数量】。
                 // 这种情况很常见：用户加了 5 件，然后被别人买走了 3 件。
                 //
                 // 这里刻意【不自动改小数量】—— 那是替用户做决定。
                 // 只标记出来让他自己改，改动权在他手上。
                 item.setAvailable(false);
-                item.setUnavailableReason("库存只剩 " + p.getStock() + " 件");
+                item.setUnavailableReason("库存只剩 " + s.getStock() + " 件");
                 // 小计照算，方便前端展示「原价 × 数量」
-                item.setSubtotal(p.getPrice().multiply(BigDecimal.valueOf(qty)));
+                item.setSubtotal(s.getPrice().multiply(BigDecimal.valueOf(qty)));
                 items.add(item);
                 continue;
             }
@@ -380,7 +459,7 @@ public class CartServiceImpl implements CartService {
             //   用 double 的话 0.1 + 0.2 != 0.3，
             //   购物车里 3 件 0.1 元的商品会算出 0.30000000000000004 元。
             //   钱的计算里出现这种数字是灾难性的 —— 它会一路传到订单、发票、对账
-            item.setSubtotal(p.getPrice().multiply(BigDecimal.valueOf(qty)));
+            item.setSubtotal(s.getPrice().multiply(BigDecimal.valueOf(qty)));
 
             // ★ 只有【能买】的商品才计入合计。
             //   已经售罄/下架的东西不该出现在「你要付多少钱」里
@@ -390,7 +469,7 @@ public class CartServiceImpl implements CartService {
             items.add(item);
         }
 
-        // ★ 显式排序：失效的排后面，然后按商品 id 倒序（新加的在前）。
+        // ★ 显式排序：失效的排后面，然后按 skuId 倒序。
         //
         //   不能依赖 Redis Hash 的返回顺序 —— 那取决于它的内部编码，
         //   元素少的时候恰好有序，多了就变了。依赖它就是依赖一个
@@ -398,9 +477,18 @@ public class CartServiceImpl implements CartService {
         //
         //   「失效的沉到底部」是电商购物车的通行做法：
         //   用户打开购物车是为了结算，能买的必须一眼看到
+        //
+        //   ★ 排序键从 productId 换成了 skuId，这一步是【必须的】而不是顺手：
+        //     失效行的 productId 是 null（商品查不到才失效的），
+        //     拿它排序会直接 NPE；而 skuId 来自 Redis，永远有值。
+        //     ⚠️ 另外原来这里写着「新加的在前」——那是个不准确的说法：
+        //     id 是商品/SKU 被【创建】的顺序，和用户什么时候加进车里无关。
+        //     真实的顺序 Redis 里没有存（Hash 不保序），所以这里只是
+        //     「一个稳定的顺序」，让每次刷新长得一样。
+        //     附带好处：同一件商品的几个规格 id 是连着生成的，会排在一起。
         items.sort(Comparator
                 .comparing(CartItemVO::getAvailable, Comparator.reverseOrder())
-                .thenComparing(CartItemVO::getProductId, Comparator.reverseOrder()));
+                .thenComparing(CartItemVO::getSkuId, Comparator.reverseOrder()));
 
         vo.setItems(items);
         vo.setTotalQuantity(totalQuantity);
@@ -428,18 +516,18 @@ public class CartServiceImpl implements CartService {
     // ==========================================================================
 
     @Override
-    public Map<Long, Integer> readQuantities(List<Long> productIds) {
+    public Map<Long, Integer> readQuantities(List<Long> skuIds) {
         Long memberId = currentMemberId();
         String key = cartKey(memberId);
 
         // ★ 用 HMGET 而不是 HGETALL + 自己筛。
         //
-        //   购物车里可能有 20 种商品，而这次只结算 2 种。
+        //   购物车里可能有 20 种规格，而这次只结算 2 种。
         //   HGETALL 会把 20 种全部拉回应用服务器，再丢掉 18 种 ——
         //   网络传了 10 倍的数据，只为了扔掉 90%。
         //
         //   但 HMGET 需要把 field 转成 String 数组：
-        //     HMGET mall:cart:1 "5" "7"
+        //     HMGET mall:cart:1 "204" "311"
         //   返回按顺序对应的值列表，不存在的 field 返回 null。
         //
         //   ★ 这里有个容易踩的坑：HMGET 返回的顺序【和请求的顺序一一对应】，
@@ -447,9 +535,9 @@ public class CartServiceImpl implements CartService {
         //     但一定要用【同一个数组】去遍历，不能一边按原 list 遍历
         //     一边按返回的 list 取下标 —— 两边顺序一旦不一致就错位了，
         //     而且错位后是把 A 的数量算到 B 头上，金额会出错。
-        List<String> fields = new ArrayList<>(productIds.size());
-        for (Long pid : productIds) {
-            fields.add(String.valueOf(pid));
+        List<String> fields = new ArrayList<>(skuIds.size());
+        for (Long sid : skuIds) {
+            fields.add(String.valueOf(sid));
         }
 
         // ★ 这里用 redisTemplate.<String, String>opsForHash() 显式指定泛型，
@@ -469,15 +557,15 @@ public class CartServiceImpl implements CartService {
             // 值为 null（不在车里）或者数量不合法（数据脏了）都跳过 ——
             // 调用方通过"返回的 key 少了谁"来发现这种情况
             if (qty != null && qty > 0) {
-                result.put(productIds.get(i), qty);
+                result.put(skuIds.get(i), qty);
             }
         }
         return result;
     }
 
     @Override
-    public void removeItems(List<Long> productIds) {
-        if (productIds == null || productIds.isEmpty()) {
+    public void removeItems(List<Long> skuIds) {
+        if (skuIds == null || skuIds.isEmpty()) {
             // 空集合不报错。调用方（下单）会在"没结算任何商品"时
             // 更早地失败，走不到这里；但这个判断留着，
             // 是因为删空集合本身就不是错误操作。
@@ -487,14 +575,22 @@ public class CartServiceImpl implements CartService {
         Long memberId = currentMemberId();
         String key = cartKey(memberId);
 
-        // HDEL 支持一次删多个 field：HDEL mall:cart:1 "5" "7"
+        // HDEL 支持一次删多个 field：HDEL mall:cart:1 "204" "311"
         // 返回真正删掉的数量 —— 如果某个 field 本来就不在，不计入。
         // 所以它天然是幂等的，不需要额外判断。
-        Object[] fields = productIds.stream().map(String::valueOf).toArray();
+        //
+        // ★★ 里程碑 15 阶段 4 的【头号静默风险点】就在这一行。
+        //    它的参数从 productIds 改成了 skuIds，而错误是不会报出来的：
+        //    传一个 productId 进来，HDEL 会去删那个【数字】对应的 field ——
+        //    如果恰好有别的 SKU 用着这个 id，删掉的就是别人的购物车行。
+        //    而且调用它的是订单事务提交后的回调，那里的异常只打日志
+        //    （见 OrderServiceImpl.registerCartCleanupAfterCommit），
+        //    所以症状是「用户的车里少了一件东西」，没有任何报错。
+        Object[] fields = skuIds.stream().map(String::valueOf).toArray();
 
         Long removed = redisTemplate.opsForHash().delete(key, fields);
         log.info("下单后清理购物车: memberId={}, 请求清理={} 件, 实际删除={} 件",
-                memberId, productIds.size(), removed);
+                memberId, skuIds.size(), removed);
 
         // ★ 不调 touch() 刷新过期时间，是刻意的：
         //   下单是"购物车使命完成"的时刻，不是"用户还在逛"的时刻。
@@ -541,33 +637,19 @@ public class CartServiceImpl implements CartService {
         return KEY_PREFIX + memberId;
     }
 
-    /**
-     * 查出一个「现在可以买」的商品，查不到就抛异常。
-     *
-     * <p>用的是 {@code selectShopById}，它内部带了 {@code status = 1} ——
-     * 所以下架的商品在这里就会被拦下，加不进购物车。
-     */
-    private ShopProductDetailVO requireAvailableProduct(Long productId) {
-        if (productId == null || productId < 1) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "商品不存在或已下架");
-        }
-        // 这里复用商品详情的方法，返回的是 ShopProductDetailVO（比列表 VO 多一个
-        // description）。购物车其实用不到 description，多查一列有点浪费。
-        //
-        // ★ 知道这个浪费、并且接受它，比不知道要好。
-        //   为什么不干脆再写一个只查必要列的 SQL？因为「复用已有查询」
-        //   带来的好处（字段增加了自动就有、逻辑只有一处）大于
-        //   「多查一列 description」的代价（几百字节的网络传输）。
-        //   如果哪天商品描述变成几 MB 的大文本，这个判断就要翻过来。
-        //   **优化要针对真实的瓶颈，而不是想象中的浪费。**
-        ShopProductDetailVO product = productMapper.selectShopById(productId);
-        if (product == null) {
-            // 和商品详情接口一样，【不区分】「不存在」和「已下架」——
-            // 区分了就等于告诉外界「这个 id 是存在的」
-            throw new BusinessException(ResultCode.NOT_FOUND, "商品不存在或已下架");
-        }
-        return product;
-    }
+    // ★ 里程碑 15 阶段 4：这里原本有一个 requireAvailableProduct(Long productId)，
+    //   已经【整个方法删除】了 —— 它搬去了 ShopSkuServiceImpl.getAvailable(Long skuId)。
+    //
+    //   搬家的理由不是「这个方法现在更长一点」，而是【它从 1 个调用者变成了 3 个】：
+    //     · CartServiceImpl.add()          → 加购时确认能买
+    //     · CartServiceImpl.updateQuantity() → 改数量时确认能买
+    //     · ShopSkuController              → GET /api/shop/skus/{id}
+    //   留在购物车里，另外两个地方就得各抄一份，而「什么算可买」
+    //   就会有三份实现 —— 三份里只要有一份忘了查 status，
+    //   下架商品就能从那条路被买走，而且不会有任何报错。
+    //
+    //   ⚠️ 它原来还有一点值得留着的话：为什么【不区分】「不存在」和「已下架」。
+    //     那段理由现在写在 ShopSkuServiceImpl.notFound 上，一个字没丢。
 
     /**
      * 刷新购物车的过期时间（滑动过期）。
