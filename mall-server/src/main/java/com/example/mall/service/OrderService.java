@@ -4,6 +4,7 @@ import com.example.mall.common.PageResult;
 import com.example.mall.dto.BuyNowDTO;
 import com.example.mall.dto.CartOrderDTO;
 import com.example.mall.dto.OrderQueryDTO;
+import com.example.mall.dto.OrderShipDTO;
 import com.example.mall.dto.ShopOrderQueryDTO;
 import com.example.mall.vo.AdminOrderVO;
 import com.example.mall.vo.OrderVO;
@@ -200,9 +201,12 @@ public interface OrderService {
      * <p>⚠️ 这个操作<b>不可逆</b>：没有「取消发货」接口。
      * 所以前端要加二次确认（管理端页面已经这么做）。
      *
+     * @param dto 承运商 + 快递单号。<b>★ 里程碑 18 起必填</b> ——
+     *            这两个字段此前根本不存在（接口没有请求体）。
+     *            为什么不允许留空，见 {@code OrderAdminMapper.markShipped}
      * @return 发货后的订单（含明细），前端可以直接用它刷新那一行，不用重查列表
      */
-    AdminOrderVO ship(String orderNo);
+    AdminOrderVO ship(String orderNo, OrderShipDTO dto);
 
     /**
      * 确认收货 —— 用户操作自己的订单。

@@ -276,3 +276,52 @@ export function listMyOrders(params) {
 export function completeOrder(orderNo) {
   return request.post(`/shop/orders/${orderNo}/complete`)
 }
+
+// ==========================================================================
+// 里程碑 18：物流
+//
+// ★ 用户端【只有一个】物流接口，而且是【只读】的。
+//   没有「新增节点」也没有「删除节点」—— 轨迹是管理员手工录的，
+//   会员能做的只有看。这一点在视觉上要一致：那个弹窗里
+//   不该出现任何表单，否则用户会试着填它。
+// ==========================================================================
+
+/**
+ * 查自己某一单的物流：承运商 + 单号 + 发货时间 + 轨迹节点。
+ *
+ * <p>{@code GET /api/shop/orders/{orderNo}/logistics}
+ * <p>需要登录。只能查<b>自己的</b>订单 —— 查别人的返回 1003，
+ * 和 {@code getOrder} 同一个口径（不泄露「这个订单号是存在的」）。
+ *
+ * <p>⚠️⚠️ <b>为什么这个接口也必须带会员条件</b>：
+ * 物流里含<b>收货地址级别的隐私信息</b> —— 快件到了哪个城市、
+ * 哪个网点、什么时候派送，拼起来就能推出这个人住在哪一片。
+ * 这比「订单金额」还敏感，所以服务端的 SQL 里一样有
+ * {@code WHERE member_id = ?}，前端<b>传不了也不该传</b> memberId。
+ *
+ * <p>★★ 一个接口返回四样东西，是因为<b>这四样正是那个弹窗要显示的全部内容</b>。
+ * 拆成两个请求意味着弹窗要等两次，而中间那次失败会留下一个
+ * <b>半空的弹窗</b>（上面有单号、下面是空的），用户以为「还没更新」。
+ *
+ * <p>★ 轨迹是<b>最新在上</b>的（服务端按 {@code trace_time DESC, id DESC} 排好），
+ * 前端<b>不要再排一次</b> —— 重排就是第二个定义者。而排序键为什么
+ * 不是 {@code id}：轨迹可以<b>补录</b>（把昨天的「已揽收」今天才录进去），
+ * 按 id 排会让时间线倒过来。
+ *
+ * <p>⚠️ 三个字段会<b>从响应里整个消失</b>（后端配了 non_null）：
+ * 未发货的订单没有 {@code logisticsCompany} / {@code trackingNo}，
+ * 未发货和已完成但没录节点的订单都可能没有 {@code shipTime}。
+ * <b>判断要用假值（{@code v-if="o.trackingNo"}），不能写 {@code === null}</b> ——
+ * 对消失的 key 取属性得到的是 undefined，写 {@code === null} 判断恒为 false，
+ * 入口就永远不显示了。本项目已经踩过【5 次】。
+ *
+ * <p>⭐ 唯一的例外是 {@code traces}：它<b>永远是数组</b>，不会是 null。
+ * 所以 {@code v-for} 可以直接写，不用先判空。
+ *
+ * @param {string} orderNo
+ * @returns {Promise<{logisticsCompany?: string, trackingNo?: string,
+ *           shipTime?: string, traces: Array}>}
+ */
+export function getOrderLogistics(orderNo) {
+  return request.get(`/shop/orders/${orderNo}/logistics`)
+}

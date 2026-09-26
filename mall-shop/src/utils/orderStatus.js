@@ -51,6 +51,14 @@
  * （因为状态会写进数据库，改了就等于把所有历史数据的含义改变了）。
  * 所以这个字典<b>只会往后追加</b>，不会重排 —— 前端的对应关系很稳。
  * 这一点比 {@code MAX_QUANTITY_PER_ITEM} 那种"可能被运营改动"的常量安全得多。
+ *
+ * <p>★ {@code REFUNDED: 5} 是里程碑 17 追加的（售后 + 运费）。
+ * 它不是"多一个标签"这么轻 —— 它<b>同时</b>是管理端「发货」按钮和
+ * 用户端「确认收货」按钮的闸门：一张全部明细都退完款的订单会落到 5，
+ * 于是那两个按钮都不再显示。
+ * ⚠️ 但真正的闸门仍然是 SQL 里的 {@code WHERE status = 1} ——
+ * 这里的标签错了最多让人看到一个不该出现的按钮，点了也会被拒。
+ * <b>前端判断的是"显示什么"，不是"允许什么"。</b>
  */
 export const ORDER_STATUS = {
   PENDING_PAY: 0,
@@ -58,6 +66,7 @@ export const ORDER_STATUS = {
   SHIPPED: 2,
   COMPLETED: 3,
   CANCELLED: 4,
+  REFUNDED: 5,
 }
 
 /**
@@ -80,6 +89,8 @@ export function orderStatusLabel(status) {
       return '已完成'
     case ORDER_STATUS.CANCELLED:
       return '已取消'
+    case ORDER_STATUS.REFUNDED:
+      return '已退款'
     default:
       return '未知状态'
   }
@@ -98,6 +109,7 @@ export function orderStatusLabel(status) {
  *   已发货 → primary 蓝。正常途中，不需要用户做任何事
  *   已完成 → success 绿。终态，好事
  *   已取消 → info    灰。终态，但没什么可高兴的，也不需要用户做什么
+ *   已退款 → info    灰。终态，同上（里程碑 17 追加）
  * </pre>
  * <b>颜色传达的是「要不要用户行动」，不是「这个状态好不好」。</b>
  * 所以「已取消」是灰色而不是红色 —— 它不是错误，只是一件已经结束的事。
@@ -113,6 +125,12 @@ export function orderStatusTagType(status) {
     case ORDER_STATUS.COMPLETED:
       return 'success'
     case ORDER_STATUS.CANCELLED:
+      return 'info'
+    case ORDER_STATUS.REFUNDED:
+      // ★ 和「已取消」同色：终态、不需要用户做任何事、也不是什么好事。
+      //   不要因为"退款成功了"就配绿 —— 绿在这套配色里表示「办成了」，
+      //   而整单退款对用户来说是这单黄了，不是办成了。
+      //   （售后单自己的「退款完成」才是绿的，那是另一件事，见 afterSaleStatus.js）
       return 'info'
     default:
       return 'info'

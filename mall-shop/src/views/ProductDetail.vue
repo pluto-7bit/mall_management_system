@@ -272,7 +272,7 @@ watch(maxQuantity, (max) => {
  * <p>「还没选的时候显示什么」有一个错误答案和一个正确答案：
  * <pre>
  *   错误：随便挑一个规格的价格 → 用户会以为那就是他要买的价格
- *   正确：起售价 + 一个「起」字 → 明确告诉用户这只是个下界
+ *   正确：起售价（+ 区间）→ 明确告诉用户这是这一档商品的价格范围
  * </pre>
  * 后端给这个字段起名 {@code minPrice} 而不是 {@code price}，
  * 就是为了让上面这个区分在代码里也看得见。
@@ -280,35 +280,74 @@ watch(maxQuantity, (max) => {
 const priceValue = computed(() => currentSku.value?.price ?? product.value?.minPrice ?? null)
 
 /**
- * 要不要在价格后面跟一个「起」字。
+ * 还没选规格时的<b>最高价</b>，来自后端的 {@code maxPrice}（★ 里程碑 16 新增）。
  *
- * <p>★ 判据是「<b>所有规格的价格不全一样</b>」，不是「规格数 &gt; 1」——
- * 4 个规格都卖 10 元时写「¥10.00 起」是在暗示还有更贵的，而实际上没有。
- * <b>一个永远为真的修饰语等于没有信息</b>，和模板里
- * 「库存超过 99 才提示单次限购」是同一个判断。
+ * <h3>★★ 这里删掉了一份前端的 min/max 计算，理由值得记下来</h3>
  *
- * <p>⚠️ 选中规格之后<b>不再显示</b>「起」：那时显示的是确定的价格。
+ * <p>里程碑 15 的时候，本页是自己从 {@code skuList} 里循环算 min 和 max 的
+ * （原来那个 {@code priceIsFrom}）—— 因为那时后端<b>只给 minPrice</b>，
+ * 「所有规格的价格不全一样」这个判断在前端没有别的办法做。
+ *
+ * <p>★ 里程碑 16 后端加上了 {@code maxPrice}，于是那个循环变成了
+ * <b>同一个事实的第二份实现</b>：后端从 {@code skus} 里算一遍，
+ * 前端再从同一个 {@code skus} 里算一遍。
+ * <b>两份实现不会永远一致</b> —— 那一天的现象是「首页写 ¥100 ~ ¥300、
+ * 点进来写着 ¥100 起」，而两边都各自「算对了」。
+ *
+ * <p>★ 所以正确做法不是「保持两处同步」，而是<b>删掉一份</b>：
+ * 现在这一页读的是后端算好的两个数，和列表页读的是同一套语义。
+ * ⚠️ 注意 {@code product.skus} 和这两个字段在后端是<b>同一次计算</b>出来的
+ * （见 {@code ShopProductDetailVO.skus} 的注释），所以它们不会分岔 ——
+ * 这才是「一份实现」成立的前提。
  */
-const priceIsFrom = computed(() => {
-  const skus = skuList.value
-  if (!skus.length) {
+const priceMax = computed(() => product.value?.maxPrice ?? null)
+
+/**
+ * 要不要把价格显示成<b>区间</b>（{@code ¥100.00 ~ ¥300.00}）。
+ *
+ * <p>★ 判据是「最低价和最高价不一样」，不是「规格数 &gt; 1」——
+ * 4 个规格都卖 10 元时写「¥10.00 ~ ¥10.00」是在无中生有一个范围，
+ * 而实际上没有。<b>一个永远为真的修饰语等于没有信息</b>，
+ * 和模板里「库存超过 99 才提示单次限购」是同一个判断。
+ *
+ * <p>⚠️ 选中规格之后<b>不显示区间</b>：那时显示的是确定的价格。
+ *
+ * <p>★★ 里程碑 16 用区间<b>替掉了原来那个「起」字</b>。理由是具体的：
+ * 「¥100.00 起」只说出了下界，而用户真正想知道的是这个范围有多宽 ——
+ * 两档商品写「起」，他得点进去才知道另一档是多少。
+ * 区间把这件事在卡片上就说完了，所以「起」这个字可以退休了。
+ */
+const showRange = computed(() => {
+  if (currentSku.value || priceValue.value === null || priceMax.value === null) {
     return false
   }
-  let min = null
-  let max = null
-  for (const s of skus) {
-    const p = Number(s.price)
-    if (min === null || p < min) {
-      min = p
-    }
-    if (max === null || p > max) {
-      max = p
-    }
-  }
-  return min !== max
+  return Number(priceMax.value) !== Number(priceValue.value)
 })
 
-const showFrom = computed(() => !currentSku.value && priceIsFrom.value)
+/**
+ * 当前这一行该显示的<b>划线价</b>（原价）；没有、或它不高于售价时是 null。
+ *
+ * <h3>★★ 划线价是「所选规格的」，不是「商品级的」</h3>
+ *
+ * <p>判据来自一个具体的反例：多规格商品的原价<b>没有唯一答案</b>。
+ * 黑色的售价 ¥100 配的是白色那一档的原价 ¥350 时，
+ * 画出来的删除线是一个<b>不存在的折扣</b> —— 那两个数字从来不属于同一个规格。
+ * 所以商品级的划线价在列表接口上就被一把锁挡掉了
+ * （{@code CASE WHEN sku_count = 1}，见 {@code ShopProductVO.marketPrice}），
+ * 而详情页是一个能问出「哪个规格」的地方，答案就该从<b>选中的那一行</b>上取。
+ *
+ * <p>⚠️ 判据是<b>严格大于</b>，和后端的保存校验是同一条规则的两端：
+ * 后端拒绝 {@code marketPrice <= price}，这里再判一次是因为
+ * 「数据是以前存的、规则是后来加的」这件事在本项目里已经发生过。
+ * 前端多判一次的成本是一次比较，收益是**永远不会画出假的折扣**。
+ */
+const marketPriceOfCurrent = computed(() => {
+  const sku = currentSku.value
+  if (!sku || sku.marketPrice === null || sku.marketPrice === undefined) {
+    return null
+  }
+  return Number(sku.marketPrice) > Number(sku.price) ? sku.marketPrice : null
+})
 
 /**
  * 按钮为什么不能点；空串表示可以买。
@@ -914,17 +953,34 @@ function buyNow() {
 
           <div class="price-box">
             <span class="label">价格</span>
-            <span class="price">¥{{ formatAmount(priceValue) }}</span>
             <!--
-              ★ 「起」写在 {{ }} 【外面】，是这一行的注解，不是价格的一部分。
-                放进去的话 formatAmount 的返回值会被拼成一个非数字字符串，
-                任何拿它当数用的地方都会跟着出问题。
-                （sql/test-frontend-format.py 的规则 2 就盯着这一条。）
+              ★★ 里程碑 16：这里从「一个数 + 起」改成了「区间」。
 
-              ★ 有规格但还没选时显示「起」；选中之后显示的是确定的价格，
-                不再跟「起」—— 一个已经确定的数后面跟「起」是自相矛盾的。
+              ⚠️ 区间的第二个数字【必须自己带一个 ¥】，不能写成
+                 ¥{{ '{{ formatAmount(min) }}' }} ~ {{ '{{ formatAmount(max) }}' }}。
+                 理由不是好看：sql/test-frontend-format.py 规则 2 的正则
+                 （MONEY_INTERP）只捕获【紧跟 ¥ 之后】的那个插值，
+                 第二种写法里第二个数字完全落在检查之外 ——
+                 而它恰恰是本轮唯一新加的金额显示位置。
+                 ★ 一段检查不到的新代码，等于一个新代码里的静默区。
+
+              ★ 每个 ¥ 都在自己的 <i> 里（.price-box i 把它缩成小一号），
+                而 formatAmount 的契约是【不带货币符号】，两者不能合并。
             -->
-            <span v-if="showFrom" class="price-from">起</span>
+            <span class="price">¥{{ formatAmount(priceValue) }}</span>
+            <template v-if="showRange">
+              <span class="price-sep">~</span>
+              <span class="price">¥{{ formatAmount(priceMax) }}</span>
+            </template>
+            <!--
+              ★★ 划线价：选中规格之后，如果那一行的原价高于售价才画。
+                 ⚠️ 它取的是 marketPriceOfCurrent（所选规格那一行），
+                    【不是】商品级的字段 —— 详情页刻意没有商品级的划线价，
+                    理由见那个 computed 的注释。
+            -->
+            <span v-if="marketPriceOfCurrent" class="price-market">
+              ¥{{ formatAmount(marketPriceOfCurrent) }}
+            </span>
           </div>
 
           <!--
@@ -1400,12 +1456,28 @@ function buyNow() {
   flex-shrink: 0;
 }
 
-/* 「起」—— 跟在价格后面那个字。
-   ★ 比价格小得多、颜色也不是价格那种红：它是【注解】不是数字本身。
-     写成和价格一样大，用户会把它读成价格的一部分 */
-.price-from {
-  font-size: 14px;
+/* 区间中间那个波浪号（里程碑 16 加的，替换掉了原来的「起」字）。
+   ★ 它和「起」字一样是【注解】不是数字：所以要小、要灰 ——
+     写成和价格一样大一样红，用户会把它读成一个减号或者连字符。
+   ★ 两边留一点空隙，否则 ~ 会贴到前后两个数字上，
+     30px 的数字旁边挤一个 16px 的符号看起来像是渲染错了 */
+.price-sep {
+  margin: 0 4px;
+  font-size: 16px;
   color: #909399;
+}
+
+/* 划线价（原价）—— 跟在售价后面的那个数（里程碑 16）。
+   ★ 三个属性各管一件事，缺一个都会出错：
+       line-through  它是【被划掉】的，这是它全部的含义
+       小一号 + 灰    它【不是当前价格】，用户扫一眼比较的是红的那个
+                       写成同样大小同样红，价格区就有两个"价格"了
+   ⚠️ 不能用 color: inherit —— 那样它会跟着 .price-box 变红，退化成一个价格 */
+.price-market {
+  margin-left: 8px;
+  font-size: 16px;
+  color: #909399;
+  text-decoration: line-through;
 }
 
 /* ---------------- 里程碑 15：规格选择器 ---------------- */

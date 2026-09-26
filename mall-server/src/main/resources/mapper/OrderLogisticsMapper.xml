@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mall.mapper.OrderLogisticsMapper">
+
+    <!--
+      里程碑 18：物流轨迹。整张表只有一个订单级的外键（order_id），
+      零外键的既定约定见 OrderLogisticsMapper.java 的类注释。
+    -->
+
+    <!--
+      ★ create_time 不写，交给数据库的 DEFAULT CURRENT_TIMESTAMP。
+        理由同订单主表：录入时间该由数据库的时钟说了算，
+        应用服务器时钟不一致时会出现「后录的节点时间更早」。
+
+      ★ 三个值（status / description / trace_time）原样写入，不做规范化：
+        description 是管理员手写的中文，不做 trim 之外的任何处理
+        （trim 在校验层做，见 LogisticsTraceSaveDTO）。
+    -->
+    <insert id="insert">
+        INSERT INTO order_logistics (order_id, status, description, trace_time)
+        VALUES (#{orderId}, #{status}, #{description}, #{traceTime})
+    </insert>
+
+    <!--
+      ★★ ORDER BY trace_time DESC, id DESC —— 最新在上。
+
+      ⚠️⚠️ 这里【不能】写成 ORDER BY id DESC。
+        补录是这个功能的默认用法（不做快递公司 API 对接，手工录入是
+        轨迹唯一的来源）：管理员晚上一次性补录白天的节点时，
+        后录的那条 trace_time 更早 —— 按 id 排会把它顶到最上面，
+        时间线整个倒过来。而页面、代码、控制台全都正常。
+
+      ★ 第二个键 id DESC 也不是装饰：两条节点被填了完全相同的 trace_time
+        （比如「已揽收」和「运输中」都填 09:00）时，trace_time 单独排不出
+        先后，MySQL 返回的顺序【不确定】，每次查询还可能不一样。
+        断言会随机红，然后被人用 DISTINCT 掩盖。
+        同里程碑 17「同秒创建的两张单要取 MAX(id)」是同一个坑。
+
+      ★ 只查 payload 需要的 5 列，不带 order_no（这张表根本没存）。
+    -->
+    <select id="selectByOrderId" resultType="OrderLogistics">
+        SELECT id, order_id, status, description, trace_time, create_time
+        FROM order_logistics
+        WHERE order_id = #{orderId}
+        ORDER BY trace_time DESC, id DESC
+    </select>
+
+    <!--
+      ★★ AND order_id = #{orderId} 是安全边界：traceId 来自前端路径参数，
+        只按 id 删就能删掉任意订单的节点。
+        外键挡不住「张冠李戴」，只能由 WHERE 挡。
+
+      ★ 删除【不回退订单状态】：删掉一条「已签收」不会把订单退回「已发货」。
+        这是决定不是漏了 —— 给它配一条回退 SQL 意味着订单状态机
+        第一次有了反向边，所有依赖终态的逻辑都要重新论证。
+        见 LogisticsServiceImpl.deleteTrace 的注释。
+    -->
+    <delete id="deleteByIdAndOrderId">
+        DELETE FROM order_logistics
+        WHERE id = #{id}
+          AND order_id = #{orderId}
+    </delete>
+
+</mapper>

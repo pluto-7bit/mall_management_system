@@ -296,6 +296,344 @@ check(
 )
 
 # ===========================================================================
+section("规则 5：五张码表在【后端 ↔ 两端字典】之间双向一致")
+# ===========================================================================
+#
+# ★★ 里程碑 17 新增。它防的是一类【完全不报错】的错：
+#
+#   后端加了第 6 个订单状态（`REFUNDED = 5`），前端字典没跟上。后果：
+#     `orderStatusLabel(5)` 走到 default，那一行显示「未知状态」——
+#     页面正常、代码正常、控制台干净。只有用户看到四个字不对劲。
+#   而管理端的筛选下拉漏了一项的后果更安静：
+#     运营永远筛不出「已退款」的订单，他不会报 bug，
+#     只会以为「就是没有这种单」。
+#
+# ★ 为什么这个文件管得了它：因为这些码表的「定义者」是 Java 常量类，
+#   而它们的「手抄版」是前端字典 —— 两样都是【源码】。
+#   这正是本脚本存在的理由（开头那段）：这轮的正确性不在 HTTP 响应里。
+#
+# ★★ 两个方向都要查，而且要一起查：
+#     正向：后端每一个码都在字典里、值一样
+#           → 抓「后端加了、前端没加」
+#     反向：字典里不许有后端没有的名字
+#           → 抓「前端多编了一个」
+#   ⚠️ 只查正向的话，前端把 `REFUNDED: 5` 抄成 `REFUNDED: 6`（多编一个值）
+#      依然全绿 —— 而它会和将来后端真加的第 6 个状态撞车。
+#      这正是 README 里那条:「同一事实两份实现必然分岔，配一条断言。
+#      而断言必须能抓住【两个方向】，否则它只保护了一半。」
+
+JAVA_COMMON = os.path.join(ROOT, "mall-server", "src", "main", "java",
+                           "com", "example", "mall", "common")
+
+# ★ 只认 `public static final int` —— 那些才是对外契约。
+#   文件里的私有常量、局部变量不该进这张表。
+JAVA_CONST = re.compile(r"public\s+static\s+final\s+int\s+(\w+)\s*=\s*(\d+)\s*;")
+
+
+def java_constants(filename):
+    """读出 Java 常量类的 {名字: 值}；文件不存在或读不到时返回 None。"""
+    path = os.path.join(JAVA_COMMON, filename)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    found = JAVA_CONST.findall(text)
+    return {name: int(val) for name, val in found} if found else None
+
+
+def js_dict(path, dict_name):
+    """读出一个 `export const NAME = { A: 1, ... }` 字面量的 {名字: 值}。
+
+    ★ 只认纯字面量的 `NAME: 123,`。写成算出来的值、或注释里的示例，
+      都读不到 —— 这是好事：码表本来就【必须】是字面量，
+      能算出来的码表意味着有人在别处又定义了一遍。
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(rf"export const {dict_name}\s*=\s*\{{(.*?)\n\}}", text, re.S)
+    if not m:
+        return None
+    return {n: int(v) for n, v in re.findall(r"(\w+)\s*:\s*(-?\d+)\s*,", m.group(1))}
+
+
+def js_function_body(path, fn_name):
+    """取出 `export function NAME(...) { ... }` 的函数体文本。"""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(rf"export function {fn_name}\s*\([^)]*\)\s*\{{(.*?)\n\}}", text, re.S)
+    return m.group(1) if m else None
+
+
+def compare_code_table(java_file, title, targets):
+    """把一张 Java 码表和两端（或多端）的 JS 字典对着比。
+
+    targets 里每一项是 (显示名, js 绝对路径, 字典名, label 函数名)。
+    """
+    backend = java_constants(java_file)
+    check(f"读到了 {java_file}（{title}的权威定义）", backend is not None,
+          f"文件不存在或没有 public static final int：{JAVA_COMMON}")
+    if not backend:
+        return
+
+    for label_name, path, dict_name, fn_name in targets:
+        rel = os.path.relpath(path, ROOT).replace("\\", "/")
+        js = js_dict(path, dict_name)
+
+        if js is None:
+            check(f"{rel} 里有 {dict_name}", False,
+                  f"读不到 `export const {dict_name} = {{ ... }}`。\n"
+                  f"★ 后端现在有 {len(backend)} 个码：{sorted(backend)}")
+            continue
+
+        # ---- 正向：后端每一个都要在，且值一样 ----
+        missing = {n: v for n, v in backend.items() if js.get(n) != v}
+        check(f"{rel} 的 {dict_name} 覆盖后端全部 {len(backend)} 个码（{title}）",
+              not missing,
+              "这些码没抄过来或抄错了：\n" +
+              "\n".join(f"  后端 {n} = {v}，前端是 {js.get(n, '【没有这个名】')}"
+                        for n, v in missing.items()))
+
+        # ---- 反向：不许有后端没有的 ----
+        extra = {n: v for n, v in js.items() if n not in backend}
+        check(f"{rel} 的 {dict_name} 没有后端不存在的码",
+              not extra,
+              "前端多编了这些（后端没有）：\n" +
+              "\n".join(f"  {n} = {v}" for n, v in extra.items()) +
+              "\n★ 只查正向的话，这一条永远抓不住 —— 而它会和将来"
+              "后端真加的那个码撞车。")
+
+        # ---- label 函数必须覆盖全部名字 ----
+        body = js_function_body(path, fn_name)
+        if body is None:
+            check(f"{rel} 里有 {fn_name}()", False, "读不到函数体")
+            continue
+        uncovered = [n for n in backend
+                     if f"case {n}:" not in body and f"case {dict_name}.{n}:" not in body]
+        check(f"{rel} 的 {fn_name}() 覆盖全部 {len(backend)} 个码",
+              not uncovered,
+              f"这些码没有 case 分支（会走到 default）：{uncovered}")
+
+
+SHOP_ORDER_JS = os.path.join(SHOP_SRC, "utils", "orderStatus.js")
+WEB_ORDER_JS = os.path.join(WEB_SRC, "utils", "orderStatus.js")
+SHOP_AS_JS = os.path.join(SHOP_SRC, "utils", "afterSaleStatus.js")
+WEB_AS_JS = os.path.join(WEB_SRC, "utils", "afterSaleStatus.js")
+
+compare_code_table("OrderStatus.java", "订单状态", [
+    ("mall-shop", SHOP_ORDER_JS, "ORDER_STATUS", "orderStatusLabel"),
+    ("mall-web", WEB_ORDER_JS, "ORDER_STATUS", "orderStatusLabel"),
+])
+
+compare_code_table("AfterSaleStatus.java", "售后状态", [
+    ("mall-shop", SHOP_AS_JS, "AFTER_SALE_STATUS", "afterSaleStatusLabel"),
+    ("mall-web", WEB_AS_JS, "AFTER_SALE_STATUS", "afterSaleStatusLabel"),
+])
+
+compare_code_table("AfterSaleReason.java", "售后申请原因", [
+    ("mall-shop", SHOP_AS_JS, "AFTER_SALE_REASONS", "afterSaleReasonLabel"),
+    ("mall-web", WEB_AS_JS, "AFTER_SALE_REASONS", "afterSaleReasonLabel"),
+])
+
+compare_code_table("AfterSaleType.java", "售后类型", [
+    ("mall-shop", SHOP_AS_JS, "AFTER_SALE_TYPES", "afterSaleTypeLabel"),
+    ("mall-web", WEB_AS_JS, "AFTER_SALE_TYPES", "afterSaleTypeLabel"),
+])
+
+# ★ 里程碑 18：第五张码表（物流节点状态）。
+#
+# ★★ 为什么它必须【单独写一段】，不能靠"以后加码表顺手也加一行"：
+#   规则 5 的方向是「后端每一个码都要在前端字典里」——
+#   所以【漏掉一整个 compare_code_table 调用】的后果是
+#   「那张表谁都不量」，而其余四张照样全绿、整段看起来毫无异常。
+#   这正是里程碑 17 那条「一份谁都不量的清单一定会过期」的同一个形状，
+#   只不过这次过期的是「码表的清单」本身。
+#
+# ★ 它防的具体失败：前端少一个节点状态 → logisticsStatusLabel(3) 走 default
+#   → 物流时间线上那一行显示「未知状态」。页面正常、控制台干净。
+SHOP_LOGI_JS = os.path.join(SHOP_SRC, "utils", "logisticsStatus.js")
+WEB_LOGI_JS = os.path.join(WEB_SRC, "utils", "logisticsStatus.js")
+
+compare_code_table("LogisticsStatus.java", "物流节点状态", [
+    ("mall-shop", SHOP_LOGI_JS, "LOGISTICS_STATUS", "logisticsStatusLabel"),
+    ("mall-web", WEB_LOGI_JS, "LOGISTICS_STATUS", "logisticsStatusLabel"),
+])
+
+# ===========================================================================
+section("规则 6：筛选选项的取值集合 —— 管理端必须【等于】，用户端必须【是子集】")
+# ===========================================================================
+#
+# ★★ 这一条抓的是规则 5 抓不到的那一半：
+#
+#   规则 5 管「字典全不全」，这一条管「**用**字典的地方全不全」。
+#   后端加了 `REFUNDED = 5`、前端字典也加了，但管理端筛选下拉忘了加第 6 项 ——
+#   规则 5 全绿，而运营永远筛不出「已退款」的订单，
+#   ★ 页面不报错、代码不报错、控制台干净。
+#   README 里那条「一条不会红的检查等于没有检查」的兄弟:
+#   **一个不会报错的缺口等于没有缺口 —— 除非有人专门去量它。**
+#
+# ★★ 「等于」和「是子集」是【两个不同的断言】，不是一个松一个紧：
+#     管理端筛选：必须【等于】。五个状态就得有五个选项（外加「全部」）——
+#                 少一项 = 筛不到，而筛不到是静默的。
+#     用户端 Tab：必须是【子集】。它刻意不给「已取消」单独的 Tab，
+#                 理由写在 Orders.vue 里（没人会专门去找一笔自己取消掉的订单）。
+#                 ⚠️ 用「等于」会把它判红，然后下一个人会去改 Tab 而不是改断言 ——
+#                 那正好把一个【有意的决定】改成了错误。
+#   **断言写松了会漏，写紧了会逼着人做错事。**
+#
+# ⚠️ 读不懂的写法（不是 `XXX.NAME` 这种字面量引用）一律判红，不静默跳过 ——
+#    否则把引用改成算出来的值就能绕过这条检查。
+
+
+def resolve_option_values(text, array_name, dict_name, mapping):
+    """从 `const NAME = [ { value: XXX.YYY, ... }, ... ]` 里解出值的集合。
+
+    返回 (值的集合, 解不出来的原因)；解不出来时集合为 None。
+    """
+    m = re.search(rf"const {array_name}\s*=\s*\[(.*?)\n\]", text, re.S)
+    if not m:
+        return None, f"读不到数组 {array_name}"
+    names = []
+    for raw in re.findall(r"value:\s*([^,\n]+)", m.group(1)):
+        raw = raw.strip()
+        if raw == "null":
+            continue  # 「全部」的哨兵，不参与比较（见 ORDER_STATUS_OPTIONS 的注释）
+        mm = re.match(rf"{dict_name}\.(\w+)$", raw)
+        if not mm:
+            return None, f"{array_name} 里有一项写的是 `value: {raw}`，不是 {dict_name}.名字"
+        names.append(mm.group(1))
+    unknown = [n for n in names if n not in mapping]
+    if unknown:
+        return None, f"{array_name} 引用了 {dict_name} 里没有的名字：{unknown}"
+    return {mapping[n] for n in names}, None
+
+
+def check_options(display, path, array_name, dict_name, mapping, expected, must_equal):
+    rel = os.path.relpath(path, ROOT).replace("\\", "/")
+    if not os.path.exists(path):
+        check(f"{rel} 里读得到 {array_name}", False, "文件不存在")
+        return
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    values, err = resolve_option_values(text, array_name, dict_name, mapping)
+    if values is None:
+        check(f"{rel} 的 {array_name} 读得懂", False, err)
+        return
+
+    if must_equal:
+        ok = values == expected
+        detail = (f"缺了：{sorted(expected - values)}\n" if expected - values else "") + \
+                 (f"多了：{sorted(values - expected)}" if values - expected else "")
+        check(f"{rel} 的 {array_name} 取值集合 == 后端状态值集合（{display}）",
+              ok, detail)
+    else:
+        ok = values <= expected
+        detail = f"出现了后端没有的值：{sorted(values - expected)}" if not ok else ""
+        check(f"{rel} 的 {array_name} 取值集合 ⊆ 后端状态值集合（{display}）",
+              ok, detail)
+
+
+def js_number_array(path, array_name):
+    """读出一个 `const NAME = [0, 1, 2]` 这种纯数字数组。读不到返回 None。"""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(rf"const {array_name}\s*=\s*\[([^\]]*)\]", text)
+    if not m:
+        return None
+    nums = re.findall(r"\d+", m.group(1))
+    return {int(n) for n in nums} if nums else None
+
+
+order_java = java_constants("OrderStatus.java") or {}
+order_values = set(order_java.values())
+
+# ★★ 这是本题里【第四份】订单状态的手抄本：
+#   OrderStatus.java（真源）→ 两端 orderStatus.js 的字典 → Orders.vue 的 TABS
+#   → 还有这里，utils/query.js 的 VALID_ORDER_STATUS。
+#   它前四份都由规则 5 / 规则 6 看着，只有这一份是谁都不管的 ——
+#   而它恰恰是「URL 能不能表达某个状态」的唯一决定者。
+#   ★ 它现实地漏过一次（里程碑 17 加 REFUNDED 时），
+#     症状是 `/orders?status=5` 被静默地消化成「全部」。
+#   **一份谁都不量的清单，一定会过期。**
+_order_query_path = os.path.join(SHOP_SRC, "utils", "query.js")
+_valid = js_number_array(_order_query_path, "VALID_ORDER_STATUS")
+check("mall-shop/src/utils/query.js 读得到 VALID_ORDER_STATUS", _valid is not None,
+      "读不到 `const VALID_ORDER_STATUS = [ ... ]`")
+if _valid is not None:
+    check("VALID_ORDER_STATUS 的取值集合 == 后端状态值集合",
+          _valid == order_values,
+          (f"缺了：{sorted(order_values - _valid)}\n" if order_values - _valid else "") +
+          (f"多了：{sorted(_valid - order_values)}" if _valid - order_values else "") +
+          "\n★ 少一个值的后果是「URL 里那个 status 被静默地当成『全部』」——\n"
+          "  页面显示全部订单，不报错、不警告。")
+
+web_order_text_path = WEB_ORDER_JS
+check_options("管理端订单筛选", web_order_text_path, "ORDER_STATUS_OPTIONS",
+              "ORDER_STATUS", order_java, order_values, must_equal=True)
+check_options("用户端订单 Tab", os.path.join(SHOP_SRC, "views", "Orders.vue"), "TABS",
+              "ORDER_STATUS", order_java, order_values, must_equal=False)
+
+as_java = java_constants("AfterSaleStatus.java") or {}
+as_values = set(as_java.values())
+
+# ★ 售后这一处【两端都等于】：和订单 Tab 的取舍不同。
+#   顾客会专门去找一笔「被拒绝」「自己撤销」的售后 ——
+#   那是他关心的事（钱退没退成），而不是他不记得的事。
+check_options("管理端售后筛选", WEB_AS_JS, "AFTER_SALE_STATUS_OPTIONS",
+              "AFTER_SALE_STATUS", as_java, as_values, must_equal=True)
+check_options("用户端售后筛选", SHOP_AS_JS, "AFTER_SALE_STATUS_OPTIONS",
+              "AFTER_SALE_STATUS", as_java, as_values, must_equal=True)
+
+# ★ 里程碑 18：管理端「新增物流节点」那个下拉。
+#   少一个值的后果：那个状态【永远录不进去】—— 管理员在下拉里找不到它，
+#   而页面、接口、控制台没有一层会报错。
+logi_java = java_constants("LogisticsStatus.java") or {}
+logi_values = set(logi_java.values())
+
+check_options("管理端物流节点下拉", WEB_LOGI_JS, "LOGISTICS_STATUS_OPTIONS",
+              "LOGISTICS_STATUS", logi_java, logi_values, must_equal=True)
+
+# ★★ 用户端【没有】LOGISTICS_STATUS_OPTIONS 数组，这不是漏了：
+#   用户端根本没有物流的筛选 / 录入 —— 节点只在那个只读弹窗里展示。
+#   规则 6 量的就是「用字典的地方全不全」，而用户端没有这样的地方。
+#   ⚠️ 反过来说，给用户端加一个 OPTIONS 数组是【有害的】：
+#      它会是一条零读者的死代码，而且会让将来的人以为
+#      「用户端也能录物流」，从而去「补上」那个根本没有的入口。
+#
+# ★ 也正因为如此，这一条【不能】用 must_equal=False 静默地放过 ——
+#   下面这条断言就是它的替代：这里没有调用 = 这里不需要调用。
+#
+# ★★ 断言的是【有没有 export 这个声明】，不是「文中出现过这个名字」。
+#    本脚本第一版写的是 `"LOGISTICS_STATUS_OPTIONS" not in 文件内容`，
+#    然后它立刻红了 —— 因为用户端那个文件末尾的注释里，为了说明
+#    「这里刻意没有它」，把那个名字写了出来。**检查被解释它自己的注释绊倒了。**
+#
+#    而脚本开头 strip_noise 的注释早就预言过这一幕：
+#    「下一个人往注释里写一句带 {{ }} 的金额示例，检查就会假红一次，
+#      然后他会做的不是『改注释』，而是『把这条检查删掉』。」
+#    所以正确的修法不是去剥 .js 的注释（strip_noise 只认 .vue），
+#    而是【让断言的边界和它想守的东西重合】：这里要守的是
+#    「用户端没有导出这个数组」，那就只匹配 export 声明。
+#    这样注释可以自由地提到它、解释它，而断言依然精确。
+_sh_logi = os.path.join(SHOP_SRC, "utils", "logisticsStatus.js")
+_declares_options = False
+if os.path.exists(_sh_logi):
+    with open(_sh_logi, encoding="utf-8") as f:
+        _declares_options = bool(re.search(
+            r"^\s*export\s+const\s+LOGISTICS_STATUS_OPTIONS\b", f.read(), re.M))
+
+check("★ 用户端没有导出物流节点下拉（它没有筛选，只有只读弹窗）",
+      not _declares_options,
+      "mall-shop/src/utils/logisticsStatus.js 里 export 了 LOGISTICS_STATUS_OPTIONS —— "
+      "用户端没有录入物流的地方，这个数组会是零读者的死代码，\n"
+      "而且会让将来的人以为「用户端也能录物流」，去补一个根本不存在的入口")
+
+# ===========================================================================
 section("上报（不做断言）")
 # ===========================================================================
 #

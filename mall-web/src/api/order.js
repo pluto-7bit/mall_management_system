@@ -85,10 +85,93 @@ export function getOrderList(params) {
  * 所以调用方<b>必须先做二次确认</b>，那不是走过场，
  * 它是这个操作唯一的后悔机会。
  *
+ * ★★ 里程碑 18：请求体从【没有】变成【必填】——
+ * 要填承运商和快递单号（「货是怎么发出去的」本来就是发货这件事的一部分，
+ * 里程碑 10 只是没有记它）。
+ *
+ * <p>⚠️⚠️ <b>两个字段都必填，服务端刻意不接受空值。</b>
+ * 理由具体得很：用户端的「查看物流」入口是按单号有没有值渲染的，
+ * 允许为空会让「已发货但没单号」成为常态，而那些订单的用户
+ * <b>页面上什么都没有、也不报错</b>，只会以为这个功能没做。
+ * 所以服务端把「单号必填」放在接口契约上，让调用方在入口就失败。
+ *
+ * <p>⚠️ 长度上限 50 / 64（对齐数据库列宽）。超长会拿到 400，
+ * 而不是「服务器错误」—— 别在前端再抄一遍这个长度，让服务端说。
+ *
  * @param {string} orderNo
+ * @param {{logisticsCompany: string, trackingNo: string}} payload 两个都必填
  * @returns {Promise<Object>} 发货后的订单（含 items 和会员名），
  *          可以直接拿去替换列表里那一行，不用重查整页
  */
-export function shipOrder(orderNo) {
-  return request.post(`/admin/orders/${orderNo}/ship`)
+export function shipOrder(orderNo, payload) {
+  return request.post(`/admin/orders/${orderNo}/ship`, payload)
+}
+
+/**
+ * 查一张订单的物流：承运商 + 单号 + 发货时间 + 轨迹节点。
+ *
+ * <p>{@code GET /api/admin/orders/{orderNo}/logistics}
+ *
+ * <p>★★ 一个接口返回三样东西，是因为<b>这三样正是那个弹窗要显示的全部内容</b>。
+ * 拆成两个请求意味着弹窗要等两次，而中间那次失败会留下一个
+ * <b>半空的弹窗</b>（上面有单号、下面是空的），用户以为「还没更新」。
+ *
+ * <p>★ 轨迹是<b>最新在上</b>的（服务端按 {@code trace_time DESC, id DESC} 排好），
+ * 前端<b>不要再排一次</b> —— 重排就是第二个定义者。
+ *
+ * <p>⚠️ 未发货的订单也能查（返回空轨迹），但 {@code logisticsCompany} /
+ * {@code trackingNo} / {@code shipTime} 三个字段会<b>从响应里整个消失</b>
+ * （Jackson 的 non_null），判断要用假值，<b>不能写 === null</b>。
+ *
+ * @param {string} orderNo
+ * @returns {Promise<{logisticsCompany?: string, trackingNo?: string,
+ *           shipTime?: string, traces: Array}>} traces 永远是数组，不会是 null
+ */
+export function getOrderLogistics(orderNo) {
+  return request.get(`/admin/orders/${orderNo}/logistics`)
+}
+
+/**
+ * 给一张订单新增一个物流轨迹节点。
+ *
+ * <p>{@code POST /api/admin/orders/{orderNo}/logistics}
+ *
+ * <p>★★ <b>录到「已签收」（status = 4）会把订单自动推到「已完成」，
+ * 而且不可撤销。</b>删掉这条节点不会把订单退回去 ——
+ * 所以调用方<b>必须在提交前把这句话摆在操作者眼前</b>，
+ * 而不是提交后再补救。
+ *
+ * <p>★ {@code traceTime} 是「这一节点【发生】的时刻」，可以填<b>过去的时刻</b>
+ * （补录是这个功能的默认用法：白天忙、晚上一次性补录）。必填 ——
+ * 服务端不兜底成 now，否则一个前端 bug 会把补录的节点静默记成今天，
+ * 而管理员以为记的是昨天。
+ *
+ * @param {string} orderNo
+ * @param {{status: number, description: string, traceTime: string}} payload
+ *          traceTime 格式 'YYYY-MM-DD HH:mm:ss'
+ * @returns {Promise<Object>} 录完之后的完整物流，可以直接拿去刷新对话框
+ */
+export function addLogisticsTrace(orderNo, payload) {
+  return request.post(`/admin/orders/${orderNo}/logistics`, payload)
+}
+
+/**
+ * 删除一个录错的轨迹节点。
+ *
+ * <p>{@code DELETE /api/admin/orders/{orderNo}/logistics/{traceId}}
+ *
+ * <p>★ 路径里带 orderNo 不是冗余：服务端要用它把 order_id 查出来，
+ * 再用 {@code WHERE id = ? AND order_id = ?} 删 ——
+ * 这样传错 id 也删不到别人的节点。
+ *
+ * <p>⚠️ <b>删除不回退订单状态。</b>删掉一条「已签收」，
+ * 订单仍然是「已完成」。这是决定不是 bug，别去「修」它。
+ *
+ * <p>★ 轨迹只允许新增和删除，<b>没有修改</b>：一条被改过的轨迹不是轨迹。
+ * 改错的做法是删了重录。
+ *
+ * @returns {Promise<Object>} 删完之后的完整物流，可以直接拿去刷新对话框
+ */
+export function deleteLogisticsTrace(orderNo, traceId) {
+  return request.delete(`/admin/orders/${orderNo}/logistics/${traceId}`)
 }

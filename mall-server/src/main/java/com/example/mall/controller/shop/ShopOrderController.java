@@ -6,7 +6,9 @@ import com.example.mall.dto.BuyNowDTO;
 import com.example.mall.dto.CartOrderDTO;
 import com.example.mall.dto.PayDTO;
 import com.example.mall.dto.ShopOrderQueryDTO;
+import com.example.mall.service.LogisticsService;
 import com.example.mall.service.OrderService;
+import com.example.mall.vo.LogisticsVO;
 import com.example.mall.vo.OrderVO;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -72,6 +74,7 @@ import org.springframework.web.bind.annotation.RestController;
 public class ShopOrderController {
 
     private final OrderService orderService;
+    private final LogisticsService logisticsService;
 
     /**
      * 购物车结算下单。
@@ -367,5 +370,34 @@ public class ShopOrderController {
     @PostMapping("/{orderNo}/complete")
     public Result<OrderVO> complete(@PathVariable String orderNo) {
         return Result.success(orderService.complete(orderNo));
+    }
+
+    /**
+     * 查这一单的物流。★ 里程碑 18 新增。
+     *
+     * <p>{@code GET /api/shop/orders/{orderNo}/logistics}
+     *
+     * <p>返回<b>一个</b> {@code LogisticsVO}：承运商 + 单号 + 发货时间 + 轨迹节点。
+     * 之所以是一个接口而不是两个（查单号 / 查轨迹），是因为这三样
+     * <b>正是那个弹窗要显示的全部内容</b> —— 拆开意味着弹窗要等两次，
+     * 而中间那次失败会留下一个半空的弹窗。见 {@code LogisticsVO} 的类注释。
+     *
+     * <p>★ {@code memberId} 来自 JWT（服务层从 {@code UserContext} 取），
+     * <b>不在路径或参数里</b> —— 同上面 {@code page} 的注释：
+     * 物流里含<b>收货地址级别的隐私信息</b>（快件到了哪个城市），
+     * 不能凭订单号就读到别人的。
+     *
+     * <p>★ <b>这个读接口不判断订单状态</b>（未发货的订单也返回，
+     * 只是三个字段为空、轨迹为空数组）。它是无副作用的读，
+     * 按状态拦只会把「订单刚被退款」这类正常情况变成一句「状态不允许」。
+     * 「只有已发货的订单能<b>记</b>物流」那条闸门在管理端的 POST 上。
+     *
+     * <p>★ 它是本 Controller 里<b>唯一一个路径带上子资源名</b>的接口 ——
+     * 因为物流是订单的子记录（快照在 {@code orders} 上、轨迹在
+     * {@code order_logistics} 上），不是订单的另一个「动作」。
+     */
+    @GetMapping("/{orderNo}/logistics")
+    public Result<LogisticsVO> logistics(@PathVariable String orderNo) {
+        return Result.success(logisticsService.getMyLogistics(orderNo));
     }
 }

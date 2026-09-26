@@ -11,9 +11,26 @@
     <!--
       ============================================================
        ★ 这张表的写操作【故意】很窄，只有五条：
-         insert / updatePriceStock / deleteByIds / decreaseSkuStock / increaseSkuStock。
+         insert / updatePriceCostStock / deleteByIds / decreaseSkuStock / increaseSkuStock。
          这里【没有】通用的 updateById，那是刻意的，不是还没写。
       ============================================================
+
+      ★★ 里程碑 16：三个查询都带上了 cost_price。**这是允许的，不是泄漏。**
+
+      成本价的边界【不在这一层】，它在 VO 的继承树上：
+         SkuVO（公共） ← ShopSkuVO（用户端出口）/ AdminSkuVO（管理端出口，多加成本三件套）
+      所以「用户端拿不到成本价」这件事，靠的是用户端那几条查询
+      （ShopSkuService）产出的是 ShopSkuVO 而不是 AdminSkuVO ——
+      和这里 SELECT 了哪几列毫无关系。
+
+      ⚠️ 因此【不要】为了让这个文件「看起来安全」而把 cost_price 从下面删掉：
+         管理端详情也走同一个 selectByProductId，删了它，
+         商品编辑页的成本价会永远回填成空白，保存后又写回 NULL ——
+         接口 200，商家填的成本价静默消失。
+
+      ★ 也正因为边界在 VO 而不在 SQL，
+        守它的检查必须扫【接口返回的 JSON】，而不是 grep 这个文件 ——
+        见 sql/test-price.py 的 E 组（双向：用户端不许有、管理端必须有）。
 
       通用版 updateById 会把 spec_json 也变成「可以改的字段」，
       而 spec_json 是这一行的【身份】—— 它和 product_id 一起构成唯一索引
@@ -43,7 +60,7 @@
         而不是让它从列表里消失 —— 消失的规格看起来像「不存在」。
     -->
     <select id="selectByProductId" resultType="ProductSku">
-        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        SELECT id, product_id, spec_json, price, market_price, cost_price, stock, create_time, update_time
         FROM product_sku
         WHERE product_id = #{productId}
         ORDER BY id
@@ -51,7 +68,7 @@
 
     <!-- 按主键查一行 SKU。查不到返回 null，由 Service 决定怎么处理 -->
     <select id="selectById" resultType="ProductSku">
-        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        SELECT id, product_id, spec_json, price, market_price, cost_price, stock, create_time, update_time
         FROM product_sku
         WHERE id = #{id}
     </select>
@@ -80,7 +97,7 @@
       ⚠️ 调用方必须保证 ids 非空，理由同 deleteByIds 的注释：空的 IN () 是语法错误。
     -->
     <select id="selectByIds" resultType="ProductSku">
-        SELECT id, product_id, spec_json, price, stock, create_time, update_time
+        SELECT id, product_id, spec_json, price, market_price, cost_price, stock, create_time, update_time
         FROM product_sku
         WHERE id IN
         <foreach collection="ids" item="sid" open="(" close=")" separator=",">
@@ -95,20 +112,36 @@
       所以 Service 调完 insert 就能拿到新行的 id，不用再查一次。
     -->
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO product_sku (product_id, spec_json, price, stock)
-        VALUES (#{productId}, #{specJson}, #{price}, #{stock})
+        INSERT INTO product_sku (product_id, spec_json, price, market_price, cost_price, stock)
+        VALUES (#{productId}, #{specJson}, #{price}, #{marketPrice}, #{costPrice}, #{stock})
     </insert>
 
     <!--
-      改一行的价格和库存。
+      改一行的价格与库存 —— ★ 里程碑 16 从 updatePriceStock 改名而来，写四个字段。
 
-      ★ 只有这两列能改，而且【只能按 id 改】——
+      ★★ 为什么加了两列就【必须】改名？
+        因为一个写着「只写价格和库存」的名字，在加了两列之后就是【一句假话】。
+        下一个人要再加第五个字段（比如「促销价」）时，他会按名字判断
+        「这个方法就是改价格的，加一列进去就行」—— 而那正是最容易漏改一处的时刻。
+        漏改的症状是最难查的那一类：**接口 200，页面上的数字是上一次的**，
+        没有任何一层报错，因为 SQL 语法完全正确，只是没写那一列。
+
+      ★ 窄语句的名字就是它的文档。字段变了，名字要跟着变，
+        让「名字和事实对不上」这件事在 code review 里一眼可见。
+
+      ★ 为什么还是只有这四列能改，而且只能按 id 改：
         因为这是管理员在规格矩阵里编辑已有的一行，不是「换一个规格」。
-        见文件开头那段：spec_json 是身份，不参与更新。
+        见文件开头那段 —— spec_json 是这一行的【身份】，不参与更新。
+
+      ⚠️ 传进来的 marketPrice / costPrice 可以是 NULL，这是【全量覆盖】语义的一部分：
+        商家把划线价清空 = 真的清空。少写那一列就等于「清不掉」。
     -->
-    <update id="updatePriceStock">
+    <update id="updatePriceCostStock">
         UPDATE product_sku
-        SET price = #{price}, stock = #{stock}
+        SET price        = #{price},
+            market_price = #{marketPrice},
+            cost_price   = #{costPrice},
+            stock        = #{stock}
         WHERE id = #{id}
     </update>
 

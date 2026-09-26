@@ -166,9 +166,73 @@ public interface OrderAdminMapper {
      * <p>发货只是「东西出库了」的状态变更，扣库存发生在下单那一刻
      * （{@code decreaseSkuStock}）。这里再去动库存就是重复扣减。
      *
+     * <h4>4. ★★ 里程碑 18：多写两个列，而且它们【必填】</h4>
+     *
+     * <p>从「没有请求体」变成「必填承运商 + 单号」是一次<b>契约变更</b>，
+     * 这里说清为什么不允许为空（{@code @NotBlank} 在
+     * {@code OrderShipDTO} 上，那个 DTO 里也有对应说明）：
+     *
+     * <p>允许为空 → 「已发货但没有单号」变成一个<b>合法且常态</b>的状态 →
+     * 用户端 {@code Orders.vue} 的「查看物流」入口是按单号有没有值显示的 →
+     * <b>那些订单的页面上什么都没有，也不报错</b>，用户以为这个功能没做。
+     *
+     * <p>这是本项目最忌讳的那类失败：数据没坏、页面少东西、没人知道。
+     * 所以把「单号必填」放在接口契约上，让它在<b>入口</b>就失败，
+     * 而不是让一个诚实的用户端去猜。
+     *
+     * <p>★ 但 {@code WHERE} 一个字没动 —— 闸门仍然是 {@code status = 1}，
+     * 「发两次货、写两次 ship_time」依然不可能。本轮只是让这一次写多写两个列。
+     *
+     * @param logisticsCompany 承运商（如「顺丰」），长度已在 DTO 层对齐列宽
+     * @param trackingNo       快递单号
      * @return 影响行数。<b>1 = 发货成功；0 = 订单不存在 / 状态不是已付款</b> ——
      *         返回 0 时调用方要用 {@link #selectAdminByOrderNo} 重查一次，
      *         好把两种原因分辨成准确的错误信息
      */
-    int markShipped(@Param("orderNo") String orderNo);
+    int markShipped(@Param("orderNo") String orderNo,
+                    @Param("logisticsCompany") String logisticsCompany,
+                    @Param("trackingNo") String trackingNo);
+
+    /**
+     * 把订单标记为已完成（管理端，录物流「已签收」时联动）。★ 里程碑 18 新增。
+     *
+     * <h4>★★ 它是「已发货 → 已完成」这条边的【第二个行动者】</h4>
+     *
+     * <p>第一个是 {@code OrderMapper.markCompleted}（买家点「确认收货」）。
+     * 两条 SQL 写的是<b>同一条边</b>：同一个 {@code WHERE status = 2}，
+     * 同一个 {@code SET status = 3, complete_time = NOW()}。
+     * 见 {@code OrderStatus} 类注释里那张边表。
+     *
+     * <h4>★ 为什么不复用它、而要在这里再写一条</h4>
+     *
+     * <p>因为那条的 {@code WHERE} 里有 {@code member_id = #{memberId}}，
+     * 而<b>录物流的管理员不是会员，没有 memberId 可传</b>。
+     * 硬把订单的会员 id 查出来再传进去，等于把会员身份从订单里反推出来
+     * 当成鉴权条件 —— 那不是鉴权，是自欺。
+     * 管理端的安全边界由 {@code AdminAuthInterceptor} 拦 {@code /api/admin/**}
+     * 提供，这正是本类存在的理由（见类注释）。
+     *
+     * <h4>★★ 调用方【不要检查返回值】</h4>
+     *
+     * <p>返回 0 的正常含义是<b>「这单已经不是已发货了」</b>——
+     * 买家自己已经确认收货了，或者订单已经被退款推到了 5。
+     * 那是<b>正常情况，不是错误</b>。
+     *
+     * <p>检查它会制造假失败 → 抛异常 → <b>把那个还没提交的事务回滚掉 →
+     * 连刚写进去的物流轨迹节点一起没了</b>。
+     * 管理员看到的是「记录失败」，而实际上失败的是这条「顺手做的联动」。
+     * 判据逐字同售后 T8 的 {@code markOrderRefundedIfAllRefunded}。
+     *
+     * <h4>★★ 连带后果：它会写 {@code complete_time}，而那是一个时钟的起点</h4>
+     *
+     * <p>{@code complete_time} 是<b>售后 7 天窗口的起点</b>
+     * （{@code AfterSaleWindow}）。所以「录一条已签收」= 用户从这一刻起
+     * 有 7 天可以申请退货退款。
+     *
+     * <p>这是对的（货到手了、钟开始走），但它是<b>这条时钟的第二个起点</b>——
+     * 第一个是买家自己点「确认收货」。改售后时限时两个起点都要想到。
+     *
+     * @return 影响行数。1 = 推成功；0 = 订单不是已发货（<b>正常</b>，见上）
+     */
+    int markCompletedByNo(@Param("orderNo") String orderNo);
 }

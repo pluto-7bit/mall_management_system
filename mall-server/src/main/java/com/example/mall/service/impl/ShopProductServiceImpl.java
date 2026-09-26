@@ -7,6 +7,7 @@ import com.example.mall.common.SpecGroup;
 import com.example.mall.dto.ShopProductQueryDTO;
 import com.example.mall.mapper.ProductImageMapper;
 import com.example.mall.mapper.ProductMapper;
+import com.example.mall.service.CategoryService;
 import com.example.mall.service.ProductReviewService;
 import com.example.mall.service.ShopProductService;
 import com.example.mall.service.ShopSkuService;
@@ -31,6 +32,20 @@ public class ShopProductServiceImpl implements ShopProductService {
 
     private final ProductMapper productMapper;
     private final ProductImageMapper productImageMapper;
+
+    /**
+     * ★ 里程碑 16 起：分类筛选要「含后代」。
+     *
+     * <p><b>和管理端的 {@code ProductServiceImpl} 调的是同一个方法，这是刻意的。</b>
+     * 「点父分类要连同子分类的商品一起显示」是一条事实，
+     * 如果只有一端含后代，同一件商品在两个端上的件数会对不上
+     * （管理端 20 件、用户端 28 件），而运营会先怀疑后台统计错了，
+     * 不会先怀疑这是两个不同的规则。
+     *
+     * <p>这也是为什么这里跨层调 Service 而不是让 Mapper 直接查：
+     * 规则必须只有一个定义者，见 {@code CategoryService.selfAndDescendantIds}。
+     */
+    private final CategoryService categoryService;
 
     /**
      * 只用来取某个商品的评价聚合（★ 里程碑 12 起）。
@@ -85,6 +100,29 @@ public class ShopProductServiceImpl implements ShopProductService {
         //   后面的代码都可以假定它是干净的），
         //   但如果这个方法被别处复用，就要小心副作用。
         query.normalize();
+
+        // ★★ 里程碑 16：把「点了一个分类」展开成「它自己 + 所有后代」。
+        //
+        //   和 ProductServiceImpl.page 里那一段是【同一个规则、同一份实现】
+        //   （都调 CategoryService.selfAndDescendantIds），只是写在了两个类里。
+        //   这份「重复」是两个端各有一套 DTO 这条约定带来的，不是抄错了 ——
+        //   但要盯住它：test-category.py 里「按父分类筛选含后代商品」
+        //   在两个端上【各断言一次】。如果哪天有人只改了其中一端，
+        //   两条断言会一条绿一条红，而不是两条都绿。
+        //
+        //   ★ 这里也是【无条件】覆盖 categoryIds，理由同管理端：
+        //     派生字段必须每次重算，否则前端能直接传 ?categoryIds=1,2
+        //     把「含后代」这条规则绕过去。
+        if (query.getCategoryId() != null) {
+            List<Long> categoryIds = categoryService.selfAndDescendantIds(query.getCategoryId());
+            // 空集合 → 空页。分类不存在时就是这种情况，
+            // 而「不存在的分类筛出 0 件」是里程碑 16 之前就有的行为，原样保住。
+            // 不短路的话 IN () 会变成 SQL 语法错误 → 500（见 ProductMapper.xml 里的说明）。
+            if (categoryIds.isEmpty()) {
+                return PageResult.empty(query.getPageNum(), query.getPageSize());
+            }
+            query.setCategoryIds(categoryIds);
+        }
 
         long total = productMapper.countShopByQuery(query);
         if (total == 0) {
@@ -184,18 +222,25 @@ public class ShopProductServiceImpl implements ShopProductService {
         //     和 spec_schema 那一列撞的是同一堵墙（见 selectSpecSchema 的注释）。
         List<SkuVO> skus = shopSkuService.listByProductId(id);
         product.setSkus(skus);
-        // ★ skuCount 和 minPrice 都是【从这个列表里算出来的】，不是再查一次数据库。
+        // ★ skuCount、minPrice、maxPrice 都是【从这个列表里算出来的】，
+        //   不是再查一次数据库。
         //
         //   为什么不走 SQL 聚合（像列表接口那样）？
         //   因为要渲染规格选择器就必须先把整批 SKU 查出来，顺便算一下是零成本的，
         //   而再去数据库聚合一次就多一次往返。
         //
-        //   ★★ 而且这样它们三个【永远不会分叉】：同一份数据、同一次计算。
+        //   ★★ 而且这样它们【永远不会分叉】：同一份数据、同一次计算。
         //      如果 minPrice 改回由 SQL 提供，就会出现「选择器上是 4 档、
         //      起售价却按 3 档算」这种只在某个商品上出现的诡异现象 ——
         //      而两个来源都各自「正确」，没有任何地方会报错。
+        //
+        //   ★ 里程碑 16 加的 maxPrice 【必须走同一条路】，理由正是上面那句：
+        //     列表接口的 maxPrice 来自 SQL 的 MAX(price)，这一份来自 Java。
+        //     两者不一致的现象是「首页写 ¥4999 ~ ¥6999，点进去变成 ¥4999 ~ ¥5999」
+        //     —— 用户会怀疑自己看错了，而两个数都各自「算对了」。
         product.setSkuCount(skus.size());
         product.setMinPrice(minPriceOf(skus));
+        product.setMaxPrice(maxPriceOf(skus));
 
         // ★ spec_schema 单独查一次（只有一列，主键命中）。
         //
@@ -232,5 +277,34 @@ public class ShopProductServiceImpl implements ShopProductService {
             }
         }
         return min;
+    }
+
+    /**
+     * 最高价 = 所有规格里最贵的那个（★ 里程碑 16 新增）。
+     *
+     * <p>空列表同样返回 <b>null</b>，理由和 {@link #minPriceOf} 完全一致。
+     *
+     * <p>★ 为什么是<b>两个方法</b>而不是一个带 {@code boolean wantMax} 的：
+     * 那样调用点会变成 {@code extremePriceOf(skus, true)}，
+     * 读的人得回头数一下 true 到底是要大的还是要小的。
+     * <b>窄方法的名字就是它的文档</b> —— 两段各自 8 行、各自说清自己是什么，
+     * 比一个需要查参数含义的通用折叠便宜。
+     *
+     * <p>⚠️ 唯一需要注意的重复是「跳过 null 价格」这一条：两个方法里都有。
+     * 它在这里是<b>同一条规则的第二份抄写</b>，所以将来要改（比如把 null 当 0）
+     * 必须两处一起改 —— 上面那句「同一份数据、同一次计算」是它们的共同前提，
+     * 改岔了就会出现 min 跳过 null 而 max 不跳这种荒唐情况。
+     */
+    private BigDecimal maxPriceOf(List<SkuVO> skus) {
+        BigDecimal max = null;
+        for (SkuVO sku : skus) {
+            if (sku.getPrice() == null) {
+                continue;
+            }
+            if (max == null || sku.getPrice().compareTo(max) > 0) {
+                max = sku.getPrice();
+            }
+        }
+        return max;
     }
 }

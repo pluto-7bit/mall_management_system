@@ -221,8 +221,102 @@ public class OrderItemVO {
      *
      * <p>★ 顺带一提，这也是为什么它<b>不能</b>是 {@code long} 基本类型：
      * 基本类型表达不出「没有」这个状态，硬要表达就只能编一个 0 出来，
-     * 而 0 是一个合法的 id 的近邻 —— 那种「用一个哨兵值表示缺失」的做法，
+     * 而 0 是一个合法的 id 的近邻 —— 那种用一个哨兵值表示缺失的做法，
      * 迟早会被当成真实值用一次。
      */
     private Long reviewId;
+
+    // ======================================================================
+    //  ★ 里程碑 17：这一行的售后状态（三个字段）
+    //
+    //  ★★ 为什么是**行级**的字段，而不是看 orders.status？
+    //
+    //  这是本轮中心张力（「按行的售后」对「按订单的状态」）的第三次出现。
+    //  一张订单有两行，退了一行、另一行没退 —— 订单的状态说得出这件事吗？
+    //  说不出（它只会在「全部退完」时变成 OrderStatus.REFUNDED = 5）。
+    //  所以「这一行退没退过款」只能存在行上，由这里的字段回答。
+    //
+    //  ⚠️ 这三个字段和 OrderVO.afterSaleDeadline 一起，构成了
+    //     订单页那一行「申请售后」入口的**全部**判据。
+    //     缺任何一个，前端就只能靠猜。
+    // ======================================================================
+
+    /**
+     * 这一行<b>进行中</b>的售后单号（{@code status ∈ {0,1,2}}），
+     * <b>没有进行中的售后时为 null</b>。★ 里程碑 17 新增。
+     *
+     * <p>前端靠它决定那一行显示「申请售后」还是「售后处理中」。
+     *
+     * <p>⚠️⚠️ 和 {@link #reviewId} 一样：<b>没有时这个键会整个从 JSON 里消失</b>
+     * （全局 Jackson 配了 {@code default-property-inclusion: non_null}）。
+     * 前端要写
+     * <pre>
+     *   v-if="!it.afterSaleNo"          ✅ undefined 和 null 都判为「没有」
+     *   v-if="it.afterSaleNo === null"  ❌ 键都不存在，怎么会 === null
+     * </pre>
+     * 这个坑里程碑 11 咬过两次、15 轮又咬过一次 —— <b>第三次是这里</b>。
+     *
+     * <h4>★ 它是怎么取出来的：{@code LEFT JOIN ... AND active_token = 0}</h4>
+     *
+     * <p>它来自 {@code OrderItemMapper} 的两条查询，join 条件是
+     * <pre>
+     *   LEFT JOIN after_sale a ON a.order_item_id = oi.id AND a.active_token = 0
+     * </pre>
+     * ★★ 那个 {@code AND active_token = 0} 是<b>承重的</b>：
+     * 一条明细可以有多张<b>已关闭</b>的售后单，没有它这个 join 会让
+     * <b>明细行数翻倍</b>，而 MyBatis 的单结果查询会取到随机一行
+     * （或者抛 {@code TooManyResultsException}）。
+     * 加上它之后，由 {@code uk_order_item_active (order_item_id, active_token)}
+     * 唯一索引保证<b>最多匹配一行</b> —— 一对一是结构上的事实，不是运气。
+     *
+     * <p>⚠️ {@code ProductReviewMapper} 里问的是同一个问题
+     * （「这一行有没有售后」），但那边必须用 {@code EXISTS} 子查询，
+     * 因为那边问的是 {@code status = 3}（已退款）而那些行是<b>关闭</b>的，
+     * {@code active_token} 各不相同，join 不出唯一性。见那个文件的注释。
+     */
+    private String afterSaleNo;
+
+    /**
+     * 上面那张进行中售后单的状态（{@code 0/1/2}）。<b>没有进行中的售后时为 null。</b>
+     *
+     * <p>取值见 {@code AfterSaleStatus}。前端拿它查自己的展示字典，
+     * 显示成「待审核 / 待买家寄回 / 待卖家收货」。
+     *
+     * <p>⚠️ 和 {@link #afterSaleNo} 是<b>同一次 join 出来的两个字段</b>，
+     * 所以它们要么都有值、要么都没有 —— 这个对应关系是结构性的，
+     * 前端不需要判两次。
+     */
+    private Integer afterSaleStatus;
+
+    /**
+     * 这一行<b>有没有退过款</b>（存在一张 {@code status = 3} 的售后单）。
+     * ★ 里程碑 17 新增。
+     *
+     * <p>前端靠它决定那一行显示「已退款」标签，并且<b>永久去掉</b>
+     * 「申请售后」和「评价」两个入口。
+     *
+     * <p>★ 它和 {@link #afterSaleNo} 是两个独立的问题：
+     * 被拒过一次又重新申请的单，{@code afterSaleNo} 是新的那张，
+     * 而 {@code refunded} 仍然是 false —— <b>这正是本表的
+     * 「已关闭的历史单不限张数」那条设计要支持的场景。</b>
+     *
+     * <h4>★★ 为什么用包装类型 {@code Boolean} 而不是 {@code boolean}</h4>
+     *
+     * <p>因为 {@code EXISTS(...)} 在某些驱动/映射下回的是一个<b>可空的包装值</b>，
+     * 直接拆箱会 NPE。判据和 {@link #reviewId} 那句「基本类型表达不出『没有』」
+     * 是同一件事 —— 只不过这里「没有」不该发生，
+     * 而<b>不该发生不等于不会发生</b>：真的发生了的话，
+     * 包装类型会让我们走到一个明确的 {@code null}，而不是一个空指针。
+     * 判断要写 {@code Boolean.TRUE.equals(it.refunded)}。
+     *
+     * <h4>★ 它是「同一事实的两份实现」的第二份</h4>
+     *
+     * <p>第一份在 {@code ProductReviewMapper.selectOrderItemForReview}
+     * （评价资格）。两处都在问「这条明细有没有一张 status = 3 的售后单」。
+     * 之所以是两份而不是一份：它们返回两种不同的 VO、
+     * 服务于两条不同的查询路径，共用 SQL 片段要跨 mapper 文件，代价更大。
+     * <b>按判据 ①，配了一条断言把两边的答案对着比</b> ——
+     * 见 {@code sql/test-after-sale.py} 的 I 组。
+     */
+    private Boolean refunded;
 }

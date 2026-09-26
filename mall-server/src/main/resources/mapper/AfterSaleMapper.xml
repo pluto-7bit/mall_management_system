@@ -1,0 +1,538 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  售后单的 SQL。★ 里程碑 17 新增。
+
+  ★★ 读这个文件之前先知道一件事：
+    T1~T7 是七条状态迁移边，它们**全部**是「条件 UPDATE + 看影响行数」的形状，
+    而且**每一条在关闭时都要把 active_token 从 0 改成自己的 id**。
+      · 这不是「顺手多改一个列」，它是**释放令牌** ——
+        不释放，那一行就永远申请不了售后（唯一索引一直挡着）；
+        该占用却没占用，同一行就会出现两张进行中的单。
+      · 「关闭」和「释放」在同一条 UPDATE 里，所以结构上不可能只做一半。
+      · 守卫它们的断言在 sql/test-after-sale.py 的 I 组。
+
+  ★ 关于 active_token 为什么必须存在（而不是简单地给 order_item_id 加唯一索引），
+    完整的论证在 AfterSale.activeToken 和 sql/migration-17-after-sale.sql 里。
+    一句话版本：MySQL 没有部分唯一索引，"只在活跃期内唯一" 只能靠
+    「把活跃编码成一个能被唯一索引看见的值」来表达。
+-->
+<mapper namespace="com.example.mall.mapper.AfterSaleMapper">
+
+    <!--
+      实体用的列清单（给 selectByOrderItemIds 用）。
+
+      ★ 显式列出每一列，不用 `a.*` —— 和 OrderMapper.baseColumns 同一条纪律：
+        `*` 在加列时会**静默**改变方法的返回值宽度，而显式的清单
+        会逼着下一个人做一次「这一列要不要返回」的决定。
+        （这里的读者是 Service，它只读 orderItemId / status / activeToken
+          三个字段，其余是顺带的 —— 但保持"实体 = 全部列"这个形状
+          比精确裁剪更省事，也更不容易在新加列时漏掉。）
+    -->
+    <sql id="entityColumns">
+        a.id, a.after_sale_no, a.order_id, a.order_no, a.order_item_id, a.member_id,
+        a.type, a.status, a.reason, a.description,
+        a.refund_amount, a.refund_freight, a.refund_method, a.refund_time,
+        a.reject_reason, a.return_company, a.return_tracking, a.return_time,
+        a.receive_time, a.active_token, a.create_time, a.update_time
+    </sql>
+
+    <!--
+      VO 用的列清单 = 售后单自己的列 + **明细快照**。
+
+      ★★ 这里 join 了 order_item，列清单里那个 a.order_item_id 已经在上面，
+        但 productName / skuSpec / price / quantity / subtotal 五个字段
+        必须从明细里取 —— 售后列表要显示「退的是哪件东西」。
+        ★ 为什么敢 join？**因为 join 的是 order_item 的主键**，
+          一对一是结构上的事实，不可能让行数变多。
+          ⚠️ 对比一下 **不能** 做的事：join orders（多一个"订单被硬删了
+          售后单跟着消失"的 LEFT JOIN 陷阱），或者 join after_sale 自己
+          （一条明细可以有多张售后单 → 行数翻倍）。判据不是"要不要 join"，
+          是"这次 join 会不会让行数变多"。
+
+      ★ 注意**没有** join product：商品可能已经被删了，而订单明细是快照。
+        这和 OrderItemVO 类注释里「不要为了显示图片去 join product」是同一条。
+    -->
+    <sql id="voColumns">
+        a.id, a.after_sale_no, a.order_no, a.order_item_id,
+        a.type, a.status, a.reason, a.description,
+        a.refund_amount, a.refund_freight, a.refund_method, a.refund_time,
+        a.reject_reason, a.return_company, a.return_tracking, a.return_time,
+        a.receive_time, a.create_time,
+        oi.product_name, oi.sku_spec, oi.price, oi.quantity, oi.subtotal
+    </sql>
+
+    <!--
+      用户端列表的条件。
+
+      ★ 和 countByMember 必须**共用这一段** —— 条件不一致的症状是
+        「页面显示 12 条、分页器说总共 8 条」，而且只在某些筛选组合下出现。
+
+      ★ member_id 是安全边界，不是筛选条件。它由 Service 从 JWT 取出来、
+        单独当参数传进来（不是 DTO 的字段），理由见
+        OrderMapper.selectPageByMember 的 javadoc：
+        放进 DTO 就会被 Spring MVC 自动绑定，于是 ?memberId=999 就能查别人的。
+    -->
+    <sql id="queryCondition">
+        WHERE a.member_id = #{memberId}
+        <if test="query.status != null">
+            AND a.status = #{query.status}
+        </if>
+    </sql>
+
+    <!--
+      管理端列表的条件。
+
+      ★★ 这里**没有** member_id 条件，这是它的特别之处 ——
+        管理员就该看到所有人的售后单。安全边界在路径前缀
+        （/api/admin/** 整个被 AdminAuthInterceptor 拦着），
+        理由见 AfterSaleMapper 接口注释和 OrderAdminController 的类注释。
+
+      ★ 四个条件都是可选的，全为 null 时返回全部（分页）。
+
+      ★ afterSaleNo 用 `=` 而不是 LIKE：管理员是拿着用户报的号来查的，
+        那种场景要的是「一条命中」。而且 after_sale_no 上有唯一索引，
+        等值查询走索引，LIKE '%x%' 是全表扫。
+
+      ★ memberKeyword 走子查询而不是 join：
+        子查询不依赖 join，所以 count 那条（不 join）能**共用同一段条件**。
+        这正是 OrderAdminMapper 里同一个选择的原因。
+    -->
+    <sql id="adminQueryCondition">
+        <where>
+            <if test="status != null">
+                AND a.status = #{status}
+            </if>
+            <if test="afterSaleNo != null">
+                AND a.after_sale_no = #{afterSaleNo}
+            </if>
+            <if test="type != null">
+                AND a.type = #{type}
+            </if>
+            <if test="memberKeyword != null">
+                AND a.member_id IN (
+                    SELECT id FROM member
+                    WHERE username LIKE CONCAT('%', #{memberKeyword}, '%')
+                       OR nickname LIKE CONCAT('%', #{memberKeyword}, '%')
+                )
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      ★★ join 也被抽成了片段，理由不只是"少写一行"：
+
+        两个管理端查询共用条件，但**它们的 join 不一样** ——
+        selectAdminPage 要 join member（拿申请人名字），
+        countAdminQuery 不 join（数数不需要）。
+
+        如果只抽条件、不抽 join，那么"共用"就只覆盖了一半，
+        下一个人改条件时会以为两个查询是对称的，
+        然后在 count 里也加一个 join —— 而 join member 是
+        **一对多**（虽然 uk_username 保证一对一，但那是另一个模块的约束），
+        count 加了 join 会得到和列表不一致的答案。
+
+        把 join 也变成片段，"哪些部分共用、哪些不共用"就写在结构里了。
+    -->
+    <sql id="adminJoin">
+        LEFT JOIN member m ON m.id = a.member_id
+    </sql>
+
+    <!-- ==================================================================
+         T1 申请
+         ================================================================== -->
+
+    <!--
+      插入一张售后单。
+
+      ★ active_token 写死 0（进行中）—— 它是**唯一**一个由调用方
+        显式提供的令牌值，其余时刻都是数据库/UPDATE 自己算出来的。
+
+      ★ refund_amount / refund_freight / refund_method / refund_time
+        **一个都不写**（remain NULL / DEFAULT 0.00）：
+        金额要到退款那一刻才能算准，因为"运费退不退"取决于之后
+        是不是全部明细都退完了。见 AfterSale.refundAmount 的完整论证。
+
+      ★ 刻意不写 create_time / update_time：它们有 DEFAULT CURRENT_TIMESTAMP。
+        写死 NOW() 也能work，但那样"这一行是什么时候建的"就有了两处定义。
+
+      ★★ 真正的闸门是 uk_order_item_active 唯一索引，不是这条 INSERT ——
+        调用方必须 catch DuplicateKeyException 并翻译成 1012。
+        同理 uk_after_sale_no 撞了要换号重试。两个唯一索引，两处 catch。
+    -->
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO after_sale (after_sale_no, order_id, order_no, order_item_id, member_id,
+                                type, status, reason, description, active_token)
+        VALUES (#{afterSaleNo}, #{orderId}, #{orderNo}, #{orderItemId}, #{memberId},
+                #{type}, 0, #{reason}, #{description}, 0)
+    </insert>
+
+    <!--
+      查这些明细上全部的售后单（进行中的 + 已关闭的）。
+
+      ★ 只用它来回答两个问题、给正常路径一句人话：
+          有进行中的吗？→ 1012    退过款了吗？→ 1013
+        ★ 它**不**负责防重复申请，那个由唯一索引负责。见接口注释。
+
+      ⚠️ 调用方必须保证集合非空：IN () 是 SQL 语法错误，不是"返回 0 行"。
+    -->
+    <select id="selectByOrderItemIds" resultType="AfterSale">
+        SELECT <include refid="entityColumns"/>
+        FROM after_sale a
+        WHERE a.order_item_id IN
+        <foreach collection="orderItemIds" item="itemId" open="(" close=")" separator=",">
+            #{itemId}
+        </foreach>
+        ORDER BY a.order_item_id, a.id
+    </select>
+
+    <!-- ==================================================================
+         查询
+         ================================================================== -->
+
+    <!--
+      按「售后单号 + 会员」查一张（用户端）。
+
+      ★ member_id 是安全边界：少了它，任何人拿别人的售后单号就能撤销别人的申请。
+        （订单号/售后单号是**会出现在分享链接和客服聊天里的标识符，不是密码**。）
+
+      ★ 查不到返回 null，"不存在" 和 "不是你的" **刻意不区分** ——
+        区分开来等于告诉对方"这张单是存在的"。
+    -->
+    <select id="selectByNoAndMember" resultType="AfterSale">
+        SELECT <include refid="entityColumns"/>
+        FROM after_sale a
+        WHERE a.after_sale_no = #{afterSaleNo}
+          AND a.member_id = #{memberId}
+    </select>
+
+    <!--
+      按售后单号查一张（管理端）。没有 member_id 条件 —— 管理员处理所有人的单。
+      和上面那个是**刻意的两个方法**，不用一个"传 null 就跳过会员校验"的方法：
+      那种分支是安全漏洞最喜欢藏身的地方。
+    -->
+    <select id="selectByNoForAdmin" resultType="AfterSale">
+        SELECT <include refid="entityColumns"/>
+        FROM after_sale a
+        WHERE a.after_sale_no = #{afterSaleNo}
+    </select>
+
+    <!--
+      按「售后单号 + 会员」查一张的完整 VO（用户端）。
+
+      ★ 和 selectByNoAndMember 是两条查询，不是一条 —— 区别在**列清单**：
+        那个给 Service 读 status/type/member_id，
+        这个给前端看商品名和金额。见接口注释里那段「两个时刻」。
+
+      ★★ 列清单来自 voColumns，但条件**不来自 queryCondition**，理由：
+        queryCondition 里那句 #{query.status} 要一个 query 参数
+        （分页 DTO），而这个方法是「按唯一键查一行」，没有分页、没有筛选。
+        硬套那个片段的结果是启动时看不出来、一执行就抛
+        `Parameter 'query' not found` ——
+        ★ 因为 MyBatis 是按【名字】绑参数的，名字对不上是【运行期】错误：
+          编译不报、启动不报，只有这个语句第一次真的被执行时才炸。
+          所以它落在「B 组申请成功」那条路径上一直没被发现（B 组的失败路径先跑完了）。
+
+      ★ 所以这里的 WHERE 和 selectByNoAndMember（它的孪生兄弟）**逐字相同** ——
+        两条查询的差别只有列清单，这一点是刻意的：
+        「查得到」和「查得出什么字段」是两件事，前者必须完全一致。
+    -->
+    <select id="selectVOByNoAndMember" resultType="AfterSaleVO">
+        SELECT <include refid="voColumns"/>
+        FROM after_sale a
+        LEFT JOIN order_item oi ON oi.id = a.order_item_id
+        WHERE a.after_sale_no = #{afterSaleNo}
+          AND a.member_id = #{memberId}
+    </select>
+
+    <!--
+      按售后单号查一张的完整 VO（管理端）。没有 member_id 条件，理由同 selectByNoForAdmin。
+    -->
+    <select id="selectVOByNoForAdmin" resultType="AfterSaleVO">
+        SELECT <include refid="voColumns"/>
+        FROM after_sale a
+        LEFT JOIN order_item oi ON oi.id = a.order_item_id
+        WHERE a.after_sale_no = #{afterSaleNo}
+    </select>
+
+    <!--
+      用户端分页：我的售后单。
+
+      ★ ORDER BY a.create_time DESC, a.id DESC ——
+        末尾的 a.id 是**正确性的一部分**，不是装饰：
+        create_time 只到秒，同一秒创建的两张单顺序不确定，
+        而 LIMIT 分页在顺序不确定时会出现"某些行重复出现、某些行从未出现"。
+        （同 OrderMapper.selectPageByMember 那段说明。）
+    -->
+    <select id="selectPageByMember" resultType="AfterSaleVO">
+        SELECT <include refid="voColumns"/>
+        FROM after_sale a
+        LEFT JOIN order_item oi ON oi.id = a.order_item_id
+        <include refid="queryCondition"/>
+        ORDER BY a.create_time DESC, a.id DESC
+        LIMIT #{query.offset}, #{query.pageSize}
+    </select>
+
+    <!--
+      数当前会员有多少张售后单。
+
+      ★ 和列表共用 queryCondition —— 所以筛选条件永远一致。
+
+      ⚠️ 这里**没有** join order_item：数数不需要它。
+        而且加了 join 反而危险 —— 虽然那条 join 是一对一（join 主键），
+        但"count 不 join、列表 join"这个不对称必须是有意的，
+        不能是"顺手抄过来"的。上面的 adminJoin 片段注释讲了同一件事。
+    -->
+    <select id="countByMember" resultType="long">
+        SELECT COUNT(*)
+        FROM after_sale a
+        <include refid="queryCondition"/>
+    </select>
+
+    <!--
+      管理端分页：全部售后单。
+
+      ★ 多了 m.username / m.nickname 两个字段，来自 adminJoin 片段。
+      ★ ORDER BY 的理由同上（create_time 只到秒，要拿 id 兜底）。
+    -->
+    <select id="selectAdminPage" resultType="AdminAfterSaleVO">
+        SELECT <include refid="voColumns"/>,
+               m.username AS memberUsername,
+               m.nickname AS memberNickname
+        FROM after_sale a
+        LEFT JOIN order_item oi ON oi.id = a.order_item_id
+        <include refid="adminJoin"/>
+        <include refid="adminQueryCondition"/>
+        ORDER BY a.create_time DESC, a.id DESC
+        LIMIT #{offset}, #{pageSize}
+    </select>
+
+    <!--
+      数全部会员有多少张售后单。
+
+      ★ 和 selectAdminPage 共用 adminQueryCondition，
+        但**不共用 adminJoin** —— 数数不需要 join member。
+        这个差别写在 adminJoin 片段的注释里，省得下一个人以为是对称的。
+    -->
+    <select id="countAdminQuery" resultType="long">
+        SELECT COUNT(*)
+        FROM after_sale a
+        <include refid="adminQueryCondition"/>
+    </select>
+
+    <!-- ==================================================================
+         T2 ~ T7：六条条件更新
+         ================================================================== -->
+
+    <!--
+      T2 · 同意「仅退款」= 同意即退款（0 待审核 → 3 退款完成）。
+
+      ★★ AND type = 1 是这一条的命门：没有它，对一张"退货退款"的单
+         调用这个方法也会成功 → **货还在买家手里、钱已经退了**，
+         而且没有任何一层会报错。
+
+      ★★ active_token = id 和 status = 3 在同一条 UPDATE 里：
+         "关闭" 和 "释放令牌" 结构上不可能分开。
+
+      ★ refund_amount / refund_freight / refund_time / refund_method
+         也是同一次写入 —— §6.3(b) 的原子性断言抓的就是这里。
+         分开写会出现"状态说退了、金额还是 null"。
+
+      ★ refund_amount 由 Service 算好传进来：SQL 读不到
+        orders.freight_amount 和「别的行退完没有」这两个输入。
+    -->
+    <update id="markRefundedForOnlyRefund">
+        UPDATE after_sale
+        SET status         = 3,
+            active_token   = id,
+            refund_amount  = #{refundAmount},
+            refund_freight = #{refundFreight},
+            refund_method  = #{refundMethod},
+            refund_time    = NOW()
+        WHERE id = #{id}
+          AND status = 0
+          AND type = 1
+    </update>
+
+    <!--
+      T3 · 同意「退货退款」（0 待审核 → 1 待买家寄回）。
+
+      ★ 它不做任何副作用：不退款、不还库存。
+        这是本轮最贵的决定 —— 合成一个状态的话，管理员能在用户还没寄回时
+        就点"确认收到"，钱退了货还在买家手里，没有任何一层会报错。
+
+      ★ 没有 member_id：管理端操作别人的单（同 OrderAdminMapper.markShipped）。
+
+      ★ AND type = 2 的理由同 T2，方向相反。
+    -->
+    <update id="markApprovedForReturn">
+        UPDATE after_sale
+        SET status = 1
+        WHERE id = #{id}
+          AND status = 0
+          AND type = 2
+    </update>
+
+    <!--
+      T4 · 拒绝（0 或 1 → 4 已拒绝）。
+
+      ★ status IN (0, 1)：允许管理员同意后反悔（还没收到货），
+        ★ 但**不允许**拒绝 status = 2（货在途，只能确认收到）——
+          那时候拒绝会让买家陷入"东西寄走了、钱没退、单还被拒了"。
+
+      ★ 它不还库存，和 T7 一起是测试 C 组的对照组。
+
+      ★ 同样释放 active_token。
+    -->
+    <update id="markRejected">
+        UPDATE after_sale
+        SET status        = 4,
+            active_token  = id,
+            reject_reason = #{rejectReason}
+        WHERE id = #{id}
+          AND status IN (0, 1)
+    </update>
+
+    <!--
+      T5 · 买家填寄回物流（1 待买家寄回 → 2 待卖家收货）。
+
+      ★ 用户端动作，必须带 member_id —— 只有买家自己能填。
+
+      ★ 它既不退款也不接触库存。这一条边唯一的效果是把"球"
+        从买家手里传给卖家。
+
+      ★ 这里**没有**释放 active_token：status = 2 还是进行中。
+    -->
+    <update id="markReturned">
+        UPDATE after_sale
+        SET status          = 2,
+            return_company  = #{returnCompany},
+            return_tracking = #{returnTracking},
+            return_time     = NOW()
+        WHERE id = #{id}
+          AND member_id = #{memberId}
+          AND status = 1
+    </update>
+
+    <!--
+      T6 · 确认收到退货 → 退款（2 待卖家收货 → 3 退款完成）。
+
+      ★★ 这是整轮里唯一一处「库存归还」和「退货」真正相遇的地方。
+         货在买家手里待了一路，直到管理员确认收到才回到仓库 ——
+         所以归还库存挂在这一条边上，不在 T3 上。
+         调用方顺序：先抢这条边，抢到了才有资格还库存。反了就是库存翻倍。
+
+      ★ 没有 AND type = 2：status = 2 只可能由 T3 产生，而 T3 已经带了 type = 2。
+        再加一遍是一条不会红的检查（一条不会红的检查等于没有检查）。
+        ⚠️ 但如果哪天有了第二条进入 status = 2 的边，这里就必须补上。
+
+      ★ receive_time 和退款三件套同一次写入：它是"货回来了"的凭据，
+        而钱是因为货回来了才退的。分开写会出现"退了钱但没有收货时间"。
+    -->
+    <update id="markReceivedAndRefunded">
+        UPDATE after_sale
+        SET status         = 3,
+            active_token   = id,
+            refund_amount  = #{refundAmount},
+            refund_freight = #{refundFreight},
+            refund_method  = #{refundMethod},
+            refund_time    = NOW(),
+            receive_time   = NOW()
+        WHERE id = #{id}
+          AND status = 2
+    </update>
+
+    <!--
+      T7 · 用户撤销申请（0 待审核 → 5 已撤销）。
+
+      ★ 只允许从 status = 0 撤：status = 1 之后货已经在往回寄的路上了，
+        "撤销"是什么意思需要一段新规则（东西还退不退？钱退不退？）。
+
+      ★★ 它是**唯一一条永不接触库存的关闭边** ——
+         这一点是承重的：它让测试 C 组能拿一条真正走完的完整流程
+         去当"库存一个数都没动"的对照组。
+
+      ★ 用户端动作，带 member_id。
+    -->
+    <update id="markCancelledByMember">
+        UPDATE after_sale
+        SET status       = 5,
+            active_token = id
+        WHERE id = #{id}
+          AND member_id = #{memberId}
+          AND status = 0
+    </update>
+
+    <!-- ==================================================================
+         T8：订单终态
+         ================================================================== -->
+
+    <!--
+      数「这笔订单里，除了这一条明细，还有几条没有退完」。
+
+      ★★ 它存在的理由只有一个：决定这次退款要不要带上运费。
+         运费的商业含义是"把这批货运到你这儿"的成本 ——
+         整单都退了 = 这笔运输没产生价值 = 退；部分退 = 运输发生了 = 不退。
+
+      ★ 退款**之前**就要知道答案（金额和状态同一条 UPDATE 写下去），
+        所以要把自己排除在外再数。
+
+      ★ 子查询和 markOrderRefundedIfAllRefunded 里那句逐字相同，
+        只是时刻不同（一句问"退款前"，一句问"退款后"）。
+        这是同一事实的两份实现，配了两条断言一起盖（见接口注释）。
+    -->
+    <select id="countOtherUnrefundedItems" resultType="int">
+        SELECT COUNT(*)
+        FROM order_item i
+        WHERE i.order_id = #{orderId}
+          AND i.id &lt;&gt; #{excludeOrderItemId}
+          AND NOT EXISTS (
+              SELECT 1 FROM after_sale a
+               WHERE a.order_item_id = i.id AND a.status = 3
+          )
+    </select>
+
+    <!--
+      T8 · 把订单推到终态「已退款」（orders.status 1/2/3 → 5）。
+
+      ★★ 它赚到位置的原因：它同时是 markShipped（WHERE status = 1）和
+         markCompleted（WHERE status = 2）的闸门。没有它，
+         一张全部明细都退完款的订单会永远停在"已付款"，
+         管理员点一下"发货"就把退过款的东西发出去了 —— 钱货两空。
+
+      ★★ 不要检查影响行数：affected = 0 的正常含义是"还没全退完"，
+         不是错误。检查它只会制造假失败，而那个假失败发生在一个事务里，
+         会把"退款成功、库存已还"整个回滚掉。
+
+      ★ 为什么"重算"不违反"不加汇总列"那条铁律：
+         漂移的定义是"两个写入者给出不同的答案"。这里只有一个写入者、
+         一个方向 —— 售后状态只会往 3 走、不会回头，所以"全退完了"
+         一旦成立就永久成立，重复执行任意次结果相同。**它可以被重算，
+         因为它不会抖动。**
+
+      ★ 条件 status IN (1, 2, 3)：只从"还在流程里"的状态推到终态。
+        待付款/已取消/已退款的订单不动（已取消的订单根本不该有售后单）。
+
+      ⚠️⚠️ 子查询里**不能出现 orders**（ERROR 1093：不能在 UPDATE 的目标表上
+         再查它自己）。下面查的是 order_item 和 after_sale，安全。
+         下一个人在这里加一个 JOIN orders 就会炸 —— 会炸是好事，
+         但提前说一句省一次调试。
+    -->
+    <update id="markOrderRefundedIfAllRefunded">
+        UPDATE orders o
+        SET o.status = 5
+        WHERE o.id = #{orderId}
+          AND o.status IN (1, 2, 3)
+          AND NOT EXISTS (
+              SELECT 1 FROM order_item i
+               WHERE i.order_id = o.id
+                 AND NOT EXISTS (
+                     SELECT 1 FROM after_sale a
+                      WHERE a.order_item_id = i.id AND a.status = 3
+                 )
+          )
+    </update>
+
+</mapper>

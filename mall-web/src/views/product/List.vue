@@ -75,6 +75,49 @@ async function loadCategories() {
   }
 }
 
+/**
+ * 分类选项的显示文案（一级缩进区分二级分类）。
+ *
+ * <p>和 ProductForm.vue 里那个函数是<b>同一份实现、两个副本</b>，
+ * 这是可以接受的 —— 两个文件本来就没有共享代码，
+ * 为它新建一个 utils 只是为了三行字符串拼接，不值。
+ *
+ * <p>但要知道它<b>会分岔</b>：哪天缩进样式改了（比如从 `　└ `
+ * 换成 `— `），只改一处的话，同一个分类在列表页的筛选框里
+ * 和在编辑弹窗里会长得不一样。两处都改。
+ *
+ * <p>`　` 是全角空格 U+3000（普通空格在 HTML 里会被折叠掉）。
+ */
+function categoryLabel(c) {
+  return (c.parentId ? '　└ ' : '') + c.name
+}
+
+/**
+ * 这一行的价格要不要显示成区间（★ 里程碑 16 新增）。
+ *
+ * <p>判据是「最低价和最高价不相等」。4 个规格都卖 100 元时
+ * 写「¥100.00 ~ ¥100.00」是在编造一个范围 ——
+ * <b>一个永远为真的修饰语等于没有信息</b>，和下面「N 规格」那条注释
+ * 里说的「库存超过 99 才提示限购」是同一条判断。
+ *
+ * <p>⚠️ 必须判 null：一件没有任何 SKU 的商品两个字段都是 null
+ * （后端刻意不 COALESCE），而 {@code null !== undefined} 是 true ——
+ * 靠巧合成立的分支早晚会翻脸，所以这里明写两个判断。
+ *
+ * <p>★ 和 mall-shop 的 {@code Home.vue} 里同名函数是<b>两份实现</b>：
+ * 两个项目之间没有共享代码，这是既定事实（见 categoryLabel 上面那段）。
+ * 判据也一样会分岔 —— 改一处就要两处都改。
+ */
+function hasRange(row) {
+  if (row.maxPrice === null || row.maxPrice === undefined) {
+    return false
+  }
+  if (row.minPrice === null || row.minPrice === undefined) {
+    return false
+  }
+  return Number(row.maxPrice) !== Number(row.minPrice)
+}
+
 // ---------------------------------------------------------------------------
 // 搜索
 // ---------------------------------------------------------------------------
@@ -203,7 +246,7 @@ onMounted(() => {
             <el-option
               v-for="item in categories"
               :key="item.id"
-              :label="item.name"
+              :label="categoryLabel(item)"
               :value="item.id"
             />
           </el-select>
@@ -278,14 +321,18 @@ onMounted(() => {
         <el-table-column prop="categoryName" label="分类" width="110" align="center" />
 
         <!--
-          价格（里程碑 15 改造）。
+          价格（里程碑 15 改造，里程碑 16 加了区间）。
 
           ★ 数据源从 row.price 换成了 row.minPrice ——
             价格不再挂在这件商品上，而是挂在每一行 SKU 上，
             列表显示的是【起售价】= MIN(sku.price)，由后端 join 出来。
 
-          ★ 多规格时跟一个「起」字。不跟的话会有一个安静的误导：
-            运营看到「¥4999」，以为这就是售价，而它其实是 6 个规格里最便宜那个。
+          ★★ 里程碑 16：多规格时不再跟「起」字，改成显示【区间】
+            （¥100.00 ~ ¥300.00）。理由：「起」只说出了下界，
+            而运营看列表时想知道的是这个商品的价格跨度有多大 ——
+            「¥100 起」让他必须点进详情才知道上界。
+            ⚠️ 区间只在两个数不相等时显示，判据见 hasRange()：
+              4 个规格都卖 100 元时写「¥100.00 ~ ¥100.00」是在编造一个范围。
 
           ⚠️ 不能写成 row.price —— 阶段 2~5 期间后端还有一个同名的字段
             （派生汇总，回滚预案），它会取到一个和这里【不同】的数字，
@@ -294,14 +341,14 @@ onMounted(() => {
             所以写错会当场渲染成一片空白 —— 从「静默的错」变成了
             「一眼看得见的错」。**这就是删列值不值得做的判据之一。**
         -->
-        <el-table-column prop="minPrice" label="价格" width="130" align="right">
+        <el-table-column prop="minPrice" label="价格" width="170" align="right">
           <!--
             用插槽自定义单元格显示。 #default="{ row }" 解构出当前行的数据。
             这种写法可以在单元格里做任意格式化，比 prop 直接显示灵活得多
           -->
           <template #default="{ row }">
             <span class="price">
-              ¥{{ Number(row.minPrice).toFixed(2) }}<i v-if="row.skuCount > 1" class="from">起</i>
+              ¥{{ Number(row.minPrice).toFixed(2) }}<template v-if="hasRange(row)"> ~ ¥{{ Number(row.maxPrice).toFixed(2) }}</template>
             </span>
           </template>
         </el-table-column>
@@ -404,11 +451,11 @@ onMounted(() => {
   font-weight: 600;
 }
 
-/* 「起」和「N 规格」这两个小尾巴（里程碑 15）。
+/* 「N 规格」这个小尾巴（里程碑 15；原来还有个「起」，里程碑 16 换成了区间）。
    ★ 用 <i> 而不是 <span> 是为了【不被 price 的 font-weight: 600 继承】——
      i 默认是斜体，这里显式 normal 覆盖掉；同时字号调小、颜色变灰，
-     让它是价格旁边的注释而不是价格的一部分。
-   ⚠️ 不改成 <b> 之类的：那样看起来像「起」也是金额的一部分。 */
+     让它是商品名的注释而不是价格的一部分。
+   ⚠️ 不改成 <b> 之类的：那样看起来像「N 规格」也是金额的一部分。 */
 .from {
   font-style: normal;
   font-weight: 400;

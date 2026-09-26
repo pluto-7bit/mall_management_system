@@ -76,6 +76,8 @@ function handleCommand(command) {
     router.push('/orders')
   } else if (command === 'addresses') {
     router.push('/addresses')
+  } else if (command === 'afterSales') {
+    router.push('/after-sales')
   } else if (command === 'logout') {
     handleLogout()
   }
@@ -180,10 +182,42 @@ const activeCategoryId = computed(() => readCategoryId(route.query))
  * <p>所以下面所有链接都手写 {@code :class="{ active: ... }"}，
  * 并且 CSS 里<b>绝不能</b>留 {@code .nav-link.router-link-active} 那条规则
  * （原来有一条，删掉了）—— 留着它所有链接还是会一起亮。
+ *
+ * <h3>★ 里程碑 16：判断从"相等"换成了"属于这一支"</h3>
+ *
+ * <p>真正做判断的是 {@code categoryStore.isBranchActive}，
+ * 这里只补一个"必不必须在首页"的条件。
+ *
+ * <p>换掉的后果是具体的：点了一个二级分类之后，
+ * <b>它的父分类也会亮</b>。这不是副作用，是想要的效果 ——
+ * 否则导航条上一个高亮都没有，而列表确实被筛过了，
+ * 用户会以为筛选坏了。
+ *
+ * <p>★ 而且这个函数<b>必须和 Home.vue 里那个判断是同一个实现</b>，
+ * 理由就是 {@code utils/query.js} 开头那段（「同一个语义判断
+ * 只能有一个实现」）。两处各写一遍的话，很可能一边判断"相等"、
+ * 一边判断"属于这一支" —— 于是出现<b>导航点亮了父分类、
+ * 左栏选中了子分类</b>这种对不上的状态，而两边各自都"没错"。
  */
 function isCategoryActive(id) {
-  return onHome.value && activeCategoryId.value === id
+  return onHome.value && categoryStore.isBranchActive(id, activeCategoryId.value)
 }
+
+/**
+ * 导航条要渲染的两级结构。
+ *
+ * <p>★ 在 store 的扁平数组上现拼，而不是让 store 缓存一棵树：
+ * 树只被这一处用（Home.vue 的左栏也是拼出来的，而且它要的形状不同），
+ * 放进 store 就是给「也许还有别人要用」留一个接口。
+ *
+ * <p>⚠️ 字段名用 {@code subs} 而<b>不是</b> {@code children}：
+ * 本项目里 {@code children} 已经是「分类树的子节点」这个专有含义了
+ * （后端返回的、以及 el-table 树模式认的那个字段）。
+ * 在这里也叫 children，下一个人会以为它就是接口给的那个树。
+ */
+const navItems = computed(() =>
+  categoryStore.roots.map((r) => ({ ...r, subs: categoryStore.childrenOf(r.id) })),
+)
 
 /** 「全部商品」在首页且没有分类条件时高亮 */
 const isAllActive = computed(() => onHome.value && activeCategoryId.value === null)
@@ -258,6 +292,10 @@ onMounted(async () => {
                     <el-icon><Location /></el-icon>
                     <span>收货地址</span>
                   </el-dropdown-item>
+                  <el-dropdown-item command="afterSales">
+                    <el-icon><RefreshLeft /></el-icon>
+                    <span>退款/售后</span>
+                  </el-dropdown-item>
                   <el-dropdown-item command="logout" divided>
                     <el-icon><SwitchButton /></el-icon>
                     <span>退出登录</span>
@@ -330,13 +368,16 @@ onMounted(async () => {
     <nav class="nav-bar">
       <div class="page-container nav-inner">
         <!--
-          「全部商品分类」暂时只是回首页的链接。
-          京东这里是一个悬浮的大抽屉（鼠标移上去展开全部二级分类），
-          本项目不做 —— 那是这一轮唯一需要新增共享状态的京东特性，
-          而且我们只有一级分类，抽屉里展开也是同一份列表。
-          将来要做，形状是 el-popover 读 categoryStore.list
-          然后 router.push({ path: '/', query: { categoryId } })，
-          仍然是同一条写入路径。
+          「全部商品分类」仍然只是回首页的链接。
+          京东这里是一个悬浮的大抽屉，本项目不做 ——
+          那需要一份「全部二级分类」的平铺长列表，而我们的分类
+          加起来只有十几个，抽屉里展开和下面的导航条是同一份东西。
+
+          ★ 里程碑 16 之前这里的注释写着「将来要做，形状是 el-popover
+            读 categoryStore.list」—— 那一天到了，但落地的是【每个
+            一级分类各自的气泡】，而不是一个总抽屉。
+            理由：一个分类的两级关系，放在它自己身上最清楚；
+            全塞进一个抽屉的话，用户还得先在抽屉里找到那个分类。
         -->
         <router-link
           to="/"
@@ -359,16 +400,62 @@ onMounted(async () => {
               router-link-active —— 这些链接的差别只有 query，
               而 active 是按 route record 算的，会一起点亮。
               详见上面 isCategoryActive 的注释。
+
+            ★★ 里程碑 16：一级分类走 navItems；有二级分类的那个
+               外面套一层 el-popover（鼠标移上去展开）。
+
+              ★ 这里【没有 v-if / v-else 两个分支】，用的是
+                `:disabled="!c.subs.length"` —— 一个 el-popover 包住所有情况。
+                为什么不用 v-if/v-else：那样两个分支要各写一遍 :class，
+                而 v-else 那份只在"这个分类有子分类"时才走，所以漏掉它
+                永远不会在现在的数据上暴露（现在一个父子都没有）。
+                **一个只在特定数据形状下才会走到的分支，就是一个
+                只在特定数据形状下才会发现的 bug。**
           -->
-          <router-link
-            v-for="c in categoryStore.list"
+          <el-popover
+            v-for="c in navItems"
             :key="c.id"
-            :to="{ path: '/', query: { categoryId: c.id } }"
-            class="nav-link"
-            :class="{ active: isCategoryActive(c.id) }"
+            trigger="hover"
+            placement="bottom-start"
+            :width="150"
+            :show-arrow="false"
+            :show-after="80"
+            :disabled="!c.subs.length"
           >
-            {{ c.name }}
-          </router-link>
+            <template #reference>
+              <router-link
+                :to="{ path: '/', query: { categoryId: c.id } }"
+                class="nav-link"
+                :class="{ active: isCategoryActive(c.id) }"
+              >
+                {{ c.name }}
+              </router-link>
+            </template>
+
+            <!--
+              ★ 这些子链接指向的是【二级分类自己】，不是父分类。
+                点父分类（上面的 reference）才是「看这一整支」——
+                后端会把父分类展开成「自己 + 所有后代」，
+                所以两个链接的结果确实不同，这是有意的。
+
+              ★ 子分类【不再往下渲染】：分类最多两级，
+                这里没有第三层要处理。哪天后端放开三级，
+                这个模板必须跟着改，而【不会有任何东西报错】——
+                症状是三级分类从导航里彻底消失（它们既不是根，
+                也不在任何根的 subs 里）。
+            -->
+            <div class="nav-subs">
+              <router-link
+                v-for="sub in c.subs"
+                :key="sub.id"
+                :to="{ path: '/', query: { categoryId: sub.id } }"
+                class="nav-sub"
+                :class="{ active: isCategoryActive(sub.id) }"
+              >
+                {{ sub.name }}
+              </router-link>
+            </div>
+          </el-popover>
         </div>
       </div>
     </nav>
@@ -632,6 +719,50 @@ onMounted(async () => {
    原来有一条，删掉了 —— vue-router 的 active 是按 route record 算的、
    不看 query，所以所有指向 "/" 的分类链接会一起点亮。
    见 isCategoryActive 的注释。 */
+
+/* ---- 二级分类的气泡内容（里程碑 16）----
+   ⚠️ 这两条虽然写在 scoped 里，但【它们能生效】——
+      原因不是"气泡没被 teleport"，而是 el-popover 默认
+      把 DOM 挪到 body 下时，节点上带着本组件的 scope 属性，
+      属性跟着节点走，所以选择器照样命中。
+      ★ 反过来要注意：给 `popper-class` 指定的那个类【加不上 scoped 样式】——
+        它是 EP 自己创建的包裹层，没有本组件的 scope 属性。
+        要调气泡的内边距，得写不带 scoped 的全局样式。
+        本项目不调，用 EP 默认的 12px。
+
+   ★ 上面这两段是【实测过的】，不是推测。悬停展开气泡之后读 DOM：
+       .nav-sub   → 属性里有 data-v-7a7a37b1，计算样式 padding-left:8px / font-size:14px
+                    （正是下面这两条规则，说明 scoped 命中了）
+       .el-popover→ 属性列表里一个 data-v- 都没有（EP 自己创建的包裹层）
+     ⚠️ 这个 scope 属性的值（7a7a37b1）是构建时生成的，改文件就会变，
+       【不要】把它当成一个可以引用的常量。 */
+.nav-subs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-sub {
+  padding: 6px 8px;
+  color: #333;
+  font-size: 14px;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.nav-sub:hover {
+  color: var(--jd-red);
+  background-color: var(--jd-bg);
+}
+
+/* ★ 选中二级分类时，气泡收起之前它自己也要是红的。
+   注意父分类的红色高亮由 .nav-link.active 负责，
+   而那是 isBranchActive 算出来的 —— 两处用的同一个函数。 */
+.nav-sub.active {
+  color: var(--jd-red);
+  font-weight: 700;
+}
 
 /* ============================ 内容区 / 页脚 ============================ */
 .shop-main {

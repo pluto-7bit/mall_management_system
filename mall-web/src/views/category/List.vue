@@ -1,40 +1,70 @@
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getCategoryPage, deleteCategory } from '@/api/category'
+import { getCategoryTree, deleteCategory } from '@/api/category'
 import CategoryForm from './CategoryForm.vue'
 
 /**
  * 分类列表页。
  *
- * <p>结构和商品列表页完全一样，从上到下四部分：
- *   1. 搜索条件区
- *   2. 操作按钮区
- *   3. 数据表格区
- *   4. 分页器
+ * <h3>★★ 里程碑 16：这张表从「分页列表」变成了「树」</h3>
  *
- * <p>建议你对照着商品列表页看一遍 —— 会发现除了「字段少几个」之外，
- * 骨架是一模一样的。这就是分层的价值：
- * <b>学会一个列表页，后面的订单列表、会员列表都是照着套</b>。
- * 真正需要动脑的只有「这个模块比别人多了什么特殊规则」。
+ * <p>原来的骨架和商品列表页一模一样：搜索 / 按钮 / 表格 / 分页器，四段。
+ * 现在<b>第四段整个删掉了</b>，第三段换成了树模式。这不是"顺手做了个优化"，
+ * 是因为<b>分页和树是互相矛盾的</b>：
  *
- * <p>分类比商品特殊的地方只有一处：<b>删除可能被拒绝</b>
- * （分类下还有商品时不让删），见 handleDelete 的注释。
+ * <pre>
+ *   第 1 页里出现了一个子分类，而它的父分类排在第 2 页
+ *     → 这一页上它就是一个【孤儿节点】
+ *     → 要么前端把它当根渲染（层级错了）
+ *     → 要么它从页面上消失（更难查）
+ * </pre>
+ *
+ * <p>「按根分页、每根带全子树」可以做对，但那样 `total` 就变成了
+ * <b>根的数量</b>，而「共 N 条」这句话会开始骗人 ——
+ * 用户数了数屏幕上有 12 个分类，页面告诉他「共 6 条」。
+ * <b>一个回答不了的问题不应该有一个假答案</b>，所以分页整个去掉。
+ * 分类是几十条量级的数据，一次全读进来没有代价。
+ *
+ * <h3>⚠️ 搜索之后树会变得「稀疏」，这是设计</h3>
+ *
+ * <p>筛「手机」时，命中的子分类会带上它的<b>祖先链</b>一起返回
+ * （祖先本身不需要命中），命中的父分类会带上<b>整棵子树</b>。
+ * 所以搜一个只命中一个子分类的词，你会看到「父分类 → 那一个子分类」这样
+ * 一条细长的路径，而不是孤零零一行。
+ * <b>能看出"它挂在哪"比"省掉两行"重要</b>——后者只会让人以为分类建错了。
+ *
+ * <p>分类比商品特殊的地方还是那一处：<b>删除可能被拒绝</b>，
+ * 而且现在有<b>两种</b>拒绝（还有子分类 / 还有商品），见 handleDelete。
  */
 
 const loading = ref(false)
 const tableData = ref([])
-const total = ref(0)
 
+/** 筛选条件。★ 没有 pageNum / pageSize 了 —— 后端已经不接受分页参数（传了会被静默忽略） */
 const query = reactive({
-  pageNum: 1,
-  pageSize: 10,
   name: '',
   status: null,
 })
 
 const formVisible = ref(false)
 const editingId = ref(null)
+
+/**
+ * 「当前显示 N 条」。
+ *
+ * <p>⚠️ 这个数字是<b>在返回的树上递归数出来的</b>，不是后端给的 total ——
+ * 接口现在返回的就是整个森林，没有 total 这个字段。
+ *
+ * <p>★ 注意它的含义和「全库有多少个分类」<b>不一样</b>：
+ * 搜索时它是「命中 + 祖先 + 子树」的节点数。
+ * 所以文案写的是「当前显示」而不是「共」—— 「共」会让人以为那是总数。
+ * 要看总数就把搜索条件清空，那时两者才相等。
+ */
+const shownCount = computed(() => {
+  const walk = (nodes) => (nodes || []).reduce((n, node) => n + 1 + walk(node.children), 0)
+  return walk(tableData.value)
+})
 
 // ---------------------------------------------------------------------------
 // 数据加载
@@ -43,13 +73,16 @@ const editingId = ref(null)
 async function loadData() {
   loading.value = true
   try {
-    const res = await getCategoryPage(query)
-    tableData.value = res.list
-    total.value = res.total
+    const res = await getCategoryTree(query)
+    // ★ 拿到的是【数组】（森林），不是 { list, total, ... }。
+    //   里程碑 16 之前这里写的是 res.list —— 接口形状一换，
+    //   那个表达式会得到 undefined，表格空白，而控制台一片安静。
+    //   `?? []` 是给「后端返回 null」兜底，不是给形状变化兜底：
+    //   形状真的变了它救不了你，能救你的只有这张表本身可见。
+    tableData.value = res ?? []
   } catch {
     // 错误提示已在响应拦截器里统一处理
     tableData.value = []
-    total.value = 0
   } finally {
     // 用 finally 保证无论成功失败都要关掉 loading 转圈，
     // 否则接口一报错页面就一直转，用户以为卡死了
@@ -58,30 +91,19 @@ async function loadData() {
 }
 
 // ---------------------------------------------------------------------------
-// 搜索 / 分页
+// 搜索
 // ---------------------------------------------------------------------------
 
 function handleSearch() {
-  // ★ 搜索时必须把页码重置回第 1 页，否则会「明明有数据却显示暂无数据」
-  query.pageNum = 1
+  // ★ 原来这里有一句 query.pageNum = 1（搜完要回第 1 页）。
+  //   分页没了，这句话也跟着没了 —— 这不是"顺手删掉的"，
+  //   而是「没有页码这个概念」的自然结果。
   loadData()
 }
 
 function handleReset() {
   query.name = ''
   query.status = null
-  query.pageNum = 1
-  loadData()
-}
-
-function handlePageChange(page) {
-  query.pageNum = page
-  loadData()
-}
-
-function handleSizeChange(size) {
-  query.pageSize = size
-  query.pageNum = 1
   loadData()
 }
 
@@ -102,8 +124,14 @@ function handleEdit(row) {
 /**
  * 删除分类。
  *
- * <p><b>这个删除比商品删除多一种失败情况</b>：分类下还挂着商品时，
- * 后端会拒绝删除并返回「该分类下还有 N 个商品，请先移走或删除这些商品」。
+ * <p><b>这个删除比商品删除多两种失败情况</b>：
+ * <ul>
+ *   <li>分类下还挂着<b>商品</b> →「该分类下还有 N 个商品，请先移走或删除这些商品」</li>
+ *   <li>分类下还有<b>子分类</b> →「该分类下还有 N 个子分类，请先删除这些子分类」</li>
+ * </ul>
+ *
+ * <p>后端先查子分类、后查商品，所以两种都占着时会先提示子分类那条 ——
+ * 那是用户真正该先做的事。
  *
  * <p>前端这里怎么处理？答案是<b>什么都不用特殊处理</b>。
  * 响应拦截器已经把后端的 message 弹出来了，用户看到了明确的原因，
@@ -111,8 +139,6 @@ function handleEdit(row) {
  *
  * <p>这正是统一异常处理的价值：后端抛一个 BusinessException，
  * 前端不用写任何 if-else 判断错误类型，提示就自动到位了。
- * 想象一下如果后端返回的是「500 服务器错误」，
- * 用户完全不知道自己做错了什么 —— 那才需要前端做各种特殊处理来补救。
  */
 async function handleDelete(row) {
   try {
@@ -129,13 +155,12 @@ async function handleDelete(row) {
     await deleteCategory(row.id)
     ElMessage.success('删除成功')
 
-    // 边界情况：当前页只剩这一条时，删完这页就空了，应该自动往前翻一页
-    if (tableData.value.length === 1 && query.pageNum > 1) {
-      query.pageNum -= 1
-    }
+    // ★ 原来这里有一段「当前页只剩这一条时自动往前翻一页」的边界处理。
+    //   它跟着分页器一起删掉了 —— 树没有页可翻。
+    //   整个森林一次全在页面上，删掉谁都只是那一行消失。
     loadData()
   } catch {
-    // 已统一提示。可能是「分类下有商品」，也可能是网络问题，
+    // 已统一提示。可能是「还有子分类」或「还有商品」，也可能是网络问题，
     // 两种情况都不该刷新列表（删失败了，列表没变）
   }
 }
@@ -185,20 +210,72 @@ onMounted(() => {
           <el-icon><Plus /></el-icon>
           <span>新增分类</span>
         </el-button>
-        <span class="total-tip">共 {{ total }} 条</span>
+        <span class="total-tip">当前显示 {{ shownCount }} 条</span>
       </div>
 
-      <el-table v-loading="loading" :data="tableData" border stripe style="width: 100%">
+      <!--
+        ★★ 树模式靠三个属性，缺一不可：
+
+          row-key="id"                          告诉表格"哪一列是主键"。
+                                                树的行需要稳定的身份来记住展开状态，
+                                                没有它展开/收起会错乱
+          :tree-props="{ children: 'children' }" 告诉表格"子节点挂在哪个字段下"
+          default-expand-all                     默认全展开。
+
+        ⚠️ 关于 default-expand-all：它只在【首次渲染】时生效。
+           搜索之后重新 load，展开状态是保留在表格内部的 ——
+           所以搜索不会把树收起来，这一点是想要的（搜索结果本来就是稀疏的，
+           收起只会让人以为没搜到东西）。
+      -->
+      <el-table
+        v-loading="loading"
+        :data="tableData"
+        row-key="id"
+        :tree-props="{ children: 'children' }"
+        default-expand-all
+        border
+        stripe
+        style="width: 100%"
+      >
+        <!--
+          ★★ 树模式下【第一个列必须是分类名称】—— 这是从一次实际的
+             排版事故里改过来的。
+
+             el-table 的树缩进和展开箭头【只画在第一列】上。
+             原来 ID 是第一个列（width 70），子分类行拿到缩进之后，
+             那 70px 里塞不下「缩进 + 287」，于是 287 被挤到第二行，
+             看起来像一个排版 bug。
+             把 name 换到第一位之后，缩进和箭头落在宽度足够的名称列上，
+             ID 列只是被整体右移，不参与树的绘制。
+
+          ⚠️ 所以：**这张表的列顺序不能"顺手换回 ID 在前"**。
+             换了不会报错，只会让每一行的 ID 折行。
+        -->
+        <el-table-column prop="name" label="分类名称" min-width="180" show-overflow-tooltip />
+
         <el-table-column prop="id" label="ID" width="70" align="center" />
 
-        <el-table-column prop="name" label="分类名称" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="parentId" label="上级" width="90" align="center">
+          <!--
+            ★ 0 显示成「—」而不是「0」。
+              parentId = 0 表示「没有父」，是【一级分类】的意思 ——
+              直接印一个 0 出来，读的人会以为那是个真实存在的分类 id
+              （尤其是它旁边就有一列真的 id，1 号分类就在那儿）。
+          -->
+          <template #default="{ row }">
+            <span v-if="row.parentId === 0" class="muted">—</span>
+            <span v-else>{{ row.parentId }}</span>
+          </template>
+        </el-table-column>
 
         <el-table-column prop="sort" label="排序" width="90" align="center">
           <!--
             排序值越小越靠前。这里直接显示数字不加修饰，
             因为「小的是前面」这个规则本身不直观，
             加了颜色或图标反而容易让人以为是别的东西。
-            真要做得更友好，可以在别的分类排序旁边加个「排序第 N 位」的文案
+            ★ 同级的子分类之间也按这个值排序，而且【先父后子】——
+              排序在 SQL 里做完（ORDER BY sort ASC, id ASC），
+              前端不再排一遍。两处都排就会出现「页面上的顺序和接口给的不一样」。
           -->
           <template #default="{ row }">{{ row.sort }}</template>
         </el-table-column>
@@ -225,19 +302,9 @@ onMounted(() => {
         </template>
       </el-table>
 
-      <!-- ============ 4. 分页器 ============ -->
-      <div class="pagination">
-        <el-pagination
-          v-model:current-page="query.pageNum"
-          v-model:page-size="query.pageSize"
-          :total="total"
-          :page-sizes="[5, 10, 20, 50]"
-          layout="total, sizes, prev, pager, next, jumper"
-          background
-          @current-change="handlePageChange"
-          @size-change="handleSizeChange"
-        />
-      </div>
+      <!-- ★ 这里原来有一个 el-pagination。它和分页参数、和后端的分页
+           SQL、和「删完一条要翻页」的边界处理，一起在里程碑 16 删掉了。
+           留下的这一行说明是【故意的】，不是忘了写。 -->
     </el-card>
 
     <CategoryForm v-model="formVisible" :category-id="editingId" @success="handleFormSuccess" />
@@ -271,9 +338,7 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.pagination {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 16px;
+.muted {
+  color: #c0c4cc;
 }
 </style>

@@ -24,7 +24,9 @@ import java.util.List;
  * 而 {@code order_item.sku_id} 正指着它 —— 历史订单的快照会被就地篡改。
  *
  * <p>{@code spec_json} 的改动方式只有一种：<b>插一条新的、删一条旧的</b>。
- * 所以这里只有「改价格库存」这一条窄更新。
+ * 所以这里只有 {@link #updatePriceCostStock} 这一条窄更新
+ * （★ 里程碑 16 之前它叫 {@code updatePriceStock} —— 加了两列就改名，
+ * 理由见那个方法的 javadoc）。
  *
  * <h3>★ 扣库存 / 还库存为什么也在这张表上</h3>
  *
@@ -77,22 +79,39 @@ public interface ProductSkuMapper {
     int insert(ProductSku sku);
 
     /**
-     * 改一行的价格和库存（只能按 id 改，不能改规格 —— 见类注释）。
+     * 改一行的价格、划线价、成本价和库存（只能按 id 改，不能改规格 —— 见类注释）。
      *
-     * <p>它是 {@code ProductServiceImpl.replaceSkus} 认领老行时用的：
+     * <p>它是 {@code ProductServiceImpl.applySkus} 认领老行时用的：
      * 规格组合没变的那一行要<b>保住它的 id</b>，
      * 因为 {@code order_item.sku_id} 指着它。
      *
-     * <p>⚠️ 这是<b>全量覆盖</b>：管理员打开编辑页时库存 10、期间卖掉 3 件、
-     * 然后点保存 —— 库存会回到 10，凭空多出 3 件。
-     * 这是本阶段<b>已知的取舍</b>（真正的修法是「库存调整走增量 ±N」，
+     * <h3>★ 里程碑 16：改名 + 加两列</h3>
+     *
+     * <p>它原名叫 {@code updatePriceStock}（只写 price / stock）。
+     * 加了两列之后那个名字就成了<b>假话</b>，所以必须一起改掉 ——
+     * 理由（「窄语句的名字就是它的文档」「漏改的症状是接口 200、
+     * 页面上的数字是上一次的」）写在 {@code ProductSkuMapper.xml} 里那段。
+     *
+     * <p>⚠️ {@code marketPrice} / {@code costPrice} 都可以是 <b>null</b>，
+     * 而且是<b>全量覆盖</b>：传 null 就是「清空这一列」。
+     * 前端把划线价删掉、点保存，那一列就该变成 NULL ——
+     * 所以这里没有、也不能有 {@code <if test="marketPrice != null">}。
+     *
+     * <p>⚠️ 同样地，<b>库存也是全量覆盖</b>：管理员打开编辑页时库存 10、
+     * 期间卖掉 3 件、然后点保存 —— 库存会回到 10，凭空多出 3 件。
+     * 这是本项目<b>已知的取舍</b>（真正的修法是「库存调整走增量 ±N」，
      * 明确推迟），表单上有一行提示，README 的已知取舍里也记了一笔。
      *
+     * @param price       售价，必填
+     * @param marketPrice 划线价，可为 null（= 商家没设）
+     * @param costPrice   成本价，可为 null（= 商家没填）
      * @return 影响行数。返回 0 说明 id 不存在
      */
-    int updatePriceStock(@Param("id") Long id,
-                         @Param("price") BigDecimal price,
-                         @Param("stock") Integer stock);
+    int updatePriceCostStock(@Param("id") Long id,
+                             @Param("price") BigDecimal price,
+                             @Param("marketPrice") BigDecimal marketPrice,
+                             @Param("costPrice") BigDecimal costPrice,
+                             @Param("stock") Integer stock);
 
     /**
      * 按 id 批量删除。

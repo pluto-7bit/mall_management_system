@@ -1,19 +1,53 @@
 package com.example.mall.dto;
 
 import lombok.Data;
-import lombok.EqualsAndHashCode;
 
 /**
- * 分类列表的查询条件。
+ * 分类树的筛选条件（★ 里程碑 16 起，<b>不再继承 {@link PageQueryDTO}</b>）。
  *
- * <p>分页字段继承自 {@link PageQueryDTO}，这里只声明分类特有的筛选字段。
+ * <p>请求长这样：
+ * <pre>
+ *   GET /api/admin/categories?name=数码&status=1
+ * </pre>
  *
- * <p><b>为什么不叫 CategoryPageQueryDTO？</b> 命名上「Query」已经表达了
- * 「查询条件」的意思，加 Page 反而啰嗦。项目里统一用 {@code XxxQueryDTO}。
+ * <h3>★ 为什么删掉了 pageNum / pageSize</h3>
+ *
+ * <p>里程碑 16 把管理端分类列表从「分页的扁平表格」改成了「一棵树」，
+ * 分页随之取消。这不是偷懒，是因为<b>分页和树是互相矛盾的</b>：
+ * <pre>
+ *   第 1 页有 10 行，其中一个子分类的父分类排在第 2 页 ——
+ *   那么在这一页上，那个子分类就是一个【孤儿节点】。
+ *   前端要么把它当成根（错，它明明有父），
+ *   要么把它丢掉（也错，用户找不到它）。
+ * </pre>
+ * 按「根分页、每根带上整棵子树」可以绕开，但那样 {@code total} 就变成了
+ * 「根的数量」，页面上的「共 128 条」开始骗人 —— 用户数出来的行数不是 128。
+ *
+ * <p><b>为什么不是「留着分页字段但不生效」？</b>
+ * 那正是最该避免的一种状态：参数还在、不报错、也不起作用。
+ * 调用方（包括测试脚本）会以为自己分页描述对了，而实际上拿到的是全量。
+ * <b>一个回答不了的问题不应该有一个假答案</b> —— 分页问的就是
+ * 「这是第几页」，树答不了，那就把这个字段删掉，让它在编译期就报错。
+ *
+ * <p>⚠️ 但要注意：<b>HTTP 参数是删不掉的</b>。前端如果还传
+ * {@code ?pageNum=1&pageSize=10}，Spring MVC 会因为找不到对应的 setter
+ * 而<b>静默忽略它们</b>，接口照常返回 200 + 全量树。
+ * 这是可接受的（比报错友好），但它也是一件必须写成断言的事，
+ * 否则「参数被静默忽略」就成了一种靠肉眼看不出来的行为。
+ * {@code sql/test-category.py} 里有一条专门断言这一点。
+ *
+ * <p>分类数量很少（几十个量级），全量读进来在内存里组装，
+ * 比在 SQL 里递归建树简单得多，也快得多。见 {@code CategoryServiceImpl#treeAll}。
+ *
+ * <h3>筛选语义（写清楚，因为它和「表格筛选」的直觉不一样）</h3>
+ *
+ * <p><b>命中的节点 + 它的整棵子树 + 它的祖先链</b>。
+ * 祖先本身不需要命中 —— 否则命中结果会挂在树上看不见的位置：
+ * 用「手机壳」搜到一个二级分类，如果它的父分类因为没命中而被去掉，
+ * 这一行在树里就成了一个<b>凭空出现的根</b>，用户看不出它原来在哪。
  */
 @Data
-@EqualsAndHashCode(callSuper = true)
-public class CategoryQueryDTO extends PageQueryDTO {
+public class CategoryQueryDTO {
 
     /** 分类名称，模糊搜索。为 null 或空串时不参与筛选 */
     private String name;
@@ -22,19 +56,16 @@ public class CategoryQueryDTO extends PageQueryDTO {
     private Integer status;
 
     /**
-     * {@inheritDoc}
-     *
-     * <p>这里演示了子类如何扩展基类的规范化逻辑：
-     * <b>先调 super 处理分页字段，再处理自己新增的字段</b>。
-     * 顺序反了不会报错，但逻辑上会变得难以推理。
-     *
-     * <p>空字符串要转成 null，因为 XML 里写的是
+     * 空字符串要转成 null，因为 XML 里写的是
      * {@code <if test="name != null">} —— 空串不是 null，会进去拼出一个
      * {@code LIKE '%%'}，虽然结果碰巧一样，但白白多扫一遍索引。
+     *
+     * <p>★ 这个方法<b>不再是</b> {@code @Override}：父类 {@code PageQueryDTO}
+     * 已经不在了，所以它不再有机会犯错 —— 早先那版注释里提醒过
+     * 「顺序反了不会报错，但逻辑上会变得难以推理」（先处理分页、再处理自己）。
+     * 分页字段一消失，那个风险跟着消失。<b>删掉一个字段的收益不只是少几行代码。</b>
      */
-    @Override
     public void normalize() {
-        super.normalize();
         if (name != null && name.isBlank()) {
             name = null;
         }

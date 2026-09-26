@@ -321,6 +321,29 @@ onBeforeUnmount(stopCountdown)
             <span class="amount">¥{{ formatAmount(order.totalAmount) }}</span>
           </div>
 
+          <!--
+            ★ 里程碑 17：把运费单独列出来。
+
+            ★ 为什么判断写 freightAmount > 0 而不是 freightAmount === null？
+              因为 freight_amount 在数据库里是 NOT NULL DEFAULT 0.00，
+              满额包邮的订单拿到的是【0】，不是「字段消失」——
+              === null 会让这一行永远不显示（判断恒为 false）。
+              （本项目里「字段消失」是另一套机制：non_null 把值为 null 的 key
+                整个删掉，那是 payDeadline / shipTime 那种可空字段的写法。
+                ★ 同一份代码里有两种「没有」，判断方式不能串。）
+
+            ★ 为什么这一行写「其中运费」而不是在上方再加一行「商品合计」？
+              因为「商品合计」= totalAmount − freightAmount 是一次【减法】，
+              而「各明细小计之和」是【加法】—— 那是同一事实的两份实现，
+              分岔时不会报错（后端已经有一条断言专门守着它们，见
+              sql/test-after-sale.py）。前端再算一遍等于把那个坑搬到第三处。
+              这一页的权威数字只有 total_amount 一个，其余靠这句文案说清楚关系。
+          -->
+          <div v-if="order.freightAmount > 0" class="info-amount freight-line">
+            <span class="info-label">其中运费</span>
+            <span class="freight-amount">¥{{ formatAmount(order.freightAmount) }}</span>
+          </div>
+
           <div class="info-sub">
             收货：{{ order.receiverName }} {{ order.receiverPhone }}
           </div>
@@ -592,6 +615,23 @@ onBeforeUnmount(stopCountdown)
   color: var(--jd-red);
   font-size: 24px;
   font-weight: 700;
+}
+
+/*
+ * ★ 里程碑 17：运费那一行。
+ * 比 .amount 明显小、也明显不红 —— 它不是用户要付的数，
+ * 只是「他要付的那个数由什么组成」的一句注解。
+ * 做成和 .amount 一样大，会让「应付 109」和「运费 10」看起来像两笔钱。
+ */
+.freight-line {
+  margin-top: -8px;
+  margin-bottom: 14px;
+}
+
+.freight-amount {
+  color: #666;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .info-sub {

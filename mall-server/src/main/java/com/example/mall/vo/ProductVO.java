@@ -90,6 +90,27 @@ public class ProductVO {
     private BigDecimal minPrice;
 
     /**
+     * 最高价 —— 这件商品所有规格里最贵的那个价格（★ 里程碑 16 新增）。
+     *
+     * <p><b>为什么需要它：</b>里程碑 15 加了 {@link #minPrice} 之后，
+     * 列表上多规格商品只能显示「¥4999 起」—— 而在只有两个规格、
+     * 4999 和 6999 的时候，「起」这个字传达的信息太少了：
+     * 用户真正想知道的是这个区间有多宽。
+     * 有了本字段，卡片可以显示成 {@code ¥4999 ~ ¥6999}，
+     * <b>「起」这个字因此可以退休了</b>（前端在两者相等时显示单个价格）。
+     *
+     * <p>★ 单规格商品上它<b>等于</b> {@link #minPrice}。前端据此判断
+     * 「要不要画那个波浪号」—— 不需要后端再给一个 {@code hasRange} 布尔位，
+     * 和 {@code skuCount > 1} 时前端自己加「起」是同一种分工。
+     *
+     * <p>⚠️ <b>不 COALESCE</b>：没有 SKU 的商品这里是 {@code null}，
+     * 和 {@code minPrice} 保持一致。理由见 {@code ProductMapper.xml}
+     * 的 {@code skuAggregate} 上面那段：那条路径上的 null 是一个警报，
+     * 兜成 0 会把它抹平成「0 元」。
+     */
+    private BigDecimal maxPrice;
+
+    /**
      * 这件商品所有规格的库存合计（★ 里程碑 15 新增）。
      *
      * <p>⚠️ <b>它不能用来判断「这个商品能不能买」</b>。

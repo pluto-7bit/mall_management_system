@@ -32,11 +32,21 @@
         的引用，返回的列标签仍然是 `id`，MyBatis 的下划线转驼峰照常工作。
         使用它的 FROM 子句必须写成 `FROM orders o`（三个使用者都已改）。
     -->
+    <!--
+      ⚠️⚠️ 里程碑 18 提醒：这张列清单【也是】Orders.vue 那行单号的唯一来源。
+        logistics_company / tracking_no 漏掉的话，症状和上面 freight_amount
+        那条是同一类 —— 不报错、不警告，只是用户端订单卡片上
+        「顺丰 SF1234567890」那一行【永远不出现】，
+        而「查看物流」的入口又是按单号有没有值渲染的（见 OrderVO.trackingNo），
+        所以整个物流功能会从用户端彻底消失。
+        ★ 这两列和前 5 个生命周期列一样可空，所以它们属于
+          「漏了也不报错」的列 —— 加列时最容易忘的正是这一类。
+    -->
     <sql id="baseColumns">
         o.id, o.order_no, o.member_id,
         o.receiver_name, o.receiver_phone, o.receiver_address, o.address_id,
-        o.total_amount, o.status, o.pay_time, o.cancel_time, o.pay_method,
-        o.ship_time, o.complete_time,
+        o.total_amount, o.freight_amount, o.status, o.pay_time, o.cancel_time, o.pay_method,
+        o.ship_time, o.logistics_company, o.tracking_no, o.complete_time,
         o.idempotency_key, o.remark,
         o.create_time, o.update_time
     </sql>
@@ -58,13 +68,22 @@
       如果用应用服务器的时钟，多台机器时钟不一致时，
       订单的先后顺序会出现"后下的单时间更早"这种诡异现象。
 -->
+    <!--
+      ⚠️⚠️ 里程碑 17 提醒：这张列清单必须带 freight_amount。
+        这一列有 DEFAULT 0.00，所以【漏了它 INSERT 照样成功】——
+        不报错、不警告，运费永远是 0，而 total_amount 里已经含了运费。
+        症状只在订单页上：合计 ¥109、明细加 ¥99、运费 ¥0。
+        ★ 唯一能发现它的是 sql/test-after-sale.py 里那条
+          「total_amount = SUM(subtotal) + freight_amount」断言。
+        这就是「加列不影响现有代码」的另一面：加列也不提醒你该写它。
+    -->
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO orders (order_no, member_id,
                             receiver_name, receiver_phone, receiver_address, address_id,
-                            total_amount, status, idempotency_key, remark)
+                            total_amount, freight_amount, status, idempotency_key, remark)
         VALUES (#{orderNo}, #{memberId},
                 #{receiverName}, #{receiverPhone}, #{receiverAddress}, #{addressId},
-                #{totalAmount}, #{status}, #{idempotencyKey}, #{remark})
+                #{totalAmount}, #{freightAmount}, #{status}, #{idempotencyKey}, #{remark})
     </insert>
 
     <!--

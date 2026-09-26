@@ -1,5 +1,6 @@
 package com.example.mall.service.impl;
 
+import com.example.mall.common.AfterSaleWindow;
 import com.example.mall.common.BusinessException;
 import com.example.mall.common.BusinessRules;
 import com.example.mall.common.LoginUser;
@@ -13,6 +14,7 @@ import com.example.mall.dto.BuyNowDTO;
 import com.example.mall.dto.CartOrderDTO;
 import com.example.mall.dto.OrderBaseDTO;
 import com.example.mall.dto.OrderQueryDTO;
+import com.example.mall.dto.OrderShipDTO;
 import com.example.mall.dto.ShopOrderQueryDTO;
 import com.example.mall.entity.MemberAddress;
 import com.example.mall.entity.Order;
@@ -26,6 +28,7 @@ import com.example.mall.mapper.ProductSkuMapper;
 import com.example.mall.service.CartService;
 import com.example.mall.service.OrderService;
 import com.example.mall.service.ShopSkuService;
+import com.example.mall.service.StockRestoreService;
 import com.example.mall.util.OrderNoGenerator;
 import com.example.mall.vo.AdminOrderVO;
 import com.example.mall.vo.OrderItemVO;
@@ -41,6 +44,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -117,6 +121,29 @@ public class OrderServiceImpl implements OrderService {
     private final OrderAdminMapper orderAdminMapper;
 
     /**
+     * ★★ 里程碑 17：归还库存的那段逻辑搬到了这里。
+     *
+     * <p>它原来就在下面的 {@code cancelInternal} 里，是一个遍历明细、
+     * 逐条 {@code increaseSkuStock} 的循环。本轮「仅退款」和「退货退款」
+     * 各要再调一次，<b>而这段代码绝对不能有两份</b> ——
+     * {@code OrderService} 里那句原话：
+     * 「扣库存那段代码绝对不能有两份。两份就意味着『改了一份忘了另一份』，
+     * 而漏掉的那份就是超卖漏洞。」
+     *
+     * <p>★ 搬移是纯粹的：循环体一个字都没改（见
+     * {@code StockRestoreServiceImpl}），而这个类的行为唯一的差别是
+     * 「现在会调一个接口」。所以本轮最高回归风险的检查就是
+     * {@code test-order.py} / {@code test-order-list.py} 里
+     * 「取消订单归还库存」那几条 —— 它们必须仍然全绿。
+     *
+     * <p>⚠️ <b>顺序不能变</b>：它必须<b>在</b> {@code markCancelled}
+     * 拿到 {@code affected = 1} <b>之后</b>才被调用。
+     * 接口的契约就是「我不做任何资格判断」—— 见
+     * {@link com.example.mall.service.StockRestoreService} 的类注释。
+     */
+    private final StockRestoreService stockRestoreService;
+
+    /**
      * 待付款订单的支付时限（分钟）。超过它就自动取消。
      *
      * <p><b>★ 为什么做成配置而不是写成常量？</b>
@@ -142,6 +169,55 @@ public class OrderServiceImpl implements OrderService {
      */
     @Value("${mall.order.timeout-batch-limit}")
     private int timeoutBatchLimit;
+
+    /**
+     * 固定运费（不满包邮门槛时收这个数）。★ 里程碑 17。
+     *
+     * <p><b>★ 为什么声明成 {@code String} 而不是 {@code BigDecimal}？</b>
+     * 两个理由，第二个是真会咬人的那个：
+     * <ol>
+     *   <li>Spring 能把 {@code "10.00"} 直接转成 {@code BigDecimal}，
+     *       所以从类型上其实两种都行；</li>
+     *   <li>★ 但 {@code application.yml} 里的值<b>必须加引号</b>才活得下来 ——
+     *       不加引号的 {@code 10.00} 会被 YAML 当成<b>浮点数</b>解析成 {@code 10.0}，
+     *       再转成 BigDecimal 就得到 scale = 1 的 {@code 10.0}。
+     *       拿 {@code String} 接住，再自己 {@code new BigDecimal(...)}，
+     *       恰好和「引号让它从头到尾是个字符串」这件事对得上；
+     *       声明成 BigDecimal 会让人以为「不用加引号也行」。</li>
+     * </ol>
+     * 本项目有一条铁律是<b>金额不走 double</b>（见 {@code BusinessRules.MONEY_SCALE}），
+     * 上面这个是它在本轮的第一个落点。
+     */
+    @Value("${mall.order.freight-amount}")
+    private String freightAmountRaw;
+
+    /**
+     * 满多少免运费（商品小计 ≥ 这个数就包邮）。★ 里程碑 17。
+     *
+     * <p>和上面同一个理由声明成 {@code String}。
+     *
+     * <p><b>★ 边界是一个决定，不是巧合：恰好等于门槛时【免运费】</b>
+     * （{@code goodsAmount >= threshold}）。所以 {@code 99.00} 包邮、{@code 98.99} 不包邮，
+     * 测试必须<b>两侧都测</b> —— 只测一侧的话，把 {@code >=} 写成 {@code >} 也照样全绿。
+     */
+    @Value("${mall.order.free-freight-threshold}")
+    private String freeFreightThresholdRaw;
+
+    /**
+     * 售后申请时限（天），起点是「确认收货」。★ 里程碑 17。
+     *
+     * <p>它<b>只作用于「已完成」的订单</b> —— 已付款（未发货）和已发货
+     * （未收货）的订单没有 {@code complete_time}，也就没有起点。
+     * 完整的论证见 {@link #afterSaleDeadlineOf}。
+     *
+     * <p><b>★ 为什么声明成 {@code int}（不像上面两个金额那样用 String）？</b>
+     * 因为它不是金额 —— 「金额不走 double」那条铁律管的是精度，
+     * 而 7 天这个数不涉及小数。用一个 {@code @Value} 能直接转的整数类型
+     * 反而更好：它把「这里进来的必须是个整数」写在了类型上。
+     * <b>引号的规则只对金额那几个值成立，不要顺手推广到所有配置。</b>
+     */
+    @Value("${mall.order.after-sale-window-days}")
+    private int afterSaleWindowDays;
 
     /**
      * ★ 用它来开事务，而不是给方法加 {@code @Transactional}。
@@ -546,14 +622,22 @@ public class OrderServiceImpl implements OrderService {
             }
         }
 
-        // ---- 4. 算总金额 ----
+        // ---- 4. 算钱 ----
         // ★ 价格来自 skuMap（也就是【数据库里现在的价格】），
         //   不是客户端传的。这是"金额永远由服务端算"的落地。
         //
         // ★ 每一步都用 BigDecimal 的方法，不写成 price * quantity 这种
         //   运算符形式（BigDecimal 没有运算符重载，写不了，这是好事）。
         //   全程不出现 double，避免 0.1 + 0.2 那类精度问题。
-        BigDecimal totalAmount = BigDecimal.ZERO;
+        //
+        // ★★ 里程碑 17：钱分三步走，别再合成一个变量。
+        //      goodsAmount  各明细小计之和（= 商品合计）
+        //      freightAmount 运费，由 goodsAmount 按【下单时的】配置规则算出来
+        //      totalAmount = goodsAmount + freightAmount（= 实付，写进 orders）
+        //   三个名字各自只有一个含义，所以「实付含不含运费」这种问题
+        //   不用去猜 —— 这也正是 maven 那个 totalAmount 会骗人的教训
+        //   （见 Order.totalAmount 的注释：它的语义在本轮变了）。
+        BigDecimal goodsAmount = BigDecimal.ZERO;
         List<OrderItem> items = new ArrayList<>(lines.size());
 
         for (OrderLine line : lines) {
@@ -562,7 +646,7 @@ public class OrderServiceImpl implements OrderService {
             // 小计 = 单价 × 数量。单价是 DECIMAL(10,2)，乘出来的小数位数
             // 最多也就是 2 位，不会出现"两位以上的钱"。
             BigDecimal subtotal = s.getPrice().multiply(BigDecimal.valueOf(line.quantity()));
-            totalAmount = totalAmount.add(subtotal);
+            goodsAmount = goodsAmount.add(subtotal);
 
             OrderItem item = new OrderItem();
             // ★ 追溯线索：买的是哪件商品、哪个规格，都记下来。
@@ -598,7 +682,14 @@ public class OrderServiceImpl implements OrderService {
         // 来源 id 只作追溯用，故意不加外键（否则地址就删不掉了）
         order.setAddressId(address.getId());
 
+        // ★★ 里程碑 17：运费在这里算，算完【写进数据库】。
+        //   之后所有展示（Pay.vue / 订单列表 / 退款上限）都读 freight_amount，
+        //   一律不重算 —— 运费规则是运营随时能改的配置，
+        //   而「这笔订单当时收了多少运费」是涉及金钱的历史事实。
+        BigDecimal freightAmount = freightOf(goodsAmount);
+        BigDecimal totalAmount = goodsAmount.add(freightAmount);
         order.setTotalAmount(totalAmount);
+        order.setFreightAmount(freightAmount);
         order.setStatus(OrderStatus.PENDING_PAY);
         order.setIdempotencyKey(dto.getIdempotencyKey());
         order.setRemark(dto.getRemark());
@@ -624,8 +715,13 @@ public class OrderServiceImpl implements OrderService {
             registerCartCleanupAfterCommit(skuIds, order.getOrderNo(), memberId);
         }
 
-        log.info("下单成功: source={}, memberId={}, orderNo={}, 商品种类={}, 总金额={}",
-                source.getText(), memberId, order.getOrderNo(), items.size(), totalAmount);
+        // ★ 里程碑 17：日志里把「商品合计 / 运费 / 实付」三个数都打出来。
+        //   只打一个 totalAmount 的话，事后翻日志看到「实付 109」
+        //   没法判断那 10 块是运费还是商品的价 —— 而这三个数之间的关系
+        //   正是本轮最容易错的地方（见 test-after-sale.py 那条减法 vs 加法断言）。
+        log.info("下单成功: source={}, memberId={}, orderNo={}, 商品种类={}, 商品合计={}, 运费={}, 实付={}",
+                source.getText(), memberId, order.getOrderNo(), items.size(),
+                goodsAmount, freightAmount, totalAmount);
 
         // ---- 8. 把数据库生成的时间列读回来 ----
         //
@@ -937,51 +1033,18 @@ public class OrderServiceImpl implements OrderService {
             // 不要求每个方法都校验，但保证每个调用链上都校验过。
             List<OrderItemVO> items = orderItemMapper.selectByOrderId(order.getId());
 
-            for (OrderItemVO item : items) {
-                // ★★ 里程碑 15 阶段 4：还库存的主语从【商品】换成了【规格】。
-                //
-                //    这一处是整轮里最不容易被测出来的一处：还错了 SKU，
-                //    接口照样 200、订单状态照样变成「已取消」，
-                //    只是库存加到了另一件商品（或另一个规格）上。
-                //    test-sku.py 的 C 组专门为它准备了一条：
-                //    「同商品两个规格，取消后 A 加回来 2、B 一个数都不动」。
-                //
-                //    ⚠️ 用 productId 归还的老代码会让那条断言翻红 ——
-                //       因为 product_sku 的主键空间和 product 是两套独立的自增值，
-                //       拿 productId 去 WHERE id 是会命中【别人的 SKU】的。
-                //
-                // ★ 先挡掉 skuId 为 null 的历史明细。
-                //   这里【不】指望 increaseSkuStock(null, qty) 返回 0 就够了，
-                //   是因为下面那条 warn 会打出「SKU 不存在（可能已被删除）」——
-                //   而对 null 来说那句话是错的（它不是被删了，是这一行
-                //   本来就没有 SKU 这个概念：里程碑 13 之前下的单、
-                //   以及商品被硬删的孤儿明细）。**错误路径上的日志必须是真话**，
-                //   否则运维会照着它去查一个根本不存在的「被删的 SKU」。
-                if (item.getSkuId() == null) {
-                    log.warn("归还库存时该明细没有 skuId（历史订单或商品已被硬删），跳过: "
-                                    + "orderNo={}, orderItemId={}, productId={}, quantity={}",
-                            orderNo, item.getId(), item.getProductId(), item.getQuantity());
-                    continue;
-                }
-
-                int restored = productSkuMapper.increaseSkuStock(item.getSkuId(), item.getQuantity());
-
-                if (restored == 0) {
-                    // ★ 只记日志，不抛异常。
-                    //   order_item 故意没有外键（见 mall.sql 里那段说明），
-                    //   所以这个 SKU 有可能已经被硬删除（商家改了规格定义，
-                    //   旧的那一行被删了）。这不是用户的错，
-                    //   不能因此让「取消订单」这个操作失败 ——
-                    //   否则订单卡在待付款、库存永远占着、用户还看得见它。
-                    //   SKU 没了是运维数据的问题，人工核对即可。
-                    //
-                    //   （这和 increaseStock 当年那句「商品已被硬删」是同一类情况，
-                    //     只是粒度细了一层。）
-                    log.warn("归还库存时 SKU 不存在（可能已被删除或换过规格），跳过: "
-                                    + "orderNo={}, skuId={}, quantity={}",
-                            orderNo, item.getSkuId(), item.getQuantity());
-                }
-            }
+            // ★★ 里程碑 17：那段循环搬到了 StockRestoreService。
+            //
+            //    为什么必须抽出去而不是在这里再写一遍：本轮「仅退款」和
+            //    「退货退款」各要再调一次同样的逻辑，而
+            //    「扣库存那段代码绝对不能有两份」——
+            //    漏掉的那一份就是超卖漏洞（原话在 OrderService 里）。
+            //
+            //    ⚠️ 顺序没有变：仍然在 markCancelled 拿到 affected = 1 之后。
+            //       接口的契约是「它不做任何资格判断」，
+            //       所以「抢边」这个动作必须留在这一侧 —— 见
+            //       StockRestoreService 的类注释。
+            stockRestoreService.restoreOrderItems(items, orderNo);
 
             log.info("订单已取消: memberId={}, orderNo={}, 归还商品数={}",
                     memberId, orderNo, items.size());
@@ -1144,10 +1207,13 @@ public class OrderServiceImpl implements OrderService {
      * 需要保护的东西 —— 而实际上没有。**没有理由的事务和没有理由的锁一样，是负债。**
      */
     @Override
-    public AdminOrderVO ship(String orderNo) {
+    public AdminOrderVO ship(String orderNo, OrderShipDTO dto) {
         // ★ 条件更新当闸门：WHERE 里有 status = 1。
         //   两个管理员同时点发货，只有一个拿到 affected = 1。
-        int affected = orderAdminMapper.markShipped(orderNo);
+        //   ★ 里程碑 18：这一步同时写入承运商 + 单号，但它们不影响闸门 ——
+        //     所以「不需要事务」这个结论【没有变】（仍然只有一个写）。
+        int affected = orderAdminMapper.markShipped(
+                orderNo, dto.getLogisticsCompany(), dto.getTrackingNo());
 
         if (affected == 0) {
             // ★★ 失败路径上重查一次，把「为什么失败」翻译成人话。
@@ -1266,6 +1332,10 @@ public class OrderServiceImpl implements OrderService {
         vo.setOrderNo(order.getOrderNo());
         vo.setStatus(order.getStatus());
         vo.setTotalAmount(order.getTotalAmount());
+        // ★ 里程碑 17：实付（totalAmount）和运费是【两个列、两个字段】，
+        //   照搬就行，绝不能在这里「顺手」用一个去推另一个 ——
+        //   页面要显示「商品合计」的话是前端做减法，不是后端补一个字段。
+        vo.setFreightAmount(order.getFreightAmount());
         vo.setReceiverName(order.getReceiverName());
         vo.setReceiverPhone(order.getReceiverPhone());
         vo.setReceiverAddress(order.getReceiverAddress());
@@ -1281,7 +1351,31 @@ public class OrderServiceImpl implements OrderService {
         vo.setShipTime(order.getShipTime());
         vo.setCompleteTime(order.getCompleteTime());
 
+        // ---- 里程碑 18 加的两个字段 ----
+        // ★★ 这两个是【补上】的，不是一开始就写在这里的 —— 值得记一笔，
+        //   因为它恰好撞上了上面那段注释警告的那个坑：
+        //   列表那条路走的是 `resultType="OrderVO"`（MyBatis 按列名直接映射，
+        //   加了列就自动有了），而这条路是【手写逐字段搬】。
+        //   于是「列加了、实体加了、VO 也加了」三件事都做完了，
+        //   订单列表上单号显示得好好的，**而订单详情里它静默地没有** ——
+        //   `non_null` 把整个 key 删掉，页面上看不出任何异常。
+        //
+        //   ⚠️ 现在读这两个字段的页面只有列表，所以这个漏洞没露出来；
+        //      但详情页是最可能「顺手」加一个「查看物流」入口的地方。
+        //
+        //   ★ 判据（比记「要改哪几处」更耐用）：
+        //     往 OrderVO 加的是【数据库里的列】→ 只需在这里搬一次
+        //     （列表那条路靠 resultType=OrderVO 自动映射）；
+        //     加的是【派生值】→ toVO 和 attachItems 两处都要算。
+        vo.setLogisticsCompany(order.getLogisticsCompany());
+        vo.setTrackingNo(order.getTrackingNo());
+
         vo.setPayDeadline(payDeadlineOf(order.getStatus(), order.getCreateTime()));
+
+        // ★ 里程碑 17：售后申请截止时刻。和 payDeadline 一样是纯粹的派生值，
+        //   不是数据库里的列，所以必须在这里（和 attachItems 里）补算。
+        vo.setAfterSaleDeadline(
+                afterSaleDeadlineOf(order.getStatus(), order.getCompleteTime()));
 
         vo.setItems(items);
         return vo;
@@ -1348,6 +1442,15 @@ public class OrderServiceImpl implements OrderService {
             //   必须在这里补算。用的是和 toVO 完全同一个 payDeadlineOf 重载 ——
             //   两处各算一遍的话，迟早会出现「详情页有倒计时、列表页没有」。
             vo.setPayDeadline(payDeadlineOf(vo.getStatus(), vo.getCreateTime()));
+
+            // ★ 里程碑 17：afterSaleDeadline 是同一类派生值，
+            //   所以走完全同一个重载补算。⚠️ 这里的代价比 payDeadline 那次更大：
+            //   订单**列表**页是用户看得最多的页面，如果只在这儿漏算，
+            //   症状是「订单列表里点不了申请售后、详情页能点」——
+            //   和里程碑 12 那条「列表里点不了评价、详情里能点」是同一个形态，
+            //   而它读 Java 代码根本看不出来（两个页面共用一个 VO）。
+            vo.setAfterSaleDeadline(
+                    afterSaleDeadlineOf(vo.getStatus(), vo.getCompleteTime()));
         }
     }
 
@@ -1425,6 +1528,115 @@ public class OrderServiceImpl implements OrderService {
             return null;
         }
         return createTime.plusMinutes(payTimeoutMinutes);
+    }
+
+    /**
+     * 算一笔订单的售后申请截止时刻 —— <b>只有「已完成」的订单才算，其他状态返回 null。</b>
+     * ★ 里程碑 17。
+     *
+     * <h3>★★ 「已付款 / 已发货」的订单为什么不受时限约束？这不是疏漏，是唯一可能的选择</h3>
+     *
+     * <p>时限的起点是「确认收货」（{@code complete_time}），
+     * 而未确认收货的订单<b>根本没有这个起点</b> ——
+     * {@code complete_time} 是 NULL，而 NULL 和任何数比较都是 NULL，不是真。
+     * 本项目没有「发货后 N 天自动确认收货」的定时任务，
+     * 所以这个起点永远不会自己出现。
+     *
+     * <p>业务上也是对的：<b>钱在商家手里、货还在路上，
+     * 不该因为「等太久」剥夺用户退款的权利</b> ——
+     * 「多久没到货」是商家的责任，不是用户的。
+     *
+     * <pre>
+     *   status = 1 (已付款，未发货)  →  complete_time 是 NULL  →  不受时限约束
+     *   status = 2 (已发货，未收货)  →  complete_time 是 NULL  →  不受时限约束
+     *   status = 3 (已完成)          →  起点 = complete_time  →  受 N 天约束
+     * </pre>
+     *
+     * <h3>★ 边界是一个决定：<b>恰好等于 deadline 算「还在期限内」</b></h3>
+     *
+     * <p>也就是 {@code now > deadline} 才算超期（宽以待人）。
+     * 和 {@code freightOf} 里那句「恰好等于门槛时免运费」是同一类决定 ——
+     * <b>边界值往哪边靠是一个要写下来的决定，不是一个可以随手写 {@code >=} 的地方。</b>
+     * 而且它<b>只在一个地方</b>：这个方法和 {@code AfterSaleServiceImpl} 里
+     * 那句检查必须用同一个比较方向，否则会出现「按钮显示着、点了说超期」。
+     *
+     * <h3>★ 为什么参数是 status + completeTime，而不是整个 Order</h3>
+     *
+     * <p>和 {@link #payDeadlineOf} 完全一样的理由：调用方有两种
+     * （{@code toVO} 手上是实体，{@code attachItems} 手上是已经转好的 VO），
+     * 只取这两个字段当参数，两种调用方就能共用同一份实现。
+     *
+     * <p>★ 这也再次说明它确实是个<b>纯派生值</b>：算它只需要两个输入。
+     * <b>刻意不把它提前算成列存进 {@code after_sale} 或 {@code orders}</b> ——
+     * 它是「要用的时候算一次」的东西，不是需要被定格的历史事实。
+     * 判据和 {@code payDeadlineOf} 一字不差：
+     * <b>这个值将来会不会因为别的数据变了而变得不一致？会跟着配置走 → 不存。</b>
+     * （对比 {@code freight_amount}：那个必须存，因为它涉及钱，
+     *   而「当时收了多少运费」是一个历史事实。）
+     */
+    private LocalDateTime afterSaleDeadlineOf(Integer status, LocalDateTime completeTime) {
+        // ★★ 算法本身在 AfterSaleWindow 里，不在这里。
+        //   这里原来有一份完整的实现（判状态、判 null、plusDays），
+        //   而 AfterSaleServiceImpl.apply 那边还要再判一次「超期了没有」。
+        //   **两份实现隔着一次 HTTP 往返，症状是「按钮显示着、点了说超期」，
+        //     而且配不出断言**（两边看的是各自的「现在几点」，
+        //     断言只能问「此刻一样吗」—— 那恰恰是它们唯一一定一样的地方）。
+        //   所以这一处不靠断言兜，靠「只有一份实现」。
+        //   完整的论证写在 AfterSaleWindow 的类注释里。
+        return AfterSaleWindow.deadlineOf(status, completeTime, afterSaleWindowDays);
+    }
+
+    /**
+     * 算一笔订单的运费：<b>商品小计满门槛则免运费，否则收固定运费。</b>★ 里程碑 17。
+     *
+     * <h3>★ 这是全项目唯一一处需要把「商品小计」这个概念算出来的地方</h3>
+     *
+     * <p>算完立刻折算成「要么 0、要么固定运费」两种结果之一，写进
+     * {@code orders.freight_amount}。<b>之后全项目只认那一个列</b> ——
+     * 展示、退款上限、对账全都读它，<b>永不重算</b>。
+     *
+     * <p>理由是一条很具体的后果：运费规则是运营随时能改的<b>配置</b>
+     * （{@code mall.order.free-freight-threshold}），而「这笔订单当时收了多少运费」
+     * 是一件涉及金钱的<b>历史事实</b>。展示时重算，那么运营把门槛从 99 降到 59 的那一刻，
+     * 一笔【已经付过 10 元运费】的历史订单会显示成：
+     * <pre>
+     *   商品 ¥89.00   运费 ¥0.00   合计 ¥99.00
+     * </pre>
+     * 两个数字自相矛盾，<b>而且全程没有任何一层会报错</b>。
+     * 这和 {@code orders.receiver_address}（收货地址快照）、
+     * {@code order_item.price}（成交价快照）是<b>完全同类</b>的故障：
+     * 历史事实被今天的规则改写。
+     *
+     * <h3>★ 比较之前必须先 setScale</h3>
+     *
+     * <p>和 {@code BusinessRules.MONEY_SCALE} 那段是同一个判据：
+     * 数据库会把 {@code 99.004} 存成 {@code 99.00}。拿未舍入的原值去比大小，
+     * 会得出「该包邮」，而存进去的那个数却比门槛小 ——
+     * 于是同一条规则，在比的时候和在存的时候给出了两个答案。
+     * 而这里的输入是 {@code price × quantity}：{@code price} 是 {@code DECIMAL(10,2)}，
+     * 乘个整数数量小数位不会超过 2 位，所以实际上<b>现在</b>不会触发；
+     * 写上去是为了 <b>下一次有人改价改量时，这条规则不会突然开始骗人</b>。
+     *
+     * <h3>★ 为什么参数是 goodsAmount 而不是整个订单 / 明细列表？</h3>
+     *
+     * <p>因为它是个<b>纯函数</b>：一个数进、一个数出，不读数据库、不看上下文。
+     * 纯函数才可能被测试直接推理（「恰好 99.00 免不免」这种问题，
+     * 答案必须只由这一个入参决定）。
+     */
+    private BigDecimal freightOf(BigDecimal goodsAmount) {
+        BigDecimal threshold = new BigDecimal(freeFreightThresholdRaw)
+                .setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+        BigDecimal flat = new BigDecimal(freightAmountRaw)
+                .setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+
+        BigDecimal goods = goodsAmount.setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+        // ★ 边界的决定：恰好等于门槛时【免】。compareTo 而不是 equals ——
+        //   BigDecimal 的 equals 连 scale 一起比，99.0 和 99.00 会被判成「不相等」，
+        //   那是个和金额大小毫无关系的后果（同 BusinessRules 里的既有纪律）。
+        if (goods.compareTo(threshold) >= 0) {
+            return BigDecimal.ZERO.setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+        }
+        return flat;
     }
 
     /**

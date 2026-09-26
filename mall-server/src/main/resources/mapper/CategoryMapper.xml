@@ -17,69 +17,55 @@
       只需要改这一行，四个查询自动都有。
       如果每个 <select> 都抄一遍列名，加字段时漏改一个，
       那个接口就会莫名其妙地少返回一个字段，而且不报错 —— 这种 bug 最难查。
+
+      ★ 里程碑 16 加了 parent_id。这一次「改一行、三处都有」的说法
+      是【真的成立】的，因为 /api/shop/categories 也走这条列清单 ——
+      而它【必须】拿到 parentId（前端靠它把扁平列表分成两级）。
+      反过来说：如果当初这里是三个 <select> 各抄一份列名，
+      加 parent_id 时必定漏掉一个，而症状是
+      「商城导航的分组莫名其妙全平了」—— 不报错，只是不对。
     -->
     <sql id="baseColumns">
-        id, name, sort, status, create_time, update_time
+        id, parent_id, name, sort, status, create_time, update_time
     </sql>
 
     <!--
-      管理页的查询条件。
-      列表查询和总数查询共用这一份，保证两者永远一致。
-    -->
-    <sql id="queryCondition">
-        <where>
-            <!--
-              <where> 标签的两个作用：
-                1. 如果内部所有 <if> 都不成立，它不会生成 WHERE 关键字
-                2. 会自动去掉开头多余的 AND/OR
-              没有它的话，就得写 WHERE 1=1 这种凑数条件，很丑
-            -->
-            <if test="name != null">
-                <!--
-                  CONCAT('%', #{name}, '%') 拼成 LIKE '%数码%' 的模糊匹配。
-                  注意 % 是写在 SQL 里的常量，不是拼进参数里的，
-                  所以这里用 #{} 完全安全（对比 ${} 的 SQL 注入风险）
-                -->
-                AND name LIKE CONCAT('%', #{name}, '%')
-            </if>
-            <if test="status != null">
-                AND status = #{status}
-            </if>
-        </where>
-    </sql>
+      ★★ 全量查询。这是本 mapper 唯一一条「不加任何过滤地把整张表读出来」的语句。
 
-    <!--
-      排序的分页查询。
+      为什么连 status 都不过滤：三个调用方要的过滤条件各不相同
+      （组树按用户给的 name/status 筛、可见分类要比祖先链、
+      算后代一个都不许筛）。把 WHERE 写在这里，
+      等于在一处替三个调用方做了决定，而且做错的后果是静默的 ——
+      详见 CategoryMapper.selectAll 的 javadoc。
 
       ORDER BY sort ASC, id ASC 里的 id 是「保底排序」——
-      sort 相同的分类如果只按 sort 排，MySQL 返回的顺序是不确定的，
-      翻页时同一条数据可能在两页都出现、或者两页都不出现。
-      加上 id 让排序变得完全确定。这是个很容易被忽略的坑。
+      sort 相同的分类如果只按 sort 排，MySQL 返回的顺序是不确定的。
+      在分页时代这会让同一条数据在两页都出现或者都不出现；
+      在组树时代它同样重要：内存里是按读出来的顺序挂到父节点上的，
+      顺序不定就等于兄弟的顺序不定。
+
+      ★ 排序放在 SQL 里而不是 Java 里，是为了让「兄弟之间的顺序」
+      只有一个定义者。Java 那边一行排序代码都不写。
     -->
-    <select id="selectPage" resultType="Category">
+    <select id="selectAll" resultType="Category">
         SELECT <include refid="baseColumns"/>
         FROM category
-        <include refid="queryCondition"/>
         ORDER BY sort ASC, id ASC
-        LIMIT #{offset}, #{pageSize}
     </select>
 
     <!--
-      查总数。WHERE 条件用同一个 <include>，保证和列表查询永远一致。
-      分页参数（offset/pageSize）跟总数无关，所以这里当然不能带上 LIMIT。
-    -->
-    <select id="countByQuery" resultType="long">
-        SELECT COUNT(*)
-        FROM category
-        <include refid="queryCondition"/>
-    </select>
+      ★ 只查两列：树的一条边。
 
-    <!-- 下拉框用：只查启用的 -->
-    <select id="selectEnabledList" resultType="Category">
-        SELECT <include refid="baseColumns"/>
+      它和 selectAll 现在长得几乎一样，但【故意】不复用 ——
+      它们回答的是两个不同的问题（「有哪些分类」vs「这棵树什么形状」），
+      将来 selectAll 加条件时，算后代这件事不该跟着被过滤。
+      完整的理由写在 CategoryMapper.selectIdAndParent 的 javadoc 里。
+
+      也就是说：这里的重复是【有意的】，不是抄错了。
+    -->
+    <select id="selectIdAndParent" resultType="Category">
+        SELECT id, parent_id
         FROM category
-        WHERE status = 1
-        ORDER BY sort ASC, id ASC
     </select>
 
     <select id="selectById" resultType="Category">
@@ -100,14 +86,46 @@
         LIMIT 1
     </select>
 
+    <!--
+      数一个分类下面有几个子分类。被「不许删」和「不许挂到别人下面」两条规则用。
+
+      ★ 用 COUNT(*) 而不是把子分类查出来在内存里数：
+      调用方要的只是「有没有」和「有几个」（报错信息里要带数量），
+      不需要知道它们叫什么、排第几。
+    -->
+    <select id="countByParentId" resultType="int">
+        SELECT COUNT(*)
+        FROM category
+        WHERE parent_id = #{parentId}
+    </select>
+
+    <!--
+      ★ parent_id 是 NOT NULL DEFAULT 0（见 migration-14 头部），
+      所以这里的 #{parentId} 永远不该是 null —— Service 已经在
+      normalizeParentId 里把「不传」归一成了 0。
+      万一真传了 null 进来，MySQL 会直接报错拒绝
+      （NOT NULL 列显式插入 NULL 是错的），
+      而不是悄悄写进一个 NULL。这条列约束又一次帮了忙：
+      它把「有人的归一逻辑漏了」从一个静默的错误数据
+      变成了一次会响的失败。
+    -->
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO category (name, sort, status)
-        VALUES (#{name}, #{sort}, #{status})
+        INSERT INTO category (parent_id, name, sort, status)
+        VALUES (#{parentId}, #{name}, #{sort}, #{status})
     </insert>
 
     <update id="updateById">
         UPDATE category
         <set>
+            <!--
+              ★ parentId 的 <if> 和其他字段一样，但它的语义要多说一句：
+              「不传 parentId」在 Service 里已经被归一成 0（一级分类），
+              所以正常情况下这个 <if> 总是成立。
+              留着它是因为这一段的形状是「每个字段一个 <if>」，
+              单独给 parentId 写成无条件赋值，下一个人加字段时
+              会看不出这里为什么不一样。
+            -->
+            <if test="parentId != null">parent_id = #{parentId},</if>
             <if test="name != null">name = #{name},</if>
             <if test="sort != null">sort = #{sort},</if>
             <if test="status != null">status = #{status},</if>
@@ -118,13 +136,15 @@
     <!--
       物理删除。返回的 int 是影响行数，0 表示这个 id 不存在。
 
-      ★ 注意这里<b>没有</b>「先查分类下有没有商品」的判断 ——
-      那条判断在 Service 里。原因：
-        1. 它是业务规则（「分类下有商品就不许删」是人为定的规矩，不是技术约束）
+      ★ 注意这里<b>没有</b>「先查分类下有没有商品/子分类」的判断 ——
+      那两条判断在 Service 里。原因：
+        1. 它们是业务规则（「分类下有东西就不许删」是人为定的规矩，不是技术约束）
         2. 就算写在这里，也只是多一次查询，挡不住并发
            （检查的瞬间没有商品，删的瞬间有商品插进来了）
-      真正能兜住并发的是数据库外键约束，但那属于另一个话题。
-      学习阶段把规则放在 Service 里，清晰易读，已经足够。
+      真正能兜住并发的是数据库外键约束，但那属于另一个话题
+       —— 本项目的选择是「全库零外键 + 删除顺序由代码负责」，
+      见 README 的已知取舍。代价就是这条 Service 规则必须一直在，
+      而且是【两条】：还有商品（1004）、还有子分类（1011）。
     -->
     <delete id="deleteById">
         DELETE FROM category

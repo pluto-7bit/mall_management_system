@@ -63,7 +63,32 @@ public class OrderVO {
      */
     private Integer status;
 
+    /**
+     * 订单<b>实付</b>金额 = 各明细小计之和 + {@link #freightAmount}。★ 里程碑 17 改的语义。
+     *
+     * <p>⚠️ 里程碑 17 之前它是「商品小计」，现在它是「实付」。
+     * 前端页面上写「合计 / 应付」时才该用它；
+     * <b>要显示「商品合计」就得用减法（{@code totalAmount - freightAmount}）
+     * 或直接把明细加一遍</b> —— 那两个算法的分岔由
+     * {@code sql/test-after-sale.py} 里那条断言守着。
+     */
     private BigDecimal totalAmount;
+
+    /**
+     * 本单实际收取的运费。★ 里程碑 17 新增。
+     *
+     * <p><b>它永远是下单那一刻的快照，不是按当前规则算出来的。</b>
+     * 运营改了包邮门槛，历史订单的这一行不会跟着变 ——
+     * 理由见 {@code Order.freightAmount} 和 {@code OrderServiceImpl.freightOf}。
+     *
+     * <p>它<b>不是</b> {@code @JsonInclude} 意义上的「可空字段」：
+     * 数据库里是 {@code NOT NULL DEFAULT 0.00}，
+     * 所以满额包邮的订单拿到的是 {@code 0} 而<b>不是</b>字段消失。
+     * 前端判断「要不要显示运费这一行」要写 {@code freightAmount > 0}，
+     * ★ <b>不能</b>写 {@code freightAmount == null} ——
+     * 那是 {@code non_null} 那套「字段消失」的写法，这里不适用。
+     */
+    private BigDecimal freightAmount;
 
     // ---- 收货信息快照（下单时定下来的，不会随地址簿变化）----
 
@@ -140,6 +165,74 @@ public class OrderVO {
 
     /** 完成时间（买家确认收货），未确认时同上 */
     private LocalDateTime completeTime;
+
+    // ---- 物流（里程碑 18 加的）----
+
+    /**
+     * 承运商（快递公司）和快递单号，<b>未发货或历史订单时这两个字段会从 JSON 里消失</b>。
+     *
+     * <h4>★★ 前端判断「要不要显示物流入口」必须用假值判断，不能写 === null</h4>
+     *
+     * <p>{@code application.yml} 里配了 Jackson 的
+     * {@code default-property-inclusion: non_null} ——
+     * 值为 null 的字段<b>整个 key 都不会出现在 JSON 里</b>，
+     * 所以前端写 {@code o.trackingNo === null} <b>恒为 false</b>，
+     * 「查看物流」的按钮<b>永远不显示</b>，页面上却什么都不报错。
+     *
+     * <p><b>同一个坑这是第 5 次。</b>正确写法是
+     * {@code v-if="o.trackingNo"} —— 反正单号不可能是空字符串
+     * （服务端 {@code @NotBlank} 挡着，见 {@code OrderShipDTO}）。
+     *
+     * <p>★ 「字段有没有出现」和「发了没发」在这里恰好等价，
+     * 但这仍然只是顺带的好处 —— <b>判断订单状态的唯一依据是 {@link #status}</b>。
+     */
+    private String logisticsCompany;
+
+    /** 快递单号。见 {@link #logisticsCompany} —— 用户端的物流入口就靠它有值 */
+    private String trackingNo;
+
+    // ---- 售后相关（里程碑 17 加的）----
+
+    /**
+     * 售后申请截止时刻（= 确认收货时间 + 售后期限），
+     * <b>只有「已完成」的订单才有值</b>。
+     *
+     * <p>订单页那一行的「申请售后」入口靠它决定要不要显示。
+     *
+     * <h4>★★ 为什么由服务端算好给前端，而不是让前端拿 completeTime 自己加 7 天？</h4>
+     *
+     * <p>和 {@link #payDeadline} 是<b>同一条理由</b>：
+     * 前端自己加就要再抄一遍「7 天」这个数，而
+     * {@code mall-shop/src/utils/constants.js} 里已经立过一条规矩 ——
+     * <b>从后端抄来的常量必须留一条「抄错了会怎样」的退路。</b>
+     *
+     * <p>★ 前端抄的是一个<b>绝对时刻</b>，不是「7 天」这个数。
+     * 这一点是本轮刻意的选择：运维把期限从 7 天改成 15 天之后，
+     * 已经打开的页面不用刷新也能正确判断（因为它比的是时刻，不是时长）。
+     *
+     * <h4>⚠️⚠️ 它和 {@code payDeadline} 有一个重要的差别，别照抄那边的结论</h4>
+     *
+     * <p>{@code payDeadline} 判错的退路是「倒计时显示不准」——<b>纯展示</b>，
+     * 因为能不能付款始终由 {@code markPaid} 的 SQL 说了算。
+     * 而 {@code afterSaleDeadline} 判错会让<b>「申请售后」按钮该显示却不显示</b>，
+     * 用户以为不能申请 —— <b>而且不会报错，因为他不会去点一个看不见的按钮。</b>
+     *
+     * <p>唯一能让它判错的是<b>浏览器与服务器的时钟偏差</b>。
+     * 缓解办法是服务端在提交时再判一次（1002 / 1014）——
+     * 所以最坏情况是「按钮早消失几分钟」，而不是「申请被静默拒绝」。
+     * <b>权衡之后仍然选前端比较绝对时刻</b>（这也正是 {@code payDeadline} 的选择）：
+     * 另一种做法是每次都让服务端告诉前端「这一行过没过期」，
+     * 那就要在订单列表的每一行上多一次判断的输入 —— 而它仍然要靠
+     * 服务端时钟，问题没有消失，只是换了个地方。
+     *
+     * <h4>★ 为什么已付款/已发货的订单没有这个字段</h4>
+     *
+     * <p>因为它们没有起点（{@code complete_time} 是 NULL）。
+     * 「不受时限约束」和「期限是无限远」是两句不同的话，
+     * 而这里表达成<b>字段不存在</b>（{@code non_null} 会把它从 JSON 里删掉）——
+     * 挂一个 9999 年的假 deadline 会让前端算出一堆没意义的东西。
+     */
+    private LocalDateTime afterSaleDeadline;
 
     /** 订单里的商品明细 */
     private List<OrderItemVO> items;

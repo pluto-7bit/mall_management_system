@@ -116,7 +116,23 @@ const items = computed(() => lines.value)
 const hasUnavailable = computed(() => items.value.some((l) => !l.available))
 
 /**
- * 后端算的合计，前端只是把它加起来显示（最终金额以后端为准）。
+ * 各明细小计的合计 —— <b>★ 里程碑 17 起它只是「商品合计」，不是「应付」。</b>
+ *
+ * <p>★ 为什么改了名字以外的东西：这一轮加了运费，而<b>运费规则
+ * （固定运费 + 满额包邮的门槛）是后端的配置</b>，前端不知道、也不该抄一份。
+ * 所以这个数从「应付金额」降级成了「商品合计」，
+ * 页面上写它的那两句话也跟着改了（「共 N 项，商品合计」）。
+ *
+ * <p>⚠️ 为什么不让前端抄一遍运费规则自己算？
+ * 抄了之后，运营改门槛的那一刻起，<b>结算页显示的和实际扣的就是两个数</b>——
+ * 而这正是本项目反复在防的「同一事实两份实现」。
+ * ★ 正解是加一个 {@code POST /api/shop/orders/preview}（只算不写、
+ * 和下单共用同一个算钱函数），本轮不做，记在 README 的已知取舍里。
+ *
+ * <p>★ 这个缺口为什么可以接受：本项目的下单和付款是<b>两步</b> ——
+ * 用户下单后落在收银台（{@code Pay.vue}），那里显示的才是权威金额
+ * （{@code total_amount}）并带一行「其中运费」。
+ * 「下单前不知道运费」不会导致用户被多扣钱。
  *
  * <p>★ 里程碑 14：返回<b>数字</b>而不是格式化好的字符串 ——
  * 「保留两位小数」在模板里由 {@code formatAmount} 做。
@@ -714,8 +730,18 @@ onMounted(() => {
                 说成「共 2 种商品」是错的（只有一种商品）。
                 ★ 量词错了不是小事：它会让用户以为自己买重了。
             -->
-            共 <b>{{ items.length }}</b> 项，合计：
+            <!--
+              ★★ 里程碑 17：这句文案改了，「合计」→「商品合计」。
+                改字不是措辞问题 —— 以前这个数【就是】应付金额，
+                加了运费之后它不再是一个订单最终要付的钱了。
+                留着「合计」两个字，这一页就在说一句假话，
+                而且用户要到收银台才发现多出 10 元。
+                ★ 「按规则计算」那半句也不能删：用户有权知道
+                  还有一个数没算进来，而不是以为这就是全部。
+            -->
+            共 <b>{{ items.length }}</b> 项，商品合计：
             <span class="amount">¥{{ formatAmount(estimateTotal) }}</span>
+            <div class="freight-hint">运费按下单时的规则计算（满额包邮）</div>
           </div>
         </el-card>
 
@@ -747,8 +773,15 @@ onMounted(() => {
           </div>
 
           <div class="submit-right">
+            <!--
+              ★★ 里程碑 17：这里的「应付」改成了「商品合计」。
+                这是全页最容易被漏掉的一处 —— 它长得像一个可以不管的按钮文案，
+                但它【原来是一句关于钱的承诺】：用户读到「应付 ¥99」就会以为要付 99。
+                ★ 权威数字在下单之后的收银台（Pay.vue 读 total_amount + 运费那一行）。
+            -->
             <div class="total">
-              应付：<span class="amount">¥{{ formatAmount(estimateTotal) }}</span>
+              商品合计：<span class="amount">¥{{ formatAmount(estimateTotal) }}</span>
+              <div class="freight-hint">不含运费，下单后按规则计算</div>
             </div>
             <el-button
               type="danger"
@@ -960,6 +993,18 @@ onMounted(() => {
   font-size: 20px;
   font-weight: 700;
   color: var(--jd-red);
+}
+
+/*
+ * ★ 里程碑 17：运费那一句提示。
+ * 刻意做得比 .amount 明显轻 —— 它是一个「还有一个数没算进来」的说明，
+ * 不是要用户去读的金额。轻一点才不会被误读成「运费 ¥10」。
+ */
+.freight-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: #999;
+  margin-top: 2px;
 }
 
 /* ---- 提交栏 ---- */

@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { getShopCategories } from '@/api/category'
 
@@ -117,5 +117,101 @@ export const useCategoryStore = defineStore('category', () => {
     return list.value
   }
 
-  return { list, load }
+  // -------------------------------------------------------------------------
+  // ★★ 里程碑 16：两级分类。三个"导航与左栏共用"的判断。
+  //
+  //   ⚠️ 注意这里【没有一棵树】。
+  //
+  //   接口返回的是**扁平数组 + parentId**（不是嵌套的 children），
+  //   而「两级」这件事用两个 filter 就够了 ——
+  //   递归建树的代码在这里是纯粹的浪费，而且会多出两个形状
+  //   （tree 和 list），然后有人拿 tree 去 find、有人拿 list 去 filter，
+  //   分岔就是从那儿开始的。
+  //
+  //   刻意保持扁平的完整理由写在 `ShopCategoryController` 的注释里：
+  //   商城页有【两个按名字/id 平铺查找分类】的地方（banner 的 find、
+  //   左栏说明文案的 find），它们拿到树会**静默失效**。
+  //   「形状由谁在用决定，不由数据长什么样决定。」
+  // -------------------------------------------------------------------------
+
+  /**
+   * 一级分类（`parentId === 0`）。
+   *
+   * <p>★ 判据写成宽松真值 `!c.parentId`，而不是 `c.parentId === 0`：
+   * 后端把它序列化成数字 0，两者都对，但宽松写法对
+   * 「字段不存在」也成立（更旧的接口 / 缓存里的老数据）。
+   * ⚠️ 这是个例外判断 —— 本项目其他地方**不能**这么写，
+   * 因为 0 常常是合法值（见 ProductForm 里「毛利 0」那个坑）。
+   * 这里能用，是因为 `parentId` 的 0 和"缺失"表达的是同一件事。
+   */
+  const roots = computed(() => list.value.filter((c) => !c.parentId))
+
+  /**
+   * 某个一级分类下的二级分类。
+   *
+   * <p>★ 是<b>函数</b>而不是 computed：它带参数，没法缓存。
+   * 每次调用都遍历一遍扁平数组 —— 分类是十几个的量级，
+   * 而模板里每个根调一次，总共十几次 filter，代价可以忽略。
+   * （如果哪天分类到了几千个，这里要换成按 parentId 分好组的 Map，
+   *   但那时真正的问题会是"为什么导航里有几千个分类"。）
+   *
+   * @param {number} id 一级分类的 id
+   * @returns {Array} 该分类下的二级分类（没有就是空数组）
+   */
+  function childrenOf(id) {
+    return list.value.filter((c) => c.parentId === id)
+  }
+
+  /**
+   * ★★ 某个分类<b>这一支</b>是不是当前选中的。
+   *
+   * <h3>为什么需要它，而不是简单地 `activeId === id`</h3>
+   *
+   * <p>因为点了一个二级分类之后，它的<b>父分类也该亮</b>。
+   * 否则用户看到的是「导航条上什么都没高亮，但列表确实被筛过了」——
+   * 他会以为筛选坏了，或者以为自己点错了。
+   *
+   * <h3>★ 为什么 activeId 是参数，而不是在 store 里读 URL</h3>
+   *
+   * <p>这是这个文件开头那条边界的又一次应用：
+   * <pre>
+   *   分类列表 → 服务端数据 → store
+   *   筛选条件 → 界面状态   → URL
+   * </pre>
+   * 让 store 自己去读 `route.query`，就是把「界面状态」搬进了 store ——
+   * 那正是这个 store 存在的理由反过来打自己。而且 store 一旦依赖 router，
+   * 它就再也没法在组件外面单独测了。
+   *
+   * <p><b>所以：判断的"实现"在 store 里（只有一份），
+   * 判断的"输入"由调用方给（App 和 Home 各自从 URL 算出来，
+   * 两边算的是同一个 `readCategoryId(route.query)`）。</b>
+   * 这就同时做到了「只有一份实现」和「store 不碰路由」。
+   *
+   * <h3>它和 utils/query.js 那条原则的关系</h3>
+   *
+   * <p>query.js 开头写着「同一个语义判断只能有一个实现」。
+   * 这条就是那个判断 —— 所以它必须是<b>一个函数</b>，
+   * 而不是 App.vue 里写一遍、Home.vue 里再写一遍。
+   * 两处各写一遍的后果很具体：导航条会亮、左栏不会亮（或反过来），
+   * 而两者都是"对的"，只是对「选中了哪一支」的理解不一样。
+   *
+   * @param {number} id       要判断的分类 id
+   * @param {number|null} activeId 当前选中的分类 id（来自 URL）
+   */
+  function isBranchActive(id, activeId) {
+    if (activeId == null) {
+      return false
+    }
+    if (activeId === id) {
+      return true
+    }
+    // 两级封顶，所以"往上走一层"就够了 —— 不需要循环，
+    // 也不可能出现更深的祖先（后端规则 4 挡着三级）。
+    // ⚠️ 这一行依赖「最多两级」这个不变量。哪天后端放开三级，
+    //    这里必须改成沿 parentId 往上走，而【不会有任何测试报警】——
+    //    症状只是"选中三级分类时二级分类不亮"。
+    return list.value.some((c) => c.id === activeId && c.parentId === id)
+  }
+
+  return { list, load, roots, childrenOf, isBranchActive }
 })

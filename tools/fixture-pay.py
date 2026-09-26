@@ -422,6 +422,17 @@ def cleanup():
     run_sql(
         f"DELETE i FROM order_item i JOIN orders o ON o.id = i.order_id "
         f"WHERE o.id IN ({ids('orders')}) OR o.member_id IN ({member_ids})")
+    # ★★ 里程碑 18：order_logistics 是订单的【第二张】子表，同一个坑要踩第二遍。
+    #   它同样没有外键，所以删订单之前必须先把轨迹删掉，
+    #   否则 sql/test-logistics.py 的孤儿检查会红（"有 N 行轨迹指向不存在的订单"）。
+    #   ⚠️ 这是【验收时才发现】的：夹具自己不发货、不录轨迹，所以 grep
+    #      ship / logistics 一处命中都没有，看起来完全不用改 ——
+    #      但它会在浏览器里被点出来（管理员发货 + 录节点），
+    #      而那些轨迹记在夹具建的订单上，于是清理时成了孤儿。
+    #   ★ 判据：**改了一张"挂在订单上的子表"，就要检查每一个"删订单"的地方。**
+    run_sql(
+        f"DELETE l FROM order_logistics l JOIN orders o ON o.id = l.order_id "
+        f"WHERE o.id IN ({ids('orders')}) OR o.member_id IN ({member_ids})")
     run_sql(f"DELETE FROM orders WHERE id IN ({ids('orders')}) "
             f"OR member_id IN ({member_ids})")
     run_sql(f"DELETE FROM member_address WHERE id IN ({ids('addresses')})")

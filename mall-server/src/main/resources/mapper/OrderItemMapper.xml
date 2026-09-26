@@ -81,6 +81,30 @@
         也有 id 列，不加限定符的话 SELECT id 会直接报
         "Column 'id' in field list is ambiguous"。
         这和 OrderMapper.baseColumns 给每列加 o. 前缀是同一件事。
+
+      ★★★ 里程碑 17 又给两条查询【同时】加了三个行级售后字段：
+        a.after_sale_no / a.status（进行中的售后单）+ refunded（退过款没有）。
+
+        ★★ 那个 `AND a.active_token = 0` 是**承重的**，不是可选的过滤条件：
+
+          一条明细可以有**多张**已关闭的售后单（被拒一次、重新申请、
+          再成功，是很正常的历史）。没有这个条件，LEFT JOIN after_sale
+          会让**明细行数翻倍** —— 而 resultType 是单结果的映射，
+          MyBatis 要么取到随机一行，要么抛 TooManyResultsException。
+
+          加上它之后，由 uk_order_item_active (order_item_id, active_token)
+          唯一索引保证**最多匹配一行**（进行中的单 active_token 恒为 0，
+          而已关闭的恒为各自不同的 id）。
+          ★ 也就是说：**一对一是结构上的事实，不是运气。**
+          这条 join 之所以安全，正是里程碑 17 那套令牌设计换来的。
+
+        ⚠️ refunded 用的是 EXISTS 标量子查询，不是再 join 一次 after_sale ——
+          理由和上面正好相反：已退款的行是**关闭**的，它们的
+          active_token 各不相同，join 不出唯一性。见 AfterSale.activeToken。
+
+        ⚠️ refunded 是**同一事实的第二份实现**（第一份在
+          ProductReviewMapper.selectOrderItemForReview）。配了一条断言
+          把两边的答案对着比 —— 见 sql/test-after-sale.py 的 I 组。
     -->
     <select id="selectByOrderId" resultType="OrderItemVO">
         SELECT oi.id           AS id,
@@ -92,9 +116,14 @@
                oi.price,
                oi.quantity,
                oi.subtotal,
-               r.id            AS reviewId
+               r.id            AS reviewId,
+               a.after_sale_no AS afterSaleNo,
+               a.status        AS afterSaleStatus,
+               EXISTS (SELECT 1 FROM after_sale ra
+                        WHERE ra.order_item_id = oi.id AND ra.status = 3) AS refunded
         FROM order_item oi
         LEFT JOIN product_review r ON r.order_item_id = oi.id
+        LEFT JOIN after_sale a ON a.order_item_id = oi.id AND a.active_token = 0
         WHERE oi.order_id = #{orderId}
         ORDER BY oi.id
     </select>
@@ -129,6 +158,10 @@
         而两个页面拿到的是同一个 VO，读 Java 代码看不出任何差别。
         理由（为什么这次敢往共用的查询里加字段）见 OrderItemVO 的类注释。
 
+      ★★ 里程碑 17 加的 a.after_sale_no / a.status / refunded 三列，
+        **和上面那条单笔查询逐字一致** —— 包括那个承重的
+        `AND a.active_token = 0`（完整的理由写在上面那条的注释里）。
+
       ⚠️ foreach 的循环变量叫 oid（order id），
         结果 SELECT 里也用 oi（order item）当表别名 —— 两个名字很像但不是一回事，
         改这里的 SQL 时留意别把它们看成一回事。
@@ -143,9 +176,14 @@
                oi.price,
                oi.quantity,
                oi.subtotal,
-               r.id            AS reviewId
+               r.id            AS reviewId,
+               a.after_sale_no AS afterSaleNo,
+               a.status        AS afterSaleStatus,
+               EXISTS (SELECT 1 FROM after_sale ra
+                        WHERE ra.order_item_id = oi.id AND ra.status = 3) AS refunded
         FROM order_item oi
         LEFT JOIN product_review r ON r.order_item_id = oi.id
+        LEFT JOIN after_sale a ON a.order_item_id = oi.id AND a.active_token = 0
         WHERE oi.order_id IN
         <foreach collection="orderIds" item="oid" open="(" close=")" separator=",">
             #{oid}

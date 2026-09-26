@@ -192,6 +192,25 @@ public class ShopProductDetailVO {
     private BigDecimal minPrice;
 
     /**
+     * 最高价 —— 所有规格里最贵的那个价格（{@code max(skus[].price)}），
+     * ★ 里程碑 16 新增。
+     *
+     * <p>详情页在用户还没选规格时显示价格<b>区间</b>：
+     * {@code ¥4999 ~ ¥6999}（相等时只显示一个数）。
+     * 和 {@link #minPrice} 一样是<b>从 {@link #skus} 里算出来的</b>，
+     * 不是 SQL 聚合 —— 上面那段「它们三个永远不会分叉」同样适用于它。
+     *
+     * <p>★ 用户选中了一个 SKU 之后，价格改显示<b>那一个规格</b>的
+     * {@code price}，同时画它的 {@code marketPrice} 删除线。
+     * ⚠️ <b>划线价是「所选 SKU 的」，不是商品级的</b> ——
+     * 商品级的那个字段在 {@link ShopProductVO} 上（列表卡片用），
+     * 详情页这里<b>刻意没有</b>：多规格商品的原价没有唯一答案，
+     * 而详情页恰恰是用户能问出「哪个规格」这个问题的地方，
+     * 所以答案要从选中的那一行上取。
+     */
+    private BigDecimal maxPrice;
+
+    /**
      * 这件商品有几个规格（{@code skus.size()}）。
      *
      * <p>前端拿它决定价格后面跟不跟「起」字。

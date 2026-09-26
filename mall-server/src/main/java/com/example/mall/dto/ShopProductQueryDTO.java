@@ -3,6 +3,8 @@ package com.example.mall.dto;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
+import java.util.List;
+
 /**
  * 用户端商品列表的查询条件。
  *
@@ -61,8 +63,35 @@ public class ShopProductQueryDTO extends PageQueryDTO {
      */
     private String keyword;
 
-    /** 分类 id，为 null 时不筛选（等于「全部分类」） */
+    /**
+     * 分类 id，为 null 时不筛选（等于「全部分类」）。
+     *
+     * <p>★ 这是<b>用户传进来的那个值</b>，不是最终用来筛 SQL 的值 ——
+     * 里程碑 16 起，点「手机数码」要连同它的子分类一起筛。
+     */
     private Long categoryId;
+
+    /**
+     * ★ 真正进 SQL 的筛选条件：{@code categoryId} 自己 + 它<b>所有后代</b>的 id。
+     *
+     * <p>和管理端的 {@code ProductQueryDTO.categoryIds} 是<b>同一个概念</b>，
+     * 但它是另一个类上的另一个字段 —— 这正是本项目「两个端各有一套 DTO」
+     * 这条约定要付的账。所以这里必须把话说全，否则下一个读代码的人
+     * 会以为是复制粘贴时留下的残骸：
+     *
+     * <ul>
+     *   <li><b>值由 Service 填，且无条件覆盖</b>（{@code ShopProductServiceImpl.page}）。
+     *       URL 上直接传 {@code ?categoryIds=1,2} 会被算出来的结果整个盖掉，
+     *       所以它不是一条绕过规则的入口。</li>
+     *   <li><b>算了些什么，由谁算</b>：{@code CategoryService.selfAndDescendantIds()} ——
+     *       ★ 管理端和用户端<b>必须调同一个方法</b>。如果只有一端含后代，
+     *       同一件商品在两个端上的件数会对不上（管理端 20 件、用户端 28 件），
+     *       而运营会先怀疑后台统计错了，不会先怀疑这是两个不同的规则。</li>
+     *   <li><b>漏填 = 筛选被静默忽略</b>，接口 200、返回全部商品。
+     *       哨兵断言见 {@code ProductQueryDTO} 里那段说明（用不存在的分类 id 筛 → 必须空页）。</li>
+     * </ul>
+     */
+    private List<Long> categoryIds;
 
     /**
      * 排序方式。

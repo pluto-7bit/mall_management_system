@@ -148,6 +148,14 @@ const routes = [
   },
 
   {
+    // 我的售后（里程碑 17）
+    path: '/after-sales',
+    name: 'AfterSales',
+    component: () => import('@/views/AfterSales.vue'),
+    meta: { title: '退款/售后', requiresAuth: true },
+  },
+
+  {
     path: '/:pathMatch(.*)*',
     name: 'NotFound',
     component: () => import('@/views/NotFound.vue'),

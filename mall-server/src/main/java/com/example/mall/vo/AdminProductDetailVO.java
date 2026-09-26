@@ -99,6 +99,17 @@ public class AdminProductDetailVO extends ProductVO {
      * <p>★ 它和图集 {@code images} 一样，是<b>在 Service 里单独查一次</b>
      * 装进来的，不在这条 SQL 里 JOIN。理由同 {@code images}：
      * 那几条查询被多处共用，往里塞只给详情页用的东西会伤到别人。
+     *
+     * <p>★★ <b>里程碑 16：元素类型从 {@link SkuVO} 换成了 {@link AdminSkuVO}。</b>
+     * 管理端要多看成本价和毛利，而那个字段不能加在父类上
+     * （用户端也用着父类，见 {@code AdminSkuVO} 的类注释）。
+     * 换成子类之后，这一份响应的每个 SKU 都带成本三件套。
+     *
+     * <p>⚠️ 这个类型标注是<b>承重的，不是装饰</b>：{@code ProductServiceImpl.getById}
+     * 里构造这个列表的那几行必须产出 {@code AdminSkuVO}。
+     * 如果它还在用 {@code SkuVO.ofAll}（父类的工厂），
+     * 编译会报错 —— <b>这正是我们要的</b>：让「忘了换成管理端 VO」
+     * 变成一次编译失败，而不是一个字段恒 null、接口 200、页面少一列。
      */
-    private List<SkuVO> skus;
+    private List<AdminSkuVO> skus;
 }

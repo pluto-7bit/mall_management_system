@@ -19,18 +19,20 @@ import com.example.mall.mapper.ProductMapper;
 import com.example.mall.mapper.ProductReviewImageMapper;
 import com.example.mall.mapper.ProductReviewMapper;
 import com.example.mall.mapper.ProductSkuMapper;
+import com.example.mall.service.CategoryService;
 import com.example.mall.service.FileStorageService;
 import com.example.mall.service.ProductService;
 import com.example.mall.util.SpecJson;
 import com.example.mall.vo.AdminProductDetailVO;
+import com.example.mall.vo.AdminSkuVO;
 import com.example.mall.vo.ProductVO;
-import com.example.mall.vo.SkuVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -68,6 +70,30 @@ public class ProductServiceImpl implements ProductService {
      */
     private final ProductMapper productMapper;
     private final CategoryMapper categoryMapper;
+    /**
+     * ★ 里程碑 16 起：分类筛选要「含后代」。
+     *
+     * <p>注意这里和上面那行 {@code categoryMapper} <b>不是重复注入</b>，
+     * 它们回答的是两个不同的问题：
+     * <ul>
+     *   <li>{@code categoryMapper} —— 「<b>这一行分类数据</b>长什么样」
+     *       （保存商品时校验它存在且启用），是<b>数据</b>问题</li>
+     *   <li>{@code categoryService} —— 「<b>哪些分类 id 算这个筛选条件</b>」
+     *       （含后代），是<b>规则</b>问题</li>
+     * </ul>
+     *
+     * <p>直接拿 {@code categoryMapper} 自己算后代，看起来少一层依赖，
+     * 但那等于把「含后代」这条规则在这里<b>重新实现一遍</b>，
+     * 而用户端的 {@code ShopProductServiceImpl} 也有自己的一份 ——
+     * 两份实现迟早分岔（管理端 20 件、用户端 28 件）。
+     * <b>规则必须只有一个定义者</b>，所以这里跨层调 Service，
+     * 而不是就着手边的 Mapper 自己拼。
+     *
+     * <p>★ 这不会造成循环依赖：{@code CategoryServiceImpl} 依赖的是
+     * {@code ProductMapper}，不是 {@code ProductService}。
+     * 依赖在「谁的表谁负责查」这条线上是收敛的。
+     */
+    private final CategoryService categoryService;
     private final ProductImageMapper productImageMapper;
 
     /**
@@ -134,6 +160,37 @@ public class ProductServiceImpl implements ProductService {
         // 这类「不信任前端」的防御必须做在后端 —— 前端的校验只是给用户看的，
         // 用户完全可以绕过页面直接调接口
         query.normalize();
+
+        // ★★ 里程碑 16：把「一个分类 id」展开成「它自己 + 所有后代」。
+        //
+        //   这两行是【无条件】执行的，不是「如果传了就展开」——
+        //   categoryIds 是一个派生字段，派生字段必须每次重算，
+        //   否则它就是一条绕过规则的入口（前端可以直接在 URL 上
+        //   传 ?categoryIds=1,2 把「含后代」这条规则绕过去）。
+        //   同一个模式的先例是 PageQueryDTO.offset：它也是算出来的，传了不作数。
+        if (query.getCategoryId() != null) {
+            List<Long> categoryIds = categoryService.selfAndDescendantIds(query.getCategoryId());
+
+            // ★ 空集合必须【短路成空页】，绝对不能让它走到 SQL 里去。
+            //
+            //   唯一能造成空集合的情况是「categoryId 是一个不存在的分类」：
+            //   分类存在时 selfAndDescendantIds 至少会返回 [它自己]。
+            //   而「用一个不存在的分类去筛商品」本来就该筛出 0 件 ——
+            //   ★ 这个行为里程碑 16 之前就有（= 一个不存在的 id → 0 行），
+            //     这里是在【原样保住】它，不是在发明新规则。
+            //
+            //   如果不短路：IN () 是 SQL 语法错误 → 500。
+            //   那是个【会响的】失败（好事），但它把「分类不存在」和
+            //   「数据库出错」混成了一句话，而且这里本来就有一个正确的答案。
+            //
+            //   ★ 顺带说一句：这条短路同时是「派生逻辑没被漏掉」的哨兵。
+            //     万一有人把上面那两行删了，用不存在的分类去筛会返回【全部商品】，
+            //     test-category.py 里那条断言立刻翻红。
+            if (categoryIds.isEmpty()) {
+                return PageResult.empty(query.getPageNum(), query.getPageSize());
+            }
+            query.setCategoryIds(categoryIds);
+        }
 
         // 先查总数。如果一条都没有，就不必再发第二条 SQL 去查列表了
         long total = productMapper.countByQuery(query);
@@ -211,7 +268,15 @@ public class ProductServiceImpl implements ProductService {
         product.setSpecSchema(schema);
 
         // SKU 列表：查一次，然后把每行渲染成 VO（specText 需要上面那个 schema）
-        product.setSkus(toSkuVOs(productSkuMapper.selectByProductId(id), schema));
+        //
+        // ★★ 里程碑 16：这里用的是【管理端的 VO】（AdminSkuVO），不是 SkuVO。
+        //    它比父类多成本价和毛利，而那两个字段【绝不能】出现在用户端
+        //    （ShopSkuVO extends SkuVO，用户端出口在那边）。
+        //    ⚠️ 这个类型不是装饰：AdminProductDetailVO.skus 的类型是
+        //    List<AdminSkuVO>，所以这行一旦退回 SkuVO.ofAll 就【编译不过】——
+        //    那正是我们要的，让「忘了换成管理端 VO」变成一次响亮的失败，
+        //    而不是「接口 200、页面上少了一列成本」。
+        product.setSkus(toAdminSkuVOs(productSkuMapper.selectByProductId(id), schema));
         return product;
     }
 
@@ -612,6 +677,7 @@ public class ProductServiceImpl implements ProductService {
      *   <li>SKU 条数<b>恰好等于</b>各维取值数之积（不许漏行、不许重复）</li>
      *   <li>单个规格的库存 ≤ {@code MAX_SKU_STOCK}</li>
      *   <li>序列化后的 {@code spec_schema} 放得进 {@code VARCHAR(500)}</li>
+     *   <li>★ 里程碑 16：填了划线价就必须<b>大于</b>售价（见下面那段注释）</li>
      * </ol>
      *
      * <p>⚠️ <b>价格和库存的「非空、是正数」这里【不判】</b>，因为 DTO 上的
@@ -657,6 +723,40 @@ public class ProductServiceImpl implements ProductService {
             if (sku.getStock() > BusinessRules.MAX_SKU_STOCK) {
                 throw new BusinessException(ResultCode.BAD_REQUEST,
                         "单个规格的库存最多 " + BusinessRules.MAX_SKU_STOCK + " 件");
+            }
+
+            // ★★ 划线价（里程碑 16）：填了就必须【大于】售价。
+            //
+            //   为什么这是一条必须有的规则，而不是「随它去」：
+            //   商城页画删除线的判据是 marketPrice > price。所以一个填错的
+            //   划线价（比售价低、或者恰好等于售价）会被那个判据【静默吃掉】——
+            //   商家以为自己设了划线价，商城页什么都不显示，两端都不报错。
+            //   把「填了就必须有意义」做成一条 400，这个静默失败就变成当场拒绝。
+            //
+            //   ★★★ 而「大于」这个比较【必须按入库的舍入来做】，这是本方法里
+            //   最容易被忽略的一处：DECIMAL(10,2) 会把 100.004 存成 100.00
+            //   （实测：1.005 存进去是 1.01，MySQL 是四舍五入不是截断）。
+            //   拿原值去比的话，marketPrice=100.004 / price=100.00 会通过校验，
+            //   存进去两者却相等 → 删除线不画 → 又变回那个静默失败。
+            //   ⇒ 两个数都先 setScale(2, HALF_UP) 再比。
+            //     完整论证在 BusinessRules.MONEY_SCALE 的 javadoc 里。
+            //
+            //   ⚠️ 负数也顺带被这条拦住（售价的下界是 0.01，负数不可能大于它），
+            //   所以 DTO 上【没有】给 marketPrice 加 @DecimalMin ——
+            //   再加一条就是同一个事实的第二个定义。
+            if (sku.getMarketPrice() != null) {
+                BigDecimal market = sku.getMarketPrice()
+                        .setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+                BigDecimal price = sku.getPrice()
+                        .setScale(BusinessRules.MONEY_SCALE, RoundingMode.HALF_UP);
+                if (market.compareTo(price) <= 0) {
+                    String which = SpecJson.text(specJson, schema);
+                    throw new BusinessException(ResultCode.BAD_REQUEST,
+                            "划线价必须高于售价，否则商城页不会显示它"
+                                    + (which.isEmpty() ? "" : "（" + which + "）")
+                                    + "：售价 " + price.toPlainString()
+                                    + "，划线价 " + market.toPlainString());
+                }
             }
 
             if (minPrice == null || sku.getPrice().compareTo(minPrice) < 0) {
@@ -950,12 +1050,23 @@ public class ProductServiceImpl implements ProductService {
 
             ProductSku old = byJson.get(specJson);
             if (old != null) {
-                productSkuMapper.updatePriceStock(old.getId(), dto.getPrice(), dto.getStock());
+                // ★ 里程碑 16：从 updatePriceStock 改名成 updatePriceCostStock，
+                //   多写两列。⚠️ 名字跟着字段一起改是【必须的】——
+                //   一个写着「只写价格和库存」的名字留在这里，
+                //   下一个人加第五个字段时就会按名字判断而漏掉这里。
+                //   理由详见 ProductSkuMapper.xml 里那段。
+                //
+                //   ⚠️ 传进去的两个值可以是 null（商家清空了划线价/成本价）——
+                //   这是【全量覆盖】语义：清空就该真的清空。
+                productSkuMapper.updatePriceCostStock(old.getId(), dto.getPrice(),
+                        dto.getMarketPrice(), dto.getCostPrice(), dto.getStock());
             } else {
                 ProductSku row = new ProductSku();
                 row.setProductId(productId);
                 row.setSpecJson(specJson);
                 row.setPrice(dto.getPrice());
+                row.setMarketPrice(dto.getMarketPrice());
+                row.setCostPrice(dto.getCostPrice());
                 row.setStock(dto.getStock());
                 productSkuMapper.insert(row);
             }
@@ -963,18 +1074,36 @@ public class ProductServiceImpl implements ProductService {
     }
 
     /**
-     * 把 SKU 行渲染成 VO。{@code schema} 只影响 {@code specText} 里维度的显示顺序。
+     * 把 SKU 行渲染成<b>管理端</b>的 VO。{@code schema} 只影响 {@code specText} 里维度的显示顺序。
      *
-     * <p>★ 里程碑 15 阶段 3：<b>真正干活的那几行搬到了 {@code SkuVO.ofAll()}</b> ——
+     * <p>★ 里程碑 15 阶段 3：<b>公共字段那几行搬到了 {@code SkuVO.fill()}</b> ——
      * 因为用户端的详情页（{@code ShopSkuServiceImpl.listByProductId}）
      * 需要一模一样的一段转换。留在这里的话就是复制一份，
      * 而复制出来的那份是将来加字段时漏掉一处的来源。
+     * 本方法只负责<b>挑选子类</b>和循环，字段怎么填由 {@code SkuVO.fill} 一个地方定义。
      *
-     * <p>这个方法保留下来只是为了让调用点读起来短一点，<b>它不含任何逻辑</b>——
-     * 所以它不会成为「第二个定义」。
+     * <p>★★ 里程碑 16：产出类型从 {@code SkuVO} 换成了 {@link AdminSkuVO} ——
+     * 管理端要多看成本价和毛利。那两个字段加在子类上而不是父类上，
+     * 是因为父类也是用户端的出口（完整理由见 {@code AdminSkuVO} 的类注释）。
+     *
+     * <p>★ 为什么不写成 {@code AdminSkuVO.ofAll(rows, schema)}？
+     * 因为<b>写不出来</b>：{@code SkuVO.ofAll} 是静态方法，
+     * 子类声明同签名的静态方法叫「隐藏」，而隐藏要求返回类型可替代 ——
+     * {@code List<AdminSkuVO>} 不是 {@code List<SkuVO>} 的子类型，那是编译错误。
+     * 所以这里照着 {@code ShopSkuServiceImpl} 的既有做法自己循环
+     * （那个类同样在循环里调 {@code ShopSkuVO.of}）。
+     *
+     * <p>⚠️ 这个循环<b>必须</b>调 {@code AdminSkuVO.of} 而不是 {@code SkuVO.of}：
+     * 调错了成本三件套恒为 null，而 {@code non_null} 会让它们整个从响应里消失 ——
+     * 接口 200、页面上少三列，没有任何地方报错。
+     * （守它的是 {@code sql/test-price.py} 的 D 组和 E 组。）
      */
-    private List<SkuVO> toSkuVOs(List<ProductSku> rows, List<SpecGroup> schema) {
-        return SkuVO.ofAll(rows, schema);
+    private List<AdminSkuVO> toAdminSkuVOs(List<ProductSku> rows, List<SpecGroup> schema) {
+        List<AdminSkuVO> list = new ArrayList<>(rows.size());
+        for (ProductSku row : rows) {
+            list.add(AdminSkuVO.of(row, schema));
+        }
+        return list;
     }
 
     /** {@code null} 安全地去首尾空白。空规格名/值的拦截在调用处，这里只管「不要 NPE」。 */

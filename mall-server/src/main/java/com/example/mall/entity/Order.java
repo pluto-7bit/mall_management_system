@@ -71,18 +71,45 @@ public class Order {
     private Long addressId;
 
     /**
-     * 订单总金额。
+     * 订单【实付】金额 = 各明细小计之和 + {@link #freightAmount}。
      *
-     * <p>同样是快照：由下单时的各商品单价 × 数量算出，之后永远不变。
+     * <p>同样是快照：由下单时的各商品单价 × 数量（+ 运费）算出，之后永远不变。
      *
      * <p><b>★ 存这个「算出来的值」不算冗余。</b>
      * 因为「订单总额 = 各明细小计之和」这条规则，在商品改价之后就不成立了 ——
      * 明细里存的是当时的价格。如果每次查订单都去把明细加一遍，
-     * 遇到金额有争议（比如将来加了优惠券、运费）时，
-     * 就没法回答「当时算出来是多少」。
+     * 遇到金额有争议时，就没法回答「当时算出来是多少」。
      * <b>能重算的值，如果它需要被"定格"，就该存下来。</b>
+     *
+     * <p><b>★★ 里程碑 17：上面那句「比如将来加了优惠券、运费」，这一轮到了。</b>
+     * 运费加进来了，而且它就是上面那句话的活证据 —— 运费规则
+     * （固定运费 + 满额包邮的门槛）是【配置】，运营随时能改。
+     * 如果这个字段不存、每次拿明细和【当前】规则重算，那么运营
+     * 把门槛从 99 降到 59 的那一刻，一笔已付过 10 元运费的历史订单
+     * 会显示成「运费 ¥0.00、合计 ¥99.00」—— 两个数字自相矛盾，
+     * 而且没有任何一层会报错。
+     *
+     * <p>⚠️ 但语义在这一轮【变了】：它以前是「商品小计」，现在是「实付」。
+     * 于是「商品小计」有了两个算法（减法 {@code totalAmount - freightAmount}、
+     * 加法 {@code SUM(order_item.subtotal)}）—— 这是同一事实的两份实现，
+     * 分岔时不会有任何一层报错，出口是 sql/test-after-sale.py 里
+     * 那条「减法 vs 加法」断言。见 {@link #freightAmount}。
      */
     private BigDecimal totalAmount;
+
+    /**
+     * 本单实际收取的运费。★ 里程碑 17。
+     *
+     * <p>下单时按 {@code mall.order.freight-amount} /
+     * {@code free-freight-threshold} 算好写进来的<b>快照</b>，
+     * 展示时永远读它，<b>永不重算</b>。
+     *
+     * <p><b>★ 它为什么不是「冗余的一列」：</b>见 {@link #totalAmount}。
+     * 一句话版本 —— 运费规则是运营随时能改的配置，
+     * 而「这笔订单当时收了多少运费」是一件涉及金钱的历史事实。
+     * <b>历史事实不该被今天的规则改写。</b>
+     */
+    private BigDecimal freightAmount;
 
     /** 状态，取值见 {@code OrderStatus} */
     private Integer status;
@@ -128,6 +155,26 @@ public class Order {
      * 同一条标准，两个相反的结论，区别只在有没有人真的会去读它。
      */
     private LocalDateTime shipTime;
+
+    /**
+     * 承运商（快递公司）和快递单号。★ 里程碑 18 新增。
+     *
+     * <p>它们和 {@link #shipTime} 是「发货」这件事的三个部分，
+     * 一起写、一起为空 —— 所以也是在同一轮、同一条 UPDATE 里加进来的。
+     *
+     * <p><b>★ 为什么可空，而 {@code freightAmount} 那类列是 NOT NULL：</b>
+     * 判据不是「现在发货必填吗」（现在确实必填），而是
+     * <b>「库里已经存在的那 5 笔真实订单，发货的时候有地方记这个吗」</b>——
+     * 没有。它们发货时项目里还没有这两列，所以 {@code NULL} 是它们的
+     * <b>真值</b>，不是「缺数据」。这也是这次迁移<b>一句 UPDATE 都不用写</b>的原因。
+     *
+     * <p>（对照 {@code after_sale.return_company} 的注释：那里的理由一模一样，
+     * 只是方向相反 —— 那边是买家寄回。）
+     */
+    private String logisticsCompany;
+
+    /** 快递单号。见 {@link #logisticsCompany} */
+    private String trackingNo;
 
     /** 完成时间（买家确认收货），未确认时为 null */
     private LocalDateTime completeTime;

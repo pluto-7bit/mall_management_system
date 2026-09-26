@@ -15,7 +15,7 @@ SET NAMES utf8mb4;
 -- ⚠️ 这里的 COLLATE 必须是 utf8mb4_0900_ai_ci，不能写成 utf8mb4_general_ci。
 --
 --   ★ 表定义里写的是 `DEFAULT CHARSET = utf8mb4` 而【没有】写 COLLATE，
---     所以每张表的排序规则继承的是【库】的排序规则 —— 这一行决定了全部 11 张表。
+--     所以每张表的排序规则继承的是【库】的排序规则 —— 这一行决定了全部 12 张表。
 --
 --   ★ 而线上开发库里的表全都是 utf8mb4_0900_ai_ci。之前这里写的是 general_ci，
 --     于是「全新装库」和「跟着迁移走的库」在排序规则上分叉了。
@@ -39,6 +39,8 @@ USE mall;
 
 DROP TABLE IF EXISTS product_review_image;
 DROP TABLE IF EXISTS product_review;
+DROP TABLE IF EXISTS after_sale;
+DROP TABLE IF EXISTS order_logistics;
 DROP TABLE IF EXISTS order_item;
 DROP TABLE IF EXISTS product_image;
 DROP TABLE IF EXISTS orders;
@@ -77,7 +79,7 @@ DROP TABLE IF EXISTS admin_user;
 -- ---------------------------------------------------------------------------
 --  全库约定：★ 故意不加任何外键
 -- ---------------------------------------------------------------------------
---  11 张表一个 FOREIGN KEY 都没有，这是刻意的，不是漏了。
+--  12 张表一个 FOREIGN KEY 都没有，这是刻意的，不是漏了。
 --
 --  一句话理由：
 --    **加外键之后，「删主表那一行」会变成一条可能失败的语句，
@@ -151,8 +153,30 @@ CREATE TABLE admin_user (
 --      所以 'TEST' 和 'test' 会被判为重复。这是 MySQL 8 的默认排序规则。
 --      重要的是：应用层的 WHERE name = ? 用的是<b>同一个</b>排序规则，
 --      所以两边判断标准一致，不会出现「应用层放行、数据库拒绝」的错位。
+--
+--    ★★ 里程碑 16（migration-14）：parent_id 让分类变成一棵树。
+--
+--       parent_id = 0 表示「一级分类」，**刻意不用 NULL**。
+--       理由和 product_sku.spec_json 是同一条：**MySQL 把多个 NULL 当成互不相等** ——
+--       于是「这个分类有没有父」会在 WHERE parent_id IS NULL / = 0 两种写法之间分岔，
+--       而两者都能「看起来正常工作」，直到某天两个页面给出不同的答案。
+--       用 0 表示「没有父」，就是把「没有父」当成一个【确定的值】。
+--
+--       ⚠️ 这和 product_sku.market_price / cost_price 的 DEFAULT NULL 是
+--          【故意相反】的两种选择，判据是：这个 0 会不会被当成一个真实存在的
+--          数据去比较和计算。parent_id = 0 永远不会 join 到一个真实分类（id 从 1 开始）；
+--          而 market_price = 0 会被拿去和售价比大小。详见 migration-14b 的头部。
+--
+--       ★ 深度上限是【两级】，但那条规则不在数据库里 —— 数据库拦不住三级。
+--         它住在 CategoryServiceImpl（错误码 1009），由 sql/test-category.py 断言。
+--         为什么必须拦住：**前端只画两级**，第三级在商城页会凭空消失而不报错。
+--
+--       ★ DEFAULT 0 还让本文件的种子区（下面 INSERT INTO category）一个字都不用改 ——
+--         已有的 6 个分类 0 就是它们的真值。这就是里程碑 13 那条结论的复现：
+--         **「加列」不影响任何现有代码，「收紧约束」才影响。**
 CREATE TABLE category (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    parent_id   BIGINT UNSIGNED NOT NULL DEFAULT 0      COMMENT '上级分类 id；0 = 一级分类（刻意不用 NULL，见 migration-14 头部）',
     name        VARCHAR(50)     NOT NULL                COMMENT '分类名称（唯一）',
     sort        INT             NOT NULL DEFAULT 0      COMMENT '排序值，越小越靠前',
     status      TINYINT         NOT NULL DEFAULT 1      COMMENT '状态：1=启用 0=禁用',
@@ -160,7 +184,13 @@ CREATE TABLE category (
     update_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_name (name),
-    KEY idx_sort (sort)
+    KEY idx_sort (sort),
+    -- ★ 6 行数据上加索引换不来任何速度，这一点不装糊涂。
+    --   加它是因为「按父查子」是这张表唯一的读法（组装树、算后代集合都靠它），
+    --   和 idx_sort 是同一个性质的东西：表达「这张表怎么被访问」，不是今天的性能。
+    --   （对照 product_sku 的 uk_product_spec —— 那个是为了【正确性】必须有的，
+    --     两者性质不同，注释里不该混为一谈。）
+    KEY idx_parent (parent_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '商品分类表';
 
 
@@ -312,7 +342,21 @@ CREATE TABLE orders (
     receiver_phone   VARCHAR(20)     NOT NULL                COMMENT '收货电话（下单时快照）',
     receiver_address VARCHAR(255)    NOT NULL                COMMENT '收货地址全文（下单时快照）',
     address_id       BIGINT UNSIGNED DEFAULT NULL            COMMENT '来源地址 id，仅作追溯用，故意不加外键',
-    total_amount     DECIMAL(10, 2)  NOT NULL                COMMENT '订单总金额（快照）',
+    -- ★ 里程碑 17：total_amount 的语义【变了】—— 它现在是「实付金额」
+    --   （= 明细小计之和 + 运费），不再是「商品小计」。
+    --   于是「商品小计」有两个算法：减法 total_amount - freight_amount、
+    --   加法 SUM(order_item.subtotal)。这是同一事实的两份实现，
+    --   分岔时【不会有任何一层报错】—— 只有 sql/test-after-sale.py 里
+    --   那条「减法 vs 加法」断言能发现。见 migration-17b-order-freight.sql。
+    total_amount     DECIMAL(10, 2)  NOT NULL                COMMENT '订单实付金额 = 明细小计之和 + 运费（下单时快照）',
+    -- ★ 为什么是 NOT NULL DEFAULT 0.00 而不是可空：满额包邮下的 0 是一个
+    --   【真实的 0】，它会被拿去算「实付 = 商品小计 + 运费」。
+    --   判据见 migration-14b：「0 是一个值，NULL 是缺席」——
+    --   对照 after_sale.refund_amount 用的是 DEFAULT NULL（那里 0 会被当成
+    --   「退了 0 元」拿去求和）。两列必须分得清，别顺手改成一样。
+    -- ★★ 它是【不可重算的快照】：重算会让运营改门槛的那一刻，
+    --    历史订单页显示「运费 0、合计 99」这种自相矛盾的数字。
+    freight_amount   DECIMAL(10, 2)  NOT NULL DEFAULT 0.00   COMMENT '本单实际收取的运费（下单时的快照，永不重算）',
     status           TINYINT         NOT NULL DEFAULT 0      COMMENT '状态：0=待付款 1=已付款 2=已发货 3=已完成 4=已取消',
     -- ★ 下面这【5 个】生命周期列都可为 NULL，和上面三个收货快照列（NOT NULL）正好相反。
     --   判断标准是同一句话：这个列在「这一行刚插入时」有值吗？
@@ -334,6 +378,15 @@ CREATE TABLE orders (
     --   migration-09/10 刻意让「迁移链跑出来的列序」和这份建表语句逐列一致，
     --   好让「跑过迁移的老库」和「新建的库」SHOW CREATE TABLE 出来一模一样。
     ship_time        DATETIME        DEFAULT NULL            COMMENT '发货时间，未发货为 NULL',
+    -- ★ 里程碑 18：物流两列。和上面 5 个生命周期列一样可空，
+    --   但判据不同 —— 它们不是「这件事还没发生」，而是「这件事发生了但当时没记」：
+    --   历史订单（含 5 笔真实订单）发货时项目还没有这两个字段。
+    --   ★ 刻意 DEFAULT NULL 而不是 DEFAULT ''：'' 会被 `if (company)` 当成
+    --     「有值」，用户端订单卡片上会显示一行空白。见 migration-18-logistics.sql。
+    --   ★ 长度对齐 after_sale.return_company(50) / return_tracking(64) ——
+    --     同一件事（快递公司 + 单号），只是方向相反（那边是买家寄回）。
+    logistics_company VARCHAR(50)    DEFAULT NULL            COMMENT '承运商（快递公司）。下单时未知，发货时填；历史订单为 NULL',
+    tracking_no      VARCHAR(64)     DEFAULT NULL            COMMENT '快递单号。同 logistics_company',
     complete_time    DATETIME        DEFAULT NULL            COMMENT '完成时间，未确认为 NULL',
     idempotency_key  VARCHAR(64)     NOT NULL                COMMENT '幂等键（防重复提交，作用域是同会员内唯一）',
     remark           VARCHAR(255)    DEFAULT NULL            COMMENT '订单备注',
@@ -419,6 +472,125 @@ CREATE TABLE order_item (
     KEY idx_order_id (order_id),
     KEY idx_product_id (product_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '订单明细表';
+
+
+-- ---------------------------------------------------------------------------
+--  售后单（里程碑 17）
+-- ---------------------------------------------------------------------------
+--  ★ 一句话：一张售后单只对【一条】订单明细。
+--
+--  不做「主表 + 售后明细表」（一张单退 3 行）的理由是三条独立的：
+--    ① 状态挂主单 → 不能逐行审批；状态挂明细 → 主单状态变成派生聚合（漂移）。
+--    ② 「一条明细有没有活跃售后」会有两个定义者（明细的令牌 + 主单的状态）。
+--    ③ 「运费退多少」要引入分摊规则（按金额？按件数？按重量？），
+--       除不尽时【所有行的退款额之和可能比运费多一分或少一分】。
+--
+--  ★★ 那「一条明细不能被重复申请」靠什么守？—— 靠 uk_order_item_active。
+--     单列 uk_order_item 会连「被拒绝后重新申请」一起禁掉，业务上不可接受；
+--     而 MySQL 【没有部分唯一索引】（写不出 WHERE status < 3）；
+--     Service 里「先查后写」挡不住并发（ProductReviewServiceImpl 有血证）。
+--     解法：把「活跃」编码成一个能被唯一索引看见的值 ——
+--         进行中 (status ∈ {0,1,2}) → active_token = 0
+--         已关闭 (status ∈ {3,4,5}) → active_token = 本行 id
+--     于是同一条明细的令牌集合 {0} ∪ {每张已关闭单的 id} 两两不等，
+--     唯一索引给出的不变量是：
+--        ★ 一条明细最多一张「进行中」的售后单，已关闭的历史单不限张数。
+--     ★ 生成列方案实测【建不出来】：ERROR 3109，MySQL 不允许生成列
+--       引用 AUTO_INCREMENT 列 —— 所以这一条只能靠断言守
+--       （见 test-after-sale.py 的 I 组，两条各抓一个方向）。
+--     ★ 完整论证（含每一种被否掉的编码方式）见 migration-17-after-sale.sql。
+--
+--  ★ 全库零外键是既定约定，所以 order_id / order_item_id / member_id 都是普通列。
+-- ---------------------------------------------------------------------------
+CREATE TABLE after_sale (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    after_sale_no   VARCHAR(32)     NOT NULL                COMMENT '售后单号（前缀 AS，刻意与订单号分属两个号码空间）',
+    order_id        BIGINT UNSIGNED NOT NULL                COMMENT '订单 id（推「整单是否退完」靠它，人不用看）',
+    order_no        VARCHAR(32)     NOT NULL                COMMENT '订单号快照（人看/人搜；售后列表为此不必 join orders）',
+    order_item_id   BIGINT UNSIGNED NOT NULL                COMMENT '被申请的订单明细 id（★ uk_order_item_active 的一半）',
+    member_id       BIGINT UNSIGNED NOT NULL                COMMENT '申请会员 id（安全边界，从订单推导，绝不由客户端提供）',
+    type            TINYINT         NOT NULL                COMMENT '售后类型：1=仅退款 2=退货退款（见 AfterSaleType）',
+    status          TINYINT         NOT NULL DEFAULT 0      COMMENT '0=待审核 1=待买家寄回 2=待卖家收货 3=退款完成 4=已拒绝 5=已撤销',
+    reason          TINYINT         NOT NULL                COMMENT '申请原因码（见 AfterSaleReason；用码不用自由文本）',
+    description     VARCHAR(255)    DEFAULT NULL            COMMENT '用户补充说明（只被原样显示，不参与任何判断）',
+    refund_amount   DECIMAL(10, 2)  DEFAULT NULL            COMMENT '实退金额，退款成功时写入 = 货款 + 退还的运费。★ 刻意 DEFAULT NULL',
+    refund_freight  DECIMAL(10, 2)  NOT NULL DEFAULT 0.00   COMMENT '其中属于运费的部分（0 是真实值不是缺席）',
+    refund_method   VARCHAR(16)     DEFAULT NULL            COMMENT '退款去向 = 该订单 pay_method 的快照，退款成功时写入',
+    refund_time     DATETIME        DEFAULT NULL            COMMENT '退款时间，未退款为 NULL',
+    reject_reason   VARCHAR(255)    DEFAULT NULL            COMMENT '管理员拒绝的理由',
+    return_company  VARCHAR(50)     DEFAULT NULL            COMMENT '买家寄回的快递公司',
+    return_tracking VARCHAR(64)     DEFAULT NULL            COMMENT '买家寄回的快递单号',
+    return_time     DATETIME        DEFAULT NULL            COMMENT '买家填寄回信息的时间',
+    receive_time    DATETIME        DEFAULT NULL            COMMENT '管理员确认收到退货的时间',
+    -- ★★ 这一列和 status 说的是同一件事（关没关）。这是本项目里【唯一一处
+    --    「同一事实两个表示」】，而且是被数据库能力逼出来的，不是设计。
+    --    所以它必须配断言守着（test-after-sale.py 的 I 组），别以为它无害。
+    active_token    BIGINT UNSIGNED NOT NULL DEFAULT 0      COMMENT '★ 唯一性令牌：0=进行中；关闭时置为本行 id。见文件头部',
+    create_time     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '申请时间',
+    update_time     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_after_sale_no (after_sale_no),
+    UNIQUE KEY uk_order_item_active (order_item_id, active_token),
+    KEY idx_member (member_id, create_time),
+    KEY idx_order (order_id),
+    KEY idx_status (status, create_time)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '售后单';
+
+
+-- ---------------------------------------------------------------------------
+--  订单物流轨迹（里程碑 18）
+-- ---------------------------------------------------------------------------
+--  ★★ 这张表记的是【外部世界发生过的事】，不是系统内部的状态。
+--     轨迹可以独立于订单状态存在；订单状态绝不能从轨迹里【猜】出来。
+--
+--     反面教材：按 description 里有没有「已签收」三个字去判断订单该不该完成。
+--     它一定会在有人写下「已签收失败，改约明天」的那天静默出错。
+--     ★ 所以本表是一个很好的对照：【同一批字段里两个相反的决定】
+--         · status 是【码】—— 前端要按它画图标和颜色，它还是
+--           「录到已签收就自动完成订单」的触发条件，必须可判定 → TINYINT
+--         · orders.logistics_company / tracking_no 是【自由文本】——
+--           快递公司名是外部世界的标识符，无法穷举，没人按它做分支 → VARCHAR
+--       判据是同一条：「谁读它、读它来做什么」。
+--
+--  ★★ 排序键必须是 trace_time，不是 id
+--
+--     因为【补录是这个功能的默认用法】，不是边缘情况：管理员白天忙，
+--     晚上把一天的节点一次性补进去 —— 于是同一张订单的 trace_time 顺序
+--     和 id 顺序【相反】。只按 id 排的症状：补录之后时间线倒过来
+--     （今天的「已揽收」显示在昨天的「运输中」上面），
+--     而页面、代码、控制台【全都正常】。
+--     ⚠️ 查询里的次级键 `, id DESC` 也是必需的、不是装饰：两个节点被填了
+--        【完全相同】的 trace_time 时，单靠 trace_time 排不出先后，
+--        MySQL 会返回不确定的顺序（每次查询可能不一样）——
+--        断言会随机红，然后被人用 DISTINCT 掩盖。
+--        同 product_image.sort_no 那条「ORDER BY 要带决胜列」的规矩。
+--
+--  ★ 为什么不存 order_no 快照（而 after_sale 存了）
+--     判据「有读者才加列」：轨迹【只在查某一单的物流时被读】，
+--     那时候手里已经有 order_id 了（接口就是 /orders/{orderNo}/logistics，
+--     先按单号查到订单，再按 id 查轨迹）。after_sale 存 order_no 是因为
+--     管理端售后列表【按单号搜】且刻意不 join orders —— 那个读者在这里不存在。
+--
+--  ★ 为什么承运商/单号不在这张表上
+--     那是「这一单怎么发出去的」，是【订单级】事实（单包裹）。
+--     放进轨迹表意味着每条节点抄一份承运商，改一次要改 N 行。
+--
+--  ★ 不加外键 —— 全库零外键是既定约定。
+--  ★ 不加「操作人」列 —— 管理端目前不记录任何操作人（既定取舍），
+--    单独给物流加一个会开一个只在这里成立的先例。
+-- ---------------------------------------------------------------------------
+CREATE TABLE order_logistics (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    order_id    BIGINT UNSIGNED NOT NULL                COMMENT '所属订单 id（故意不加外键）',
+    status      TINYINT         NOT NULL                COMMENT '节点状态码：1=已揽收 2=运输中 3=派送中 4=已签收 5=异常',
+    description VARCHAR(255)    NOT NULL                COMMENT '这一节点的说明（管理员手写，如「快件已到达【杭州转运中心】」）',
+    trace_time  DATETIME        NOT NULL                COMMENT '★ 这一节点【发生】的时刻（管理员可填过去的时刻 = 补录）',
+    create_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '录入时间',
+    PRIMARY KEY (id),
+    -- ★ 列序是 (order_id, trace_time, id) —— trace_time 在 id 前面不是随意的，
+    --   它就是那个「按发生时刻排，不是按录入顺序排」的决定在索引上的样子。
+    KEY idx_order_trace (order_id, trace_time, id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '订单物流轨迹（管理员手工录入，不是快递公司推送）';
 
 
 -- ---------------------------------------------------------------------------
@@ -613,15 +785,54 @@ CREATE TABLE product_review_image (
 --      而下面种子区里 product_sku 的插入语句也算一处「以 product 开头」的
 --      插入语句 —— 那个自检的匹配串已经因此收窄成带左括号的形式。
 --      所以这里只能这么绕着说，见 sync-mall-seed.py 里那段注释。
+--
+--    ★★ 里程碑 16（migration-14b）：价格从一个数变成一套。
+--
+--       price        售价。用户实际付的钱 —— 唯一真源，不变
+--       market_price 划线价（原价/市场价）。商城页那个被划掉的数字
+--       cost_price   成本价（进货价）。★ 只在管理端出现
+--
+--       ★ 后两列都是 DEFAULT NULL，**和 category.parent_id 的
+--         NOT NULL DEFAULT 0 故意相反**。判据是 migration-14b 头部那句话：
+--         「这个 0 会不会被当成一个真实存在的数据拿去比较和计算」。
+--         parent_id = 0 只是一个「没有父」的标记，永不 join 到真实分类；
+--         而 market_price = 0 会被拿去和售价比大小 —— 「没设划线价」
+--         是一件【缺席】的事，用 0 表示会让「0 元原价」变成一个假问题。
+--         （同一个字段该用 0 还是 NULL，两次答案不同，所以两次都写下来。）
+--
+--       ★★ 成本价是一条【安全边界】，而边界【不在这个文件里、也不在 SQL 里】。
+--         SQL 该查就查（ProductSkuMapper 的三个查询都带 cost_price），
+--         真正的边界在 VO 继承树上：ShopSkuVO extends SkuVO 是用户端出口，
+--         costPrice 只加在 AdminSkuVO 上。
+--         ⚠️ 谁把 costPrice 加到父类 SkuVO 上，/api/shop/skus/{id}
+--           立刻【匿名】泄漏成本价 —— 一行改动、零编译错误、不用登录。
+--           守着它的是 sql/test-price.py 的 E 组（双向：用户端不许有、管理端必须有）。
+--
+--       ★ 展示规则「只有 market_price > price 才画删除线」是【前端】的事，
+--         后端只给数、不给 showDiscount 这种布尔位 —— 和 skuCount > 1 时
+--         前端自己加一个「起」字是同一种分工。
+--         ⚠️ 代价是一个静默失败：填错的划线价（比售价低或相等）会被
+--           这个规则悄悄吃掉。所以保存时有一条 400 拦它（且必须按入库的
+--           舍入来比大小，理由见 migration-14b 头部）。
+--
+--       ★★ 列表卡片上的划线价【只在单规格商品上】出现。
+--          `MIN(price)` 和 `MIN(market_price)` 可以来自两个不同的 SKU 行，
+--          并排显示会渲染出一个不存在的折扣（¥4999 ~~¥8999~~，而 8999
+--          是另一个规格的原价）。所以 ProductMapper 里那把锁是
+--          `CASE WHEN a.sku_count = 1 THEN a.only_market_price END` ——
+--          和 15 轮 defaultSkuId 用的是同一把锁、同一条理由：
+--          **一个回答不了的问题不应该有一个假答案。**
 -- ---------------------------------------------------------------------------
 CREATE TABLE product_sku (
-    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
-    product_id  BIGINT UNSIGNED NOT NULL                COMMENT '所属商品 id',
-    spec_json   VARCHAR(500)    NOT NULL                COMMENT '规格组合 JSON，形如 [{"name":"颜色","value":"黑"},{"name":"内存","value":"128G"}]，按规格定义顺序排列、无多余空白（规范化由 SpecJson 保证，因为 uk_product_spec 靠它才拦得住重复）；无规格的商品只有一条 spec_json = [] 的默认 SKU',
-    price       DECIMAL(10, 2)  NOT NULL                COMMENT '售价（元）—— 价格与库存的唯一真源',
-    stock       INT             NOT NULL DEFAULT 0      COMMENT '库存数量',
-    create_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    update_time DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    product_id   BIGINT UNSIGNED NOT NULL                COMMENT '所属商品 id',
+    spec_json    VARCHAR(500)    NOT NULL                COMMENT '规格组合 JSON，形如 [{"name":"颜色","value":"黑"},{"name":"内存","value":"128G"}]，按规格定义顺序排列、无多余空白（规范化由 SpecJson 保证，因为 uk_product_spec 靠它才拦得住重复）；无规格的商品只有一条 spec_json = [] 的默认 SKU',
+    price        DECIMAL(10, 2)  NOT NULL                COMMENT '售价（元）—— 价格与库存的唯一真源',
+    market_price DECIMAL(10, 2)  DEFAULT NULL            COMMENT '划线价（原价/市场价）。NULL = 商家没设，不是 0（见 migration-14b 头部）',
+    cost_price   DECIMAL(10, 2)  DEFAULT NULL            COMMENT '成本价（进货价）。★ 只在管理端出现，绝不允许进入任何 /api/shop/** 的响应',
+    stock        INT             NOT NULL DEFAULT 0      COMMENT '库存数量',
+    create_time  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    update_time  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_product_spec (product_id, spec_json)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '商品 SKU 表（价格与库存的唯一真源）';

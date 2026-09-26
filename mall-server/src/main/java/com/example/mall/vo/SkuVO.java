@@ -59,7 +59,52 @@ public class SkuVO {
 
     private BigDecimal price;
 
+    /**
+     * 划线价（原价/市场价），★ 里程碑 16 新增。{@code null} = 商家没设。
+     *
+     * <p>★ <b>它加在父类上是刻意的：两端都该看到划线价。</b>
+     * 用户端要画删除线，管理端要在规格矩阵里回填商家填过的值。
+     *
+     * <p>⚠️ 展示规则「只有 {@code marketPrice > price} 时才画删除线」在<b>前端</b>：
+     * 后端只给数，不给 {@code showDiscount} 这种布尔位 ——
+     * 和 {@code skuCount > 1} 时前端自己加一个「起」字是同一种分工。
+     * 保存时有一条 400 拦「填了却不大于售价」的输入（见 {@code ProductServiceImpl}）。
+     *
+     * <p>⚠️ <b>{@code null} 和「0」是两件事。</b>数据库那列是 {@code DEFAULT NULL}，
+     * 而且 {@code non_null} 的 Jackson 配置会让这个 key 在没设时<b>整个消失</b>，
+     * 前端判断用宽松真值（{@code !sku.marketPrice}）即可 ——
+     * 和 {@code defaultSkuId} 是同一套写法。
+     */
+    private BigDecimal marketPrice;
+
     private Integer stock;
+
+    /**
+     * ★★★ 这里【没有】也不许有 {@code costPrice}（及其派生量毛利）。
+     *
+     * <p>本类是两个出口共同的父类：
+     * <pre>
+     *   SkuVO（就是这里）
+     *    ├─ ShopSkuVO   用户端出口：/api/shop/skus/{id}、购物车、立即购买
+     *    └─ AdminSkuVO  管理端出口：商品详情 + SKU 编辑矩阵
+     * </pre>
+     *
+     * <p>成本价只该出现在管理端，所以它在 {@link AdminSkuVO} 上。
+     * ⚠️ <b>把 {@code costPrice} 加到这一层，等于让用户端接口匿名泄漏成本价</b> ——
+     * 一行改动、零编译错误、无需登录就能读到，而且
+     * {@code GET /api/shop/skus/{id}} 本来就是公开接口（加购要走它）。
+     *
+     * <p>这不是假想的风险，README 里早就写着这一天会来：
+     * 「那 {@code /api/shop/skus/**} 凭什么匿名？……哪天有人往这个响应里
+     * 加了详情接口没有的字段（成本价、真实进货量），这条理由就作废了。」
+     * 里程碑 16 就是那一天 —— 而应对方式是把新字段加在<b>子类</b>上，
+     * 让上面那句理由继续成立。
+     *
+     * <p>守着这条约定的是 {@code sql/test-price.py} 的 E 组，它是<b>双向</b>的：
+     * 用户端 JSON 里键名含 {@code cost} / {@code margin} 的一个都不许有，
+     * 同时管理端<b>必须</b>有 —— 少了后半句，那个扫描在
+     * 「成本字段根本没接上」时也会全绿。
+     */
 
     /**
      * 把一行 SKU 实体渲染成 VO —— <b>全项目唯一的「{@code ProductSku} → {@code SkuVO}」转换</b>。
@@ -126,7 +171,11 @@ public class SkuVO {
         target.setSpecs(SpecJson.parse(sku.getSpecJson()));
         target.setSpecText(SpecJson.text(sku.getSpecJson(), schema));
         target.setPrice(sku.getPrice());
+        target.setMarketPrice(sku.getMarketPrice());
         target.setStock(sku.getStock());
+        // ⚠️ 这里【不该】出现 costPrice —— 本方法是两个出口共用的，
+        //    加一行就等于给用户端加了一个字段。理由见上面那段注释。
+        //    成本三件套由 AdminSkuVO.of() 在调完本方法之后自己补。
         return target;
     }
 

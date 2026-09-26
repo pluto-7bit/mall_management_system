@@ -46,12 +46,19 @@ test-address.py 的区别说清楚：
 
 运行：
     python test-frontend-contract.py
+
+退出码：★ 里程碑 16 才有。0 = 全绿，1 = 有断言失败。
+    在这之前它【永远退出 0】，所以
+        ... && echo 绿 || echo 红
+    这句话在它身上没有任何信息量。加退出码这件事本身有个前提：
+    先跑一次看看它是不是一直有断言在假通过（见文件末尾的注释）。
 """
 
 import datetime
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -208,17 +215,65 @@ def admin_login():
     CATEGORY_ID = int(run_sql("SELECT id FROM category ORDER BY id LIMIT 1")[0][0])
 
 
-def make_product(name, price, stock):
+def make_product(name, price, stock, cost=None):
     # 里程碑 15：价格和库存搬到了 product_sku 上。没有规格的商品也要显式给一条
     # 「默认 SKU」（specs 为空数组），后端拿它的 price/stock 作为这件商品的价格和库存。
+    #
+    # ★ 里程碑 16：多了一个可选的 cost（成本价）。
+    #   默认【不传】= 这件商品的成本是 NULL，而这正是我们想要的两个对照：
+    #     传了 cost 的商品 → 管理端 SKU 必须【有】成本三件套
+    #     没传 cost 的商品 → 管理端 SKU 必须【没有】那三个键
+    #   少了后一半，前一半在「成本字段根本没接上」时也会全绿
+    #   —— 一个空转的检查比没有检查更危险。
+    #
+    #   ⚠️ 这也是 Jackson 那双刃剑的现场：default-property-inclusion: non_null
+    #   让「没设成本」和「后端忘了给成本字段」在 JSON 里长得【一模一样】
+    #   （都是键不存在）。所以这个契约只能用「一件设了成本的商品」来测，
+    #   光看一件没设成本的商品是分不出这两件事的。
+    sku = {"specs": [], "price": price, "stock": stock}
+    if cost is not None:
+        sku["costPrice"] = cost
     st, r = call("POST", "/admin/products", {
         "name": name, "categoryId": CATEGORY_ID, "status": 1,
         "cover": "", "description": "",
-        "specSchema": [], "skus": [{"specs": [], "price": price, "stock": stock}],
+        "specSchema": [], "skus": [sku],
     }, ADMIN_TOKEN)
     if r.get("code") != 200:
         raise SystemExit(f"建测试商品失败：HTTP {st} / {r}")
     return r["data"]
+
+
+# ----------------------------------------------------------------------
+# ★★ 里程碑 16：成本价泄漏扫描
+# ----------------------------------------------------------------------
+# 这一段和 sql/test-price.py 的 E 组是【同一份判断】，而两份都留着不是重复 ——
+# 它们扫的不是同一个东西：
+#   test-price.py E 组   自己发请求、扫后端返回的裸 JSON（守【接口】）
+#   这一段               扫的是本脚本里那些断言【正在读】的响应对象
+#                        （守【前端真正拿到的那一坨形状】）
+# 一句话：一个是「接口干净吗」，一个是「前端手里的东西干净吗」。
+# 而成本价泄漏这件事的性质决定了：只要有一处漏了，两端都会漏。
+COST_LEAK_WORDS = ("cost", "margin")
+
+
+def scan_leak(obj, path="", hits=None):
+    """递归找出键名里带 cost / margin 的字段路径（不区分大小写）。
+
+    ★ 扫的是【键名】而不是键值：一件商品可以叫「成本价测试T恤」，
+      那是数据，不是字段。把值也扫进去会得到一堆只有换个商品名
+      就能触发的假警报 —— 而假警报的代价是「这条断言被人关掉」。
+    """
+    if hits is None:
+        hits = []
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if any(w in key.lower() for w in COST_LEAK_WORDS):
+                hits.append(f"{path}.{key}")
+            scan_leak(val, f"{path}.{key}", hits)
+    elif isinstance(obj, list):
+        for i, val in enumerate(obj):
+            scan_leak(val, f"{path}[{i}]", hits)
+    return hits
 
 
 def sku_of(pid):
@@ -262,6 +317,12 @@ def cleanup():
     run_sql("DELETE oi FROM order_item oi "
             "JOIN orders o ON o.id = oi.order_id "
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
+    # ★ 里程碑 18：轨迹挂在订单上，所以它必须排在订单【之前】删。
+    #   order_logistics 同样没有外键（全库零外键是既定约定），
+    #   数据库不会帮你挡 —— 顺序错了就会留下孤儿轨迹。
+    run_sql("DELETE ol FROM order_logistics ol "
+            "JOIN orders o ON o.id = ol.order_id "
+            f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE o FROM orders o "
             f"JOIN member m ON m.id = o.member_id WHERE m.username LIKE '{PREFIX}%'")
     run_sql("DELETE a FROM member_address a "
@@ -286,7 +347,11 @@ def main():
     section("1. 前端读的字段，接口里真的有吗")
 
     # ---- 商品详情（ProductDetail.vue / Checkout.vue 的立即购买）----
-    pid = make_product(f"{PREFIX}契约商品", "12.30", 50)
+    # ★ 里程碑 16：这件主商品【带成本价】（12.30 卖、8.00 进）。
+    #   带它不是为了测毛利算得对不对（那是 test-price.py 的事），
+    #   而是因为下面那组双向契约要求「有一件真的设了成本的商品」——
+    #   没有它，泄漏扫描和「管理端必须有成本」两条都会变成空转。
+    pid = make_product(f"{PREFIX}契约商品", "12.30", 50, cost="8.00")
     st, r = call("GET", f"/shop/products/{pid}")
     check("商品详情 → 200", r.get("code") == 200, f"HTTP {st} / {r}")
 
@@ -431,6 +496,70 @@ def main():
     check("★★ 管理端商品详情有 images（ProductForm 回填要它）",
           isinstance(a_detail.get("images"), list),
           f"实际 {a_detail.get('images')!r}，字段：{sorted(a_detail.keys())}")
+
+    # ---- ★★ 里程碑 16：成本价的双向契约 ----
+    #
+    #   「成本价只在管理端」这句话有两半，两半都要有断言：
+    #     正向：管理端详情的 SKU 【必须】带成本三件套（否则 ProductForm
+    #           的 SKU 矩阵那一列永远是「未设置」，而接口 200、不报错）
+    #     反向：用户端三个接口的响应里【一个 cost/margin 键都不许有】
+    #
+    #   ⚠️ 只写正向是不够的：成本字段没接上时正向会红，但「成本字段接到了
+    #     父类 SkuVO 上」时正向【还是绿的】—— 那正是本轮最危险的改法
+    #     （ShopSkuVO extends SkuVO 一行改动、零编译错误、匿名泄漏）。
+    #     只写反向也是不够的：成本三件套整个没实现时反向全绿。
+    #   这两条互为对方的空转守卫，拆开任何一条都会变成一条不会红的检查。
+    a_skus = a_detail.get("skus") or []
+    check("★★ 管理端详情有 skus（下面三条的扫描对象）", bool(a_skus),
+          f"实际 {a_skus!r}")
+    if a_skus:
+        # ★ 这一条的判据是「这件商品的成本【设了】」（make_product 传了 cost=8.00）。
+        #   设了成本还缺键，只有两种可能：AdminSkuVO.of() 忘了补，
+        #   或者 costPrice 被加到了父类上又被 non_null 吃掉 —— 都是 bug。
+        require_keys(a_skus[0],
+                     ["id", "specText", "price", "stock",
+                      "costPrice", "grossMargin", "grossMarginPercent"],
+                     "管理端 SKU（设了成本价的商品）")
+        # ★ 值也要看一眼：只有键在而值是 null 的话，non_null 会让它根本不在 ——
+        #   所以拿到一个数字这一条其实是在确认「它真的算出来了」。
+        check("★★ 管理端 SKU 的毛利率是个数字（不是键在值为空）",
+              isinstance(a_skus[0].get("grossMarginPercent"), (int, float)),
+              f"实际 {a_skus[0].get('grossMarginPercent')!r}")
+
+    # ---- ★★ 反向：用户端三个接口一个成本字段都不许有 ----
+    #
+    #   ★ 扫描对象是【真的设了成本价的那件商品】（pid），不是随便一件。
+    #     拿一件成本是 NULL 的商品去扫，扫出来的干净是 non_null 给的，
+    #     不是边界给的 —— 那样这条断言在任何人往 SkuVO 上加字段时都不会红。
+    st_sd, shop_detail = call("GET", f"/shop/products/{pid}")
+    st_sl, shop_list = call("GET", "/shop/products?pageNum=1&pageSize=5")
+    st_sk, shop_sku = call("GET", f"/shop/skus/{sku_of(pid)}")
+
+    #   ⚠️ 带 HTTP 状态码：如果某个接口挂了，「响应里没有 cost」会因为
+    #      响应体是错误对象而【变成绿的】—— 空转的第二种长相。
+    check("★★ 三个用户端接口都真的 200（否则下面三条扫的是错误响应）",
+          st_sd == 200 and st_sl == 200 and st_sk == 200,
+          f"实际 {st_sd} / {st_sl} / {st_sk}")
+
+    for label, payload in (("商城商品详情", shop_detail),
+                           ("商城商品列表", shop_list),
+                           ("商城规格详情", shop_sku)):
+        leaks = scan_leak(payload)
+        check(f"★★ {label}的响应里没有任何 cost/margin 键", not leaks,
+              f"泄漏了 {leaks} —— 成本价是管理端专属字段，"
+              f"用户端可以看到这件商品的每一个响应")
+
+    #   ★★ 反空转守卫：同一把扫描器去扫【管理端】的响应，必须能扫出一堆来。
+    #
+    #   上面三条说的都是「没有」，而「没有」是最容易假绿的一种断言 ——
+    #   扫描器写错一个字母、递归少写一层、接口挂了返回错误对象，
+    #   它们【全都是绿的】。所以必须有一条说「有」的来给它们作证。
+    #   用的是同一件商品、同一个响应对象，唯一的差别就是管理端还是用户端。
+    leaked_on_admin = scan_leak(a_detail)
+    check("★★ 空转守卫：同一把扫描器扫管理端【必须】扫得出成本字段",
+          any("cost" in h.lower() for h in leaked_on_admin),
+          f"管理端只扫到 {leaked_on_admin} —— 扫描器本身坏了，"
+          f"上面那三条「没有泄漏」是空转的")
 
     st, r = call("GET", "/admin/products?pageNum=1&pageSize=5", None, ADMIN_TOKEN)
     check("★ 管理端商品列表 → 200", r.get("code") == 200, f"HTTP {st} / {r}")
@@ -1040,7 +1169,13 @@ def main():
     check("（准备）支付成功", r.get("code") == 200, f"HTTP {st} / {r}")
 
     # ★ 发货是【管理端】接口，要用管理员 token
-    st, r = call("POST", f"/admin/orders/{flow_no}/ship", None, ADMIN_TOKEN)
+    # ★★ 里程碑 18：发货的请求体从【没有】变成【必填承运商 + 快递单号】。
+    #    这个契约变更由下面两条一起钉住：
+    #      ① 带 body → 200，且响应里回显 logisticsCompany / trackingNo
+    #      ② 不带 body → HTTP 400（下面单独验，钉住「必填」而不是「可选」）
+    st, r = call("POST", f"/admin/orders/{flow_no}/ship",
+                 {"logisticsCompany": "顺丰", "trackingNo": "SF1234567890"},
+                 ADMIN_TOKEN)
     check("★ POST /admin/orders/{no}/ship → 200", r.get("code") == 200,
           f"HTTP {st} / {r}")
     shipped = r.get("data") or {}
@@ -1048,7 +1183,8 @@ def main():
     #    所以它必须是一行【管理端】订单的完整形状（含会员字段）。
     require_keys(shipped,
                  ["id", "orderNo", "status", "totalAmount", "items",
-                  "memberUsername", "memberNickname", "shipTime"],
+                  "memberUsername", "memberNickname", "shipTime",
+                  "logisticsCompany", "trackingNo"],
                  "发货响应（mall-web 拿它直接刷新那一行）")
     check("★★ 发货响应里 status = 2", shipped.get("status") == 2,
           f"拿到 {shipped.get('status')!r}")
@@ -1056,6 +1192,13 @@ def main():
           isinstance(shipped.get("shipTime"), str)
           and len(shipped["shipTime"]) == 19 and shipped["shipTime"][10] == " ",
           f"拿到 {shipped.get('shipTime')!r}")
+    # ★★ 里程碑 18：承运商和单号必须原样回显 —— mall-web 的物流对话框
+    #    和用户端的订单卡片都直接读这两个字段。
+    check("★★ 发货响应里回显了承运商和快递单号",
+          shipped.get("logisticsCompany") == "顺丰"
+          and shipped.get("trackingNo") == "SF1234567890",
+          f"拿到 logisticsCompany={shipped.get('logisticsCompany')!r} / "
+          f"trackingNo={shipped.get('trackingNo')!r}")
     check("★ 发货响应里【没有】completeTime（还没确认收货）",
           not has(shipped, "completeTime"),
           f"出现了 {shipped.get('completeTime')!r}")
@@ -1109,6 +1252,156 @@ def main():
           zero.get("total", -1) != (page.get("total") or 0)
           or len(zero.get("list") or []) != len(order_rows),
           "两者相同 —— 说明 status=0 被当成了「全部」")
+
+    # ==================================================================
+    section("8b. ★★ 里程碑 18：物流接口的响应契约")
+
+    # 这一节守的是两个弹窗和用户端订单卡片上的那个入口：
+    #   mall-web  views/order/List.vue   → logisticsData.logisticsCompany / trackingNo
+    #                                      / shipTime / traces[].{id,status,description,traceTime}
+    #   mall-shop views/Orders.vue       → o.trackingNo（v-if 决定「查看物流」按钮显不显示）
+    # 拼错任何一个名字，症状都不是报错：
+    #   入口【永远不显示】（v-if 恒 false），或者时间线渲染出一片空白。
+    # 手点页面要点到发货那一步才看得见，所以在这里钉死。
+
+    # ★ 先钉一条【用户端订单对象里必须有单号】——
+    #   这是 Orders.vue 上那一行 `v-if="o.trackingNo"` 的前提。
+    #   ⚠️ 它和上面的 non_null 是配套的：没发货的订单这个 key 会消失
+    #      （前端必须写假值判断），发货之后它必须【在】。
+    check("★★ 已发货订单的用户端响应里【有】trackingNo（查看物流入口的前提）",
+          shipped.get("trackingNo") == "SF1234567890"
+          and shipped.get("logisticsCompany") == "顺丰",
+          f"拿到 trackingNo={shipped.get('trackingNo')!r} / "
+          f"logisticsCompany={shipped.get('logisticsCompany')!r}")
+
+    # ---- ★★ 同一个 OrderVO 的两条路必须给出一致的字段 ----
+    # 这一条是【跑端到端时才发现的】一个真漏洞，所以它的说明比别的长：
+    # 订单列表走 MyBatis 的 resultType=OrderVO（按列名自动映射，加了列就自动有），
+    # 而订单详情走 Service 里【手写逐字段搬】的 toVO —— 加列的时候漏了那一处。
+    # 症状是「列表上有单号、详情里没有」，而 non_null 会让 key 整个消失，
+    # 页面、构建、控制台【全都正常】。当时没有页面读详情的这两个字段，
+    # 所以它一直没露出来；而详情页恰恰是最可能顺手加一个「查看物流」入口的地方。
+    # ⇒ 所以这条断言的判据不是「详情页现在用不用它」，而是
+    #   「同一个 VO 的两条路不能说两套话」。
+    st, r = call("GET", f"/shop/orders/{flow_no}", None, TOKEN)
+    check("★ GET /shop/orders/{no}（详情）→ 200", r.get("code") == 200,
+          f"HTTP {st} / {r}")
+    detail = r.get("data") or {}
+    check("★★ 详情里也【有】承运商和单号（和列表一致，不是只有列表有）",
+          detail.get("logisticsCompany") == "顺丰"
+          and detail.get("trackingNo") == "SF1234567890",
+          f"拿到 logisticsCompany={detail.get('logisticsCompany')!r} / "
+          f"trackingNo={detail.get('trackingNo')!r} —— "
+          f"多半是 OrderServiceImpl.toVO 那个手写搬运的地方漏了这一对")
+
+    # ---- GET 两个端：形状必须【完全一样】----
+    # ★ 两端共用同一个 LogisticsVO，所以这里量的是同一份契约。
+    #   一个端漏了字段，另一个端一定有同样的毛病 —— 所以两边都量，
+    #   红的时候能立刻告诉你是不是 VO 那一层的问题。
+    st, r = call("GET", f"/admin/orders/{flow_no}/logistics", None, ADMIN_TOKEN)
+    check("★ GET /admin/orders/{no}/logistics → 200", r.get("code") == 200,
+          f"HTTP {st} / {r}")
+    a_logi = r.get("data") or {}
+    require_keys(a_logi, ["logisticsCompany", "trackingNo", "shipTime", "traces"],
+                 "管理端物流响应")
+    check("★★ 管理端物流的 traces 是【数组】（刚发货，所以是空的）",
+          isinstance(a_logi.get("traces"), list) and len(a_logi["traces"]) == 0,
+          f"拿到 {a_logi.get('traces')!r} —— 前端 v-for 直接遍历它，不能是 null")
+    check("★ 管理端物流带上了发货时填的承运商和单号",
+          a_logi.get("logisticsCompany") == "顺丰"
+          and a_logi.get("trackingNo") == "SF1234567890",
+          f"拿到 {a_logi.get('logisticsCompany')!r} / {a_logi.get('trackingNo')!r}")
+
+    st, r = call("GET", f"/shop/orders/{flow_no}/logistics", None, TOKEN)
+    check("★ GET /shop/orders/{no}/logistics → 200", r.get("code") == 200,
+          f"HTTP {st} / {r}")
+    s_logi = r.get("data") or {}
+    require_keys(s_logi, ["logisticsCompany", "trackingNo", "shipTime", "traces"],
+                 "用户端物流响应")
+    # ★★ 两端【同形状】这件事要正面断言，而不是各量各的 ——
+    #    两边都漏同一个字段时，各量各的会一起绿。
+    check("★★ 用户端和管理端的物流响应【是同一个形状】（同一个 VO）",
+          set(a_logi.keys()) == set(s_logi.keys()),
+          f"管理端 {sorted(a_logi.keys())} vs 用户端 {sorted(s_logi.keys())}")
+
+    # ---- POST：新增节点，响应必须是【录完之后的完整物流】----
+    # ★★ 这是前端「拿返回的 VO 直接替换本地数据」的前提。
+    #    如果它只返回刚插入的那一条节点，前端要么自己往数组里 push
+    #    （顺序会错 —— 补录一条旧节点就露馅），要么重查一次（白花一次请求）。
+    st, r = call("POST", f"/admin/orders/{flow_no}/logistics",
+                 {"status": 1, "description": "快件已揽收", "traceTime": "2026-09-20 09:00:00"},
+                 ADMIN_TOKEN)
+    check("★ POST /admin/orders/{no}/logistics → 200", r.get("code") == 200,
+          f"HTTP {st} / {r}")
+    after_add = r.get("data") or {}
+    require_keys(after_add, ["logisticsCompany", "trackingNo", "shipTime", "traces"],
+                 "新增节点响应")
+    check("★★ 新增节点的响应是【完整物流】，不是那一条节点",
+          isinstance(after_add.get("traces"), list) and len(after_add["traces"]) == 1,
+          f"traces 拿到 {after_add.get('traces')!r} —— 前端直接拿它替换本地数据")
+    trace0 = (after_add.get("traces") or [{}])[0]
+    # ★ traceTime 是【发生】的时刻（管理员可以填过去的），createTime 是录入时刻。
+    #   两者都可能被前端读：mall-web 显示前者，并在「不是同一天」时补显示后者。
+    require_keys(trace0, ["id", "status", "description", "traceTime", "createTime"],
+                 "物流轨迹里的一条节点")
+    check("★★ 节点的 status 是【数字码】而不是中文（前端靠它选颜色）",
+          trace0.get("status") == 1,
+          f"拿到 {trace0.get('status')!r} —— 前端 logisticsStatusTagType 要的是码")
+    check("★ 节点回显了管理员手填的 traceTime（不是服务端的 now）",
+          trace0.get("traceTime") == "2026-09-20 09:00:00",
+          f"拿到 {trace0.get('traceTime')!r}")
+    check("★ 新增节点后，承运商和单号【不】受影响（它们是订单级的，不是节点级的）",
+          after_add.get("trackingNo") == "SF1234567890",
+          f"拿到 {after_add.get('trackingNo')!r}")
+
+    # ---- 录「已签收」：订单已经是「已完成」了，所以那条 SQL 打不中 ----
+    # ★★ 这一条钉的是「affected = 0 不是错误」。
+    #    如果不检查 affected 的写法写反了（去检查它），这里会 1002/500，
+    #    而它的正常含义只是「订单不在『已发货』状态，没什么可推的」。
+    st, r = call("POST", f"/admin/orders/{flow_no}/logistics",
+                 {"status": 4, "description": "已签收", "traceTime": "2026-09-22 15:30:00"},
+                 ADMIN_TOKEN)
+    check("★★ 给【已完成】的订单录「已签收」→ 仍然 200（联动打不中不是错误）",
+          r.get("code") == 200, f"HTTP {st} / {r}")
+    signed = r.get("data") or {}
+    check("★ 录完之后 traces 有两条", len(signed.get("traces") or []) == 2,
+          f"拿到 {len(signed.get('traces') or [])} 条")
+    # ★★ 时间线【最新在上】：2026-09-22 的那条（后录、时间也晚）必须在最前。
+    #    ⚠️ 这里只断言了「正常情况」，补录那条【不在最上面】的断言在
+    #       test-logistics.py 的 C 组 —— 那条才是真正守着排序键的。
+    check("★★ traces 最新在上（traceTime DESC）",
+          [(t.get("traceTime") or "") for t in signed.get("traces") or []]
+          == sorted([(t.get("traceTime") or "") for t in signed.get("traces") or []],
+                    reverse=True),
+          f"拿到 {[t.get('traceTime') for t in signed.get('traces') or []]}")
+
+    # ---- DELETE ----
+    # ★ 删除【不回退】订单状态，所以这里只验「节点没了」+「200」。
+    #   不回退那一条的断言在 test-logistics.py 的 E 组（那边造的是真的
+    #   「已发货→已完成」场景，能真的验出回退没回退）。
+    st, r = call("DELETE", f"/admin/orders/{flow_no}/logistics/{trace0.get('id')}",
+                 None, ADMIN_TOKEN)
+    check("★ DELETE /admin/orders/{no}/logistics/{id} → 200", r.get("code") == 200,
+          f"HTTP {st} / {r}")
+    deleted = r.get("data") or {}
+    check("★★ 删除的响应也是【完整物流】（前端拿它刷新弹窗）",
+          isinstance(deleted.get("traces"), list) and len(deleted["traces"]) == 1,
+          f"traces 拿到 {deleted.get('traces')!r}")
+
+    # ★ 删一个不存在的 id → 1003（不是 500，也不是静默成功）
+    st, r = call("DELETE", f"/admin/orders/{flow_no}/logistics/999999999",
+                 None, ADMIN_TOKEN)
+    check("★★ 删不存在的节点 → 1003 NOT_FOUND",
+          r.get("code") == 1003, f"HTTP {st} / 拿到 code={r.get('code')!r}")
+
+    # ★ 会员 token 调管理端物流接口 → 401（AdminAuthInterceptor 兜底）
+    st, r = call("GET", f"/admin/orders/{flow_no}/logistics", None, TOKEN)
+    check("★★ 会员 token 调管理端物流接口 → 401",
+          st == 401, f"HTTP {st} / {r}")
+
+    # ★ 未登录调用户端物流接口 → 401
+    st, r = call("GET", f"/shop/orders/{flow_no}/logistics")
+    check("★★ 未登录调用户端物流接口 → 401", st == 401, f"HTTP {st} / {r}")
 
     # ==================================================================
     section("9. ★ 里程碑 12：评价 + 订单明细上的评价状态")
@@ -1240,6 +1533,15 @@ def main():
     check("★★ 没有孤儿晒图", int(orphans[0][0]) == 0,
           f"{orphans[0][0]} 行晒图指向不存在的评价")
 
+    # ★ 里程碑 18：轨迹也挂在订单上，所以它是第三类会因为清理顺序出错而
+    #   留下来的孤儿。★ 它比评价更隐蔽 —— 评价至少在管理端看得见，
+    #   而孤儿轨迹只会在有人点开一张【已经不存在的订单】时才出现，
+    #   那种情况永远不会有。
+    orphans = run_sql("SELECT COUNT(*) FROM order_logistics l "
+                      "LEFT JOIN orders o ON o.id = l.order_id WHERE o.id IS NULL")
+    check("★★ 没有孤儿物流轨迹", int(orphans[0][0]) == 0,
+          f"{orphans[0][0]} 行轨迹指向不存在的订单")
+
     print()
     print(f"你的数据：商品 "
           f"{run_sql('SELECT COUNT(*) FROM product')[0][0]} 个，分类 "
@@ -1255,7 +1557,27 @@ def main():
         print("失败项：")
         for f in FAILED:
             print(f"  - {f}")
-    print()
+        # ★★ 里程碑 16 补上的【退出码】。
+        #
+        #   在这之前，这个脚本的 main() 打印完「N 通过 / M 失败」就返回了，
+        #   进程退出码永远是 0 —— 也就是说【失败了也 0】，和全绿长得一模一样：
+        #
+        #       PYTHONIOENCODING=utf-8 python.exe sql/test-frontend-contract.py \
+        #           && echo 绿 || echo 红        ← 它永远说「绿」
+        #
+        #   ★ 为什么拖到这一轮才修：里程碑 14 就发现了，当时的判断是
+        #     「单独处理」。而 16 轮要往它里面加【成本价泄漏】的断言 ——
+        #     一个永远退出 0 的脚本里，「加了断言」约等于「没加」。
+        #     加了守门的检查却不接电源，是这轮最不能忍的一种半成品。
+        #
+        #   ⚠️ 补上退出码之后第一次跑，如果它翻红了 ——
+        #     那说明【本来就有断言在假通过】，不是修坏了。
+        #     一条不会红的检查等于没有检查，而这一条连红都不会红。
+        sys.exit(1)
+
+    # 绿的时候显式退出 0。main() 自然返回也是 0，写出来是为了让
+    # 「两个分支各自决定退出码」这件事在代码里看得见，而不是靠缺省。
+    sys.exit(0)
 
 
 if __name__ == "__main__":

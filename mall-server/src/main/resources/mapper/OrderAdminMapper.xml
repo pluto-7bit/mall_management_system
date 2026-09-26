@@ -166,13 +166,47 @@
 
       ★ ship_time = NOW() 交给数据库的时钟，理由和 markPaid 一致：
         多台应用服务器时钟不一致时，会出现「发货时间早于付款时间」这种诡异数据。
+
+      ★★ 里程碑 18 加的两列：logistics_company / tracking_no
+        （货是怎么发出去的）。它们和 ship_time 是【同一件事的三个部分】——
+        「什么时候发的、哪家快递、单号多少」只可能一起发生，
+        所以写在同一条 UPDATE 里，不可能出现「有时间没单号」的中间态。
+
+      ★ 三个值都来自请求体，不做任何规范化（不去空格、不转大写）：
+        快递公司名和单号是【外部世界的标识符】，
+        单号里的空格和大小写都是承运商的规则，这里改了就和快递公司对不上。
+        理由逐字同 after_sale 的 return_company / return_tracking。
     -->
     <update id="markShipped">
         UPDATE orders
-        SET status    = 2,
-            ship_time = NOW()
+        SET status            = 2,
+            ship_time         = NOW(),
+            logistics_company = #{logisticsCompany},
+            tracking_no       = #{trackingNo}
         WHERE order_no = #{orderNo}
           AND status = 1
+    </update>
+
+    <!--
+      ★★ 里程碑 18：「已发货 → 已完成」这条边的【第二个行动者】。
+
+      第一个在 OrderMapper.markCompleted（买家点「确认收货」）。
+      两条是同一条边 —— 同一个 WHERE status = 2、同一个 SET。
+      为什么不能合并成一条：那条带 member_id，而管理员没有 memberId。
+      完整论证见 OrderAdminMapper.java 的 markCompletedByNo。
+
+      ★ 不碰库存、不碰售后 —— 和 markShipped 一样只有一个写。
+
+      ★ complete_time = NOW() 交给数据库时钟，理由同 markPaid / markShipped。
+      ⚠️ 但要记住：complete_time 是售后 7 天窗口的【起点】，
+        所以这条 SQL 顺手启动了那个时钟（用户从签收起有 7 天可退货退款）。
+    -->
+    <update id="markCompletedByNo">
+        UPDATE orders
+        SET status        = 3,
+            complete_time = NOW()
+        WHERE order_no = #{orderNo}
+          AND status = 2
     </update>
 
 </mapper>

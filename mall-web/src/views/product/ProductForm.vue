@@ -132,7 +132,7 @@ const form = reactive({
   specSchema: [],
 
   /**
-   * 规格组合行。每一行 {@code { _k, vi, price, stock }}。
+   * 规格组合行。每一行 {@code { _k, vi, price, marketPrice, costPrice, stock }}。
    *
    * <p>★★ <b>{@code vi} 存的是「每一维取第几个值」的下标数组，不是文字。</b>
    * 这是这个编辑器里最重要的一个决定，理由是：
@@ -150,6 +150,11 @@ const form = reactive({
    * <p>⚠️ 代价是「删掉中间一个取值」会让后面所有行的下标错位，
    * 所以那个操作不能只调 splice —— 见 {@code removeValue()}，
    * 它要把受影响的行一起挪。
+   *
+   * <p>★ 里程碑 16 加的 {@code marketPrice} / {@code costPrice} 和 price
+   * <b>挂在同一行、跟着同一个 {@code vi} 走</b> —— 它们必须是同一个规格的属性。
+   * ⚠️ 所以 {@code rebuildSkus()} 认领旧行时这两列也要一起认领：
+   * 漏一个字段的症状是「改一下规格名，成本价全没了」，而且保存前没有任何提示。
    */
   skus: [],
 })
@@ -220,7 +225,10 @@ function resetForm() {
  */
 function ensureDefaultSku() {
   if (form.skus.length === 0) {
-    form.skus.push({ _k: nextKey(), vi: [], price: null, stock: null })
+    form.skus.push({
+      _k: nextKey(), vi: [], price: null,
+      marketPrice: null, costPrice: null, stock: null,
+    })
   }
 }
 
@@ -231,6 +239,35 @@ async function loadCategories() {
   } catch {
     // 错误提示拦截器已经统一处理了，这里不用重复弹
   }
+}
+
+/**
+ * 分类选项的显示文案。
+ *
+ * <h3>★★ 里程碑 16：一级缩进，用来区分二级分类</h3>
+ *
+ * <p>商品可以挂在<b>任何一级</b>分类下（一级或二级都行 ——
+ * 后端只对分类之间的层级有规则，对商品挂在哪一层没有）。
+ * 所以下拉框里必须能看出"这个分类是二级的"，
+ * 否则「手机数码」和它下面的「手机壳」并排显示，看起来是同一个层级的东西。
+ *
+ * <p>`'　└ '` 里那个字符是<b>全角空格 U+3000</b>，不是普通空格。
+ * 普通空格在 HTML 里会被折叠掉（连续多个只显示成一个），
+ * 缩进会看起来若有若无；全角空格不会被折叠。
+ * 这种"用一个字符解决"的土办法比上 CSS 简单得多，而且下拉选项里
+ * 也用不了 CSS 伪元素。
+ *
+ * <p>⚠️ <b>不要"顺手"把 `getCategoryOptions()` 改成返回树。</b>
+ *    `el-select` 拿到嵌套数据会把每一个根渲染成一个<b>空白选项</b>——
+ *    下拉框还在、还能点、就是一个分类名都不显示，
+ *    而控制台一片安静。完整的理由写在 `api/category.js` 的注释里。
+ *    缩进是在【扁平】数据上拼字符串做出来的，这正是不动数据形状的原因。
+ *
+ * <p>判据用 `parentId` 而不是"有没有 children"：后者在扁平数组上
+ * 永远是不存在的（接口返回的每一项都没有 children 这个键）。
+ */
+function categoryLabel(c) {
+  return (c.parentId ? '　└ ' : '') + c.name
 }
 
 /**
@@ -286,6 +323,14 @@ watch(visible, async (open) => {
           _k: nextKey(),
           vi: viOf(schema, sku.specs),
           price: sku.price,
+          // ★ 里程碑 16：回填这两列。
+          //   ⚠️ ?? null 不能省：多规格商品没设划线价时那个 key 从 JSON 里
+          //   整个消失，读出来是 undefined，而 el-input-number 拿到
+          //   undefined 会显示成空 —— 看起来像「没设」，保存时却会把
+          //   undefined 原样发回去。显式归一成 null，让「没设」在
+          //   数据里也只有一个表示。
+          marketPrice: sku.marketPrice ?? null,
+          costPrice: sku.costPrice ?? null,
           stock: sku.stock,
         })),
       })
@@ -514,6 +559,13 @@ function rebuildSkus() {
       _k: nextKey(),
       vi,
       price: prev?.price ?? null,
+      // ★ 里程碑 16 的两个新字段【必须一起认领】。
+      //   漏掉的症状是「改一下规格名，成本价全没了」—— 静默，而且
+      //   在点保存之前页面上什么都看不出来（那两列只是变空了）。
+      //   这一条和三处之N 那批「多处回填」是同一类坑，但它在 rebuild 里，
+      //   更容易被漏：新加字段的人通常只去改 resetForm 和回填那两处。
+      marketPrice: prev?.marketPrice ?? null,
+      costPrice: prev?.costPrice ?? null,
       stock: prev?.stock ?? null,
     }
   })
@@ -652,8 +704,147 @@ function checkSkusFilled() {
     ElMessage.warning('价格必须大于 0')
     return false
   }
+
+  // ★★ 里程碑 16：划线价必须【严格高于】售价，成本价不能是负数。
+  //
+  //   ⚠️ 前端这两条【不是】为了安全 —— 后端 planSkus 会拦（400），
+  //   而且它才是唯一说了算的那一处。这里判的价值是**指出第几行**：
+  //   后端那句「划线价必须高于售价……（颜色:黑 / 尺码:S）」已经到了
+  //   能做到的程度，但商家在 12 行的表格里还是要自己找一眼。
+  //   这个「指出第几行」的分工，和上面 noPrice / noStock 两条完全一致。
+  //
+  //   ★ 判据必须和展示规则一致：[严格大于]，不是 [大于等于]。
+  //     允许相等的话，商城页那条「marketPrice > price 才画删除线」
+  //     就永远不会成立 —— 商家以为自己设了，页面上什么都不显示。
+  const badMarket = form.skus.findIndex(
+    (sku) => sku.marketPrice !== null && sku.marketPrice !== undefined
+      && Number(sku.marketPrice) <= Number(sku.price),
+  )
+  if (badMarket >= 0) {
+    ElMessage.warning(`第 ${badMarket + 1} 行的划线价必须高于售价，否则商城页不会显示它`)
+    return false
+  }
+  const badCost = form.skus.findIndex(
+    (sku) => sku.costPrice !== null && sku.costPrice !== undefined
+      && Number(sku.costPrice) < 0,
+  )
+  if (badCost >= 0) {
+    ElMessage.warning(`第 ${badCost + 1} 行的成本价不能为负数`)
+    return false
+  }
   return true
 }
+
+// ======================================================================
+// 里程碑 16：毛利率预览
+// ======================================================================
+
+/** 保留两位小数的四舍五入。
+ *
+ *  <p>⚠️ 加 {@code Number.EPSILON} 是为了对付 {@code 1.005} 这类数：
+ *  JS 里 {@code 1.005 * 100} 是 {@code 100.49999999999999}，
+ *  直接 Math.round 会得到 100（也就是 1.00），差了一分钱。
+ */
+function round2(v) {
+  return Math.round((v + Number.EPSILON) * 100) / 100
+}
+
+/**
+ * 这一行「已经填了成本价」吗。
+ *
+ * <h3>★★ 「未设置」必须看 costPrice，不能看毛利是不是 0 —— 这是本项目
+ * 「前端一律用宽松真值判断」那条约定的【例外】</h3>
+ *
+ * <p>因为成本价等于售价时毛利是 <b>0</b>，而 {@code !0} 为 <b>true</b>。
+ * 写成 {@code v-if="row.grossMargin"} 的话，表格会把
+ * 「毛利 0.00」（这个规格不赚钱）显示成「未设置」（这件商品没填成本）——
+ * 两件完全不同的事，而且都是商家要立刻看到的事之一。
+ *
+ * <p>★ 里程碑 15 那条约定之所以是「宽松真值」，前提是那些字段
+ * （{@code defaultSkuId}、{@code marketPrice}）<b>没有 0 这个合法值</b>。
+ * <b>约定的边界就是「0 是不是一个合法的答案」</b> ——
+ * 这里它是，所以这里不适用。
+ */
+function hasCost(row) {
+  return row.costPrice !== null && row.costPrice !== undefined
+}
+
+/**
+ * 毛利率的<b>预览</b>：按当前填的售价和成本价现算。没填成本价返回 null。
+ *
+ * <h3>★★ 这里确实把 AdminSkuVO 的公式抄了第二遍，而这是刻意的</h3>
+ *
+ * <p>本项目有一条反复引用的判断：<b>同一个事实有两份实现，就一定会分岔。</b>
+ * 而 {@code AdminSkuVO.of()} 已经把「毛利 = 售价 - 成本、毛利率 = 毛利/售价×100、
+ * 两位小数」算过一遍了。那为什么这里还要算？
+ *
+ * <p>因为<b>它们算的不是同一个时刻的数</b>：
+ * <pre>
+ *   AdminSkuVO.grossMarginPercent  → 库里【已经存着】的那个价格算出来的
+ *   这个函数                        → 输入框里【还没保存】的那两个数算出来的
+ * </pre>
+ * 商家把成本价从 70 改成 90 的那一刻，后端那一份还没变（要保存之后才变），
+ * 而这一列如果不跟着动，页面上就会写着一个<span>和旁边输入框对不上的</span>毛利率 ——
+ * <b>一个显示出来的数旁边摆着它的两个输入，却说不是它们算的，那才是真的谎话。</b>
+ * 所以在「实时反馈」和「一份实现」之间，这里选了前者，并且把代价写在这里。
+ *
+ * <p>★ 代价具体是什么：两边的舍入必须一样，否则会出现
+ * 「预览 30.00%、保存后 30.01%」这种一次保存就变的数字。
+ * 所以下面刻意复刻了后端的算法：<b>先算毛利并舍入到两位，再除以售价</b>
+ * （不是先除再舍入）—— 顺序不一样，结果会差一分钱。
+ * 后端那份在 {@code AdminSkuVO.of()}，改一处必须两处都改。
+ *
+ * <p>⚠️ 除零：售价是 0 时返回 null 而不是 Infinity。表单校验挡住了
+ * {@code price < 0.01}，但那和「除的时候它不为 0」是两件事。
+ *
+ * @returns {{text: string, margin: string, loss: boolean}|null}
+ *          {@code loss} 表示亏本卖（成本 > 售价）—— 那是真实的生意状态，
+ *          不该被藏起来，所以模板里标红而不是显示成「-」。
+ *          {@code margin} 是绝对毛利（元），只用在 title 上 —— 百分比是
+ *          给「这门生意赚不赚」看的，绝对额是给「这一单赚多少」看的。
+ */
+function marginPercentOf(row) {
+  if (!hasCost(row)) {
+    return null
+  }
+  const price = Number(row.price)
+  const cost = Number(row.costPrice)
+  if (!(price > 0) || Number.isNaN(price) || Number.isNaN(cost)) {
+    return null
+  }
+  // ★ 先算毛利、舍入，再除 —— 和后端 AdminSkuVO.of() 的顺序完全一致
+  const margin = round2(price - cost)
+  const percent = round2((margin * 100) / price)
+  return { text: `${percent.toFixed(2)}%`, margin: margin.toFixed(2), loss: margin < 0 }
+}
+
+/*
+ * ★★ 模板里【直接调】marginPercentOf(row)，一行调了三次（判空 / 取文字 / 判亏损）。
+ *
+ *   这不是偷懒，是【试过另一种写法并且被它咬了一口】之后的选择。
+ *   本来的写法是一个 computed 缓存：
+ *
+ *       const marginPreview = computed(() => {
+ *         const map = new Map()
+ *         for (const sku of form.skus) map.set(sku._k, marginPercentOf(sku))
+ *         return map
+ *       })
+ *       模板：v-if="marginPreview[row._k]"
+ *
+ *   ⚠️ 它【编译得过、也跑得起来、控制台一片安静】，但**每一行都显示「未设置」**。
+ *      原因是 Map 的下标访问：`map[3]` 走的是普通属性查找，
+ *      而 Map 的键不挂在对象属性上 —— 它永远是 undefined，
+ *      于是每一行都掉进 v-else 分支。要用得写 `map.get(row._k)`。
+ *
+ *   ★ 这个坑值得记下来，因为它和本轮那两个静默 bug 是同一个形状：
+ *     **错的是「取不到」，而「取不到」在界面上长得和「本来就没有」一模一样**——
+ *     毛利率列显示「未设置」，而那正是这一列的正常状态之一。
+ *     一个永远不会出现「未设置」以外的值的分支，不会有人去怀疑它。
+ *
+ *   所以改回直调：多算两次纯函数（≤60 行、每行一次减法和一次除法），
+ *   换掉一整类「取不到」的可能。★ 这也和这个模板里 specTextOf(row) /
+ *   categoryLabel(c) 的既有写法一致。
+ */
 
 /** 提交表单 */
 async function handleSubmit() {
@@ -717,6 +908,19 @@ async function handleSubmit() {
       skus: form.skus.map((sku) => ({
         specs: specsOf(sku),
         price: sku.price,
+        // ★ 里程碑 16：这一行的划线价和成本价。
+        //
+        //   ⚠️ 「没填」在这里【必须】原样送 null，不能省成 0，也不能
+        //   干脆不传这个键：
+        //     - 送 0 → 后端存下 0，于是「划线价 0 元」，而 0 > price
+        //       不成立所以商城页不显示 —— 靠巧合对了，但库里多了一个
+        //       商家从没填过的 0；毛利率那边更糟，成本 0 意味着 100% 毛利。
+        //     - 不传这个键 → Spring 反序列化成 null，和后端语义
+        //       （null = 没设）恰好一致，但那是【碰巧】对的；
+        //       而 updatePriceCostStock 是全量覆盖，一旦哪天改成
+        //       「传了才更新」，这一处的行为就变了。显式写出来。
+        marketPrice: sku.marketPrice,
+        costPrice: sku.costPrice,
         stock: sku.stock,
       })),
     }
@@ -752,7 +956,7 @@ async function handleSubmit() {
           <el-option
             v-for="item in categories"
             :key="item.id"
-            :label="item.name"
+            :label="categoryLabel(item)"
             :value="item.id"
           />
         </el-select>
@@ -836,11 +1040,11 @@ async function handleSubmit() {
       <el-form-item label="规格明细">
         <div class="sku-block">
           <el-table :data="form.skus" size="small" border>
-            <el-table-column label="规格" min-width="200">
+            <el-table-column label="规格" min-width="120">
               <template #default="{ row }">{{ specTextOf(row) }}</template>
             </el-table-column>
 
-            <el-table-column label="价格（元）" width="170">
+            <el-table-column label="价格（元）" width="112">
               <template #default="{ row }">
                 <!--
                   :min="0.01" / :precision="2" 只是 UI 层限制，用户可以绕过页面
@@ -854,7 +1058,77 @@ async function handleSubmit() {
               </template>
             </el-table-column>
 
-            <el-table-column label="库存" width="140">
+            <!--
+              划线价（里程碑 16 新增）。填了就显示在商城页的售价旁边，划一道删除线。
+
+              ★ 三列的宽度是【一起算出来的】，不是各填一个「看着差不多」的数：
+                弹窗 780px − 左右内边距 40px − 表单 label 90px ≈ 650px 可用。
+                规格 120(最小) + 价格 112 + 划线价 112 + 成本价 112 + 毛利率 80 + 库存 90
+                = 626px，刚好留一点余量。
+                ⚠️ 少给一列就会挤出横向滚动条 —— 而这一列恰好是「第 5 列」，
+                   商家的显示器越窄越容易撞上，属于「我这里好好的」。
+
+              ★ 用 :min="0.01" 而不是 0：0 是一个**合法的成本价**（赠送品、清库存），
+                但 0 元的划线价没有任何含义 —— 「原价 0 元」不构成一个折扣。
+
+              ⚠️ 这里【不】做「必须高于售价」的输入框级拦截（没有 :min 联动），
+                因为那会让商家根本输不进 80 —— 而他可能就是要先输 80、再改售价。
+                拦截放在点「确定」那一步（checkSkusFilled），那里能说清楚是哪一行。
+            -->
+            <el-table-column label="划线价" width="112">
+              <template #default="{ row }">
+                <el-input-number v-model="row.marketPrice" :min="0.01" :precision="2"
+                                 :controls="false" style="width: 100%"
+                                 placeholder="不填则不显示" />
+              </template>
+            </el-table-column>
+
+            <!--
+              成本价（里程碑 16 新增）。★ 这一列【只在管理端存在】——
+              它不在任何 /api/shop/** 的响应里，用户端从页面到接口都看不到它。
+              守住这条边界的是 sql/test-price.py 的 E 组（双向扫描）。
+
+              ★ :min="0" 而不是 :min="0.01"：成本 0 是真实的（赠品、清库存），
+                而售价 0 不是（那是白送，且毛利率要除以它）。
+                「一条规则该不该拦住某个值」的判据是【这个值在业务上有没有意义】，
+                不是「它看起来是不是太极端」。
+            -->
+            <el-table-column label="成本价" width="112">
+              <template #default="{ row }">
+                <el-input-number v-model="row.costPrice" :min="0" :precision="2"
+                                 :controls="false" style="width: 100%"
+                                 placeholder="不填则不记" />
+              </template>
+            </el-table-column>
+
+            <!--
+              毛利率（里程碑 16 新增）。★ 只读，不能编辑 —— 它是售价和成本价的
+              计算结果，不是一个独立的输入。做成输入框就会立刻出现
+              「填了毛利率但售价和成本对不上它」这种自相矛盾的行。
+
+              ★★ 「未设置」的判断看 costPrice，不看毛利是不是 0。
+                见 hasCost() 上面那段注释 —— 这是本项目
+                「前端一律用宽松真值判断」那条约定【唯一】的例外。
+
+              ★ 亏本卖（成本 > 售价）标红而不是显示成「-」：它是真实的
+                生意状态（清库存、引流款），商家最需要看到的就是它，
+                藏起来等于让他在亏钱的时候看不见。
+
+              ⚠️ 这一列显示的是【预览】（旁边那两个框现算的），
+                不是后端返回的 grossMarginPercent —— 理由见 marginPercentOf()。
+            -->
+            <el-table-column label="毛利率" width="80" align="center">
+              <template #default="{ row }">
+                <span v-if="marginPercentOf(row)" class="margin"
+                      :class="{ 'margin-loss': marginPercentOf(row).loss }"
+                      :title="`毛利 ${marginPercentOf(row).margin} 元`">
+                  {{ marginPercentOf(row).text }}
+                </span>
+                <span v-else class="margin-unset">未设置</span>
+              </template>
+            </el-table-column>
+
+            <el-table-column label="库存" width="90">
               <template #default="{ row }">
                 <el-input-number v-model="row.stock" :min="0" :precision="0"
                                  :controls="false" style="width: 100%" />
@@ -1210,5 +1484,31 @@ async function handleSubmit() {
 
 .hint.warn {
   color: #e6a23c;
+}
+
+/* ---------------- 里程碑 16：毛利率列 ---------------- */
+
+/* 毛利率是【算出来的】，用等宽体显示。
+   ★ font-variant-numeric: tabular-nums 让每个数字占一样宽 ——
+     30.00% 和 8.00% 位数不同，不用等宽体的话这一列的数字会左右跳，
+     12 行一起看起来像在抖。金额列（价格/划线价/成本价）不需要这个，
+     因为它们是输入框，不参与这种逐行比对。 */
+.margin {
+  font-variant-numeric: tabular-nums;
+  color: #67c23a;
+  font-size: 12px;
+}
+
+/* 成本 > 售价 = 亏本卖。★ 标红，不隐藏、不显示成「-」——
+   这是真实的生意状态，商家最需要在这一列看到的就是它。 */
+.margin-loss {
+  color: #f56c6c;
+}
+
+/* 「未设置」。⚠️ 走这条分支的【只有】costPrice 是 null，
+   不是「毛利为 0」—— 见 hasCost() 的注释。 */
+.margin-unset {
+  color: #c0c4cc;
+  font-size: 12px;
 }
 </style>

@@ -393,7 +393,9 @@ def advance(order_no, to_status, token=None):
         if r.get("code") != 200:
             raise SystemExit(f"支付失败：HTTP {st} / {r}")
     if to_status >= SHIPPED:
-        st, r = call("POST", f"/admin/orders/{order_no}/ship", None,
+        # ★ 里程碑 18：发货要带承运商 + 快递单号（服务端不接受空值）
+        st, r = call("POST", f"/admin/orders/{order_no}/ship",
+                     {"logisticsCompany": "顺丰", "trackingNo": "SF1234567890"},
                      token=ADMIN_TOKEN)
         if r.get("code") != 200:
             raise SystemExit(f"发货失败：HTTP {st} / {r}")

@@ -92,6 +92,58 @@ const categoryStore = useCategoryStore()
  */
 const categories = computed(() => categoryStore.list)
 
+/**
+ * 左栏要渲染的两级分类，已经【拍平成一维】。
+ *
+ * <p>★★ 里程碑 16：这里刻意拍平，而不是渲染成嵌套的 `<ul>`。
+ *
+ * <p>拍平带来两件事：
+ * <ol>
+ *   <li>模板里只有一个 `v-for`，没有嵌套循环 ——
+ *       而嵌套循环在 Vue 3 里要写成 `&lt;template v-for&gt;`，
+ *       它的 `:key` 会被 ESLint 的 `vue/no-v-for-template-key`
+ *       判成错误（那条规则是给 Vue 2 的，判定方式是版本无关的）。</li>
+ *   <li><b>顺序天然是对的</b>：一级分类后面紧跟它自己的二级分类。
+ *       分成两个循环（先所有根、再所有子）会把顺序搞乱。</li>
+ * </ol>
+ *
+ * <p>⚠️ 这个形状和 App.vue 里的 {@code navItems} <b>不一样</b>
+ *   （那边是嵌套的，因为气泡要按根分组），这是有意的：
+ *   两处的<b>数据形状需求本来就不同</b>，硬合成一个只会变成
+ *   "带一堆参数的公共函数"。共享的是 store 里那三个判断
+ *   （roots / childrenOf / isBranchActive），那才是不能分岔的部分。
+ *
+ * <p>★ `level` 只用来加缩进样式，不是一个新的判据 ——
+ *   真判据是"它在不在某个根的 subs 里"，而那由 store 的
+ *   `childrenOf` 回答。
+ */
+const catItems = computed(() => {
+  const out = []
+  for (const root of categoryStore.roots) {
+    out.push({ id: root.id, name: root.name, level: 1 })
+    for (const sub of categoryStore.childrenOf(root.id)) {
+      out.push({ id: sub.id, name: sub.name, level: 2 })
+    }
+  }
+  return out
+})
+
+/**
+ * 左栏里某个分类是不是选中态。
+ *
+ * <p>★★ 和 App.vue 里那个判断<b>是同一个实现</b>
+ * （`categoryStore.isBranchActive`），这是刻意的 ——
+ * 见 `utils/query.js` 开头那段（「同一个语义判断只能有一个实现」）。
+ *
+ * <p>★ 后果是：选中一个二级分类时，<b>它的一级分类也会变红</b>。
+ *   看起来像"选中了两个"，但它表达的其实是
+ *   「你现在看的是这一支里的一条」——
+ *   少了它，用户会觉得"我明明在手机壳里，左边却什么都没选中"。
+ */
+function isCategoryActive(id) {
+  return categoryStore.isBranchActive(id, categoryId.value)
+}
+
 /** 每批拉多少条。6 列 × 4 行 —— 一屏差不多正好铺满 */
 const PAGE_SIZE = 24
 
@@ -603,6 +655,36 @@ function goDetail(id) {
 }
 
 /**
+ * 这件商品的价格要不要显示成<b>区间</b>（★ 里程碑 16 新增）。
+ *
+ * <p>判据是「最低价和最高价不相等」，而不是「规格数 &gt; 1」：
+ * 4 个规格都卖 10 元时写「¥10.00 ~ ¥10.00」是在无中生有一个范围。
+ * <b>一个永远为真的修饰语等于没有信息</b> —— 这条判据和里程碑 15
+ * 那个「起」字用的是同一条，只是现在两边都有值可比了。
+ *
+ * <p>⚠️ <b>必须判 null</b>，不能只写 {@code p.maxPrice !== p.minPrice}：
+ * 一件没有任何 SKU 的商品两个字段都是 null（后端刻意不 COALESCE，
+ * 理由见 {@code ProductMapper.xml} 的 {@code skuAggregate}），
+ * 而 {@code null !== null} 是 <b>false</b> —— 侥幸对了；
+ * 但 {@code null !== undefined} 是 <b>true</b>，而这两个值在
+ * 「字段缺失」和「字段为 null」之间是可以互换出现的（依赖 JSON 的形状）。
+ * <b>靠巧合成立的分支早晚会翻脸</b>，所以这里明写。
+ *
+ * <p>★ 用 {@code Number(...)} 比较而不是直接 {@code !==}：
+ * 两个不同的 string（后端某天改成序列化成字符串）用 !== 比会永远为真，
+ * 页面就会对所有商品都显示区间。转成数字比较是零成本的兜底。
+ */
+function hasRange(p) {
+  if (p.maxPrice === null || p.maxPrice === undefined) {
+    return false
+  }
+  if (p.minPrice === null || p.minPrice === undefined) {
+    return false
+  }
+  return Number(p.maxPrice) !== Number(p.minPrice)
+}
+
+/**
  * 在列表页直接加入购物车。
  *
  * <p>★ 注意 @click 后面带了 {@code .stop} —— 这是必须的。
@@ -706,6 +788,8 @@ function cardLabel(p) {
           只是换一个地方去写同一个 categoryId。
           「同一个变量有两种写法」是可以的；「两个变量各写各的」才是错的。
           这正是把筛选条件放在 URL 里的好处：新增一个入口不需要新增状态。
+        ★★ 里程碑 16：现在渲染两级。一级分类下面缩进跟它自己的二级分类
+          （`catItems` 已经拍平成带 level 的一维数组，见注释）。
       -->
       <aside class="hero-cats">
         <div class="hero-cats-title">全部商品分类</div>
@@ -717,11 +801,19 @@ function cardLabel(p) {
           >
             全部商品
           </li>
+          <!--
+            ⚠️ 选中态用 isCategoryActive（= isBranchActive），不是
+              `categoryId === c.id`。差别就在二级分类上：
+              点「手机壳」时，它上面的「手机数码」这一行也会 .active。
+              见 isCategoryActive 的注释。
+            ⚠️ 二级分类的缩进靠 .cat-item-sub 这个类，不靠嵌套结构 ——
+              这正是拍平之后要自己补回来的那一件事。
+          -->
           <li
-            v-for="c in categories"
+            v-for="c in catItems"
             :key="c.id"
             class="cat-item"
-            :class="{ active: categoryId === c.id }"
+            :class="{ active: isCategoryActive(c.id), 'cat-item-sub': c.level === 2 }"
             @click="selectCategory(c.id)"
           >
             {{ c.name }}
@@ -868,8 +960,29 @@ function cardLabel(p) {
                      （见本文件 <style> 里 .product-price i），
                      而 formatAmount 的契约是【不带货币符号】。
                      里程碑 14 改的是插值里的表达式，不是标签结构。
+
+                  ★★ 里程碑 16：原来是「最低价 + 起」，现在是【区间】。
+                     「¥4999 起」只说出了下界，用户想知道的是这个范围有多宽；
+                     两档商品的「起」字让他必须点进去才知道另一档多少。
+                     区间把这件事在卡片上就说完了，所以「起」退休了。
+
+                  ⚠️ ★ 区间的第二个数字【自己带一个 ¥】。
+                     写成 `¥{{a}} ~ {{b}}` 的话，第二个数字落在
+                     sql/test-frontend-format.py 规则 2（MONEY_INTERP）的
+                     匹配之外 —— 它只捕获紧跟 ¥ 之后的那个插值。
+                     那样这一轮唯一新加的金额显示位置就是【没被检查的】。
+
+                  ★★ 划线价只用【宽松真值】判断（p.marketPrice），
+                     不能写成 === null 或 !== undefined：它只在单规格商品上
+                     存在，多规格时那个 key 从 JSON 里【整个消失】
+                     （后端 non_null + SQL 里 CASE WHEN sku_count = 1 那把锁）。
+                     和 p.defaultSkuId 完全同一套写法。
+
+                  ⚠️ 划线价【画在售价后面】，顺序不能反：用户先看到他现在要付多少，
+                     再看原价是多少。反过来的话扫一屏卡片读到的第一个数是
+                     一个他永远不会付的价格。
                 -->
-                <span class="product-price"><i>¥</i>{{ formatAmount(p.minPrice) }}<span v-if="(p.skuCount ?? 0) > 1" class="price-from">起</span></span>
+                <span class="product-price"><i>¥</i>{{ formatAmount(p.minPrice) }}<template v-if="hasRange(p)"> ~ <i>¥</i>{{ formatAmount(p.maxPrice) }}</template><span v-if="p.marketPrice && p.marketPrice > p.minPrice" class="price-market"><i>¥</i>{{ formatAmount(p.marketPrice) }}</span></span>
                 <!--
                   ★★ 里程碑 15 阶段 3：这里原来是「库存 N 件」。
 
@@ -1032,6 +1145,33 @@ function cardLabel(p) {
   color: var(--jd-red);
   font-weight: 700;
 }
+
+/* ---- 二级分类（里程碑 16）---- */
+.cat-item-sub {
+  /* ★ 缩进：靠 padding-left 而不是一个「　└ 」前缀字符。
+     左栏这一行是有 hover 背景的（.cat-item:hover），
+     前缀字符会落在背景色【里面】，看起来像分类名的一部分；
+     而 padding 让缩进成为"这一行从哪儿开始"的事，和文字无关。 */
+  padding-left: 30px;
+  /* 比一级分类小一号，但【不是灰的】——
+     灰会让它看起来像"禁用的"而不是"更深一层的" */
+  font-size: 13px;
+  /* 继承 .cat-item 的 flex: 1 1 34px —— 二级分类行也跟着摊高度。
+     它们的行高和一级一样，因为左栏的 flex 会把总高度摊平，
+     这里没有真正压扁的余地（想压只能给 min-height 单独调小，
+     但那样一级和二级的行高就会不一致，更难认） */
+}
+
+/* ★ 这里【故意没有】 .cat-item-sub.active 这条规则。
+   它看起来该有（"二级分类选中时是不是要特别标一下"），
+   但加上去只会重复一遍上面 .cat-item.active 已经写过的三条属性。
+
+   ⚠️ 顺便说清一件容易看着别扭的事：选中一个二级分类时，
+   它的一级分类【也会】变红加粗（两行同时 .active）。
+   这不是 bug，是 isBranchActive 的直接后果 ——
+   单独标出"当前是哪一个"要再引入一个"是否精确选中"的判据，
+   而两个判据并存正是 query.js 开头警告过的那种分岔来源。
+   二级分类有缩进、字号也小一号，谁是子谁是父看得出来。 */
 
 /* ---- 中栏：轮播 ---- */
 .hero-carousel {
@@ -1268,14 +1408,24 @@ function cardLabel(p) {
   margin-right: 1px;
 }
 
-/* 「起」——跟在起售价后面那个字（里程碑 15）。
-   ★ 用中性的灰，不用价格那个红：它是【注解】不是价格的一部分，
-     染成红的会被一起读成数字 */
-.price-from {
-  margin-left: 2px;
+/* 划线价（原价）—— 跟在售价后面那个数（里程碑 16）。
+   ★ 它替掉了原来这里那条 .price-from（「起」字）。
+     换掉的理由不是样式问题：「起」只在数字后面加一个注解，
+     而区间（¥100.00 ~ ¥300.00）直接把范围说完了，
+     所以那个字没有存在的位置了 —— 而【留在 CSS 里没人用的类】
+     会让下一个读代码的人以为它还在被某处用着。
+
+   ★ 三个属性各管一件事：
+       line-through 它是被划掉的，这是它全部的含义
+       小一号 + 灰   它【不是当前价格】；写成和售价一样大一样红，
+                     卡片上就有两个"价格"了，扫一屏根本分不出哪个要付
+   ⚠️ 不能用 color: inherit —— 那样会跟着 .product-price 一起变红 */
+.price-market {
+  margin-left: 4px;
   font-size: 12px;
   font-weight: 400;
   color: #909399;
+  text-decoration: line-through;
 }
 
 .product-stock {

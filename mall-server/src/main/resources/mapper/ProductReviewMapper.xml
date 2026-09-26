@@ -170,7 +170,26 @@
         SELECT oi.id           AS orderItemId,
                oi.product_id   AS productId,
                oi.product_name AS productName,
-               o.status        AS orderStatus
+               o.status        AS orderStatus,
+               <!--
+                 ★ 里程碑 17：这一条明细有没有退过款。
+
+                 ★★ 用【标量子查询】而不是 LEFT JOIN after_sale ——
+                    一条明细可以有多张售后单（被拒绝/撤销之后可以重新申请，
+                    历史单不限张数），LEFT JOIN 会让结果【行数变多】，
+                    而这是个单对象查询：MyBatis 会取到随机一行的售后状态，
+                    或者直接抛 TooManyResultsException。两种都是静默/半静默的错。
+                    要问的是「有没有」，不是「哪一张」—— 所以它天然一对一。
+
+                 ★ 只认 status = 3（退款完成）。被拒绝、已撤销的单不算 ——
+                    那两种情况下东西还在买家手里，他当然可以评价。
+
+                 ⚠️ 它是【行级】事实，和 o.status（订单级）是两个层次。
+                    这正是本轮那个中心张力第四次出现的地方：见 ReviewEligibleVO。
+               -->
+               EXISTS (SELECT 1 FROM after_sale a
+                        WHERE a.order_item_id = oi.id
+                          AND a.status = 3) AS refunded
         FROM order_item oi
         JOIN orders o ON o.id = oi.order_id
         WHERE oi.id = #{orderItemId}

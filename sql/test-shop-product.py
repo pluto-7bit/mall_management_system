@@ -168,6 +168,22 @@ def cleanup():
 
     run_sql(f"DELETE FROM product WHERE name LIKE '{PREFIX}%'")
 
+    # ★ 里程碑 16：第 5.1 节会建一个子分类。
+    #   正常路径下它当场就被删了（按 id 精确删），这里是【保险】——
+    #   脚本中途崩掉时留下的子分类，下一次运行要先清掉，
+    #   否则第二次运行会又建一个同名的，然后两个都挂不到一起、
+    #   而错误信息完全指不到真正的原因。
+    #
+    #   ⚠️ 为什么这里可以按前缀删、而 tools/fixture-*.py 里不行：
+    #      这条前缀（ZZ-sptest）是这个脚本【自己发明】的，
+    #      线上库里不可能有人手工建出一个叫这个名字的分类。
+    #      夹具脚本面对的却是用户的真实数据 —— 那条反通配符原则
+    #      针对的是那种场景，不是这一种。**判据是"这个名字有没有可能是别人的"。**
+    #
+    #   ★ 仍然保持「子先父后」：本脚本建的分类【只有一个层级】，
+    #     所有 ZZ-sptest 开头的都是子分类，父是种子分类（不归我们删）。
+    run_sql(f"DELETE FROM category WHERE name LIKE 'ZZ-{PREFIX}%'")
+
 
 def create_product(name, category_id, price, stock, status, description=""):
     """用管理端接口建商品，返回新商品的 id。"""
@@ -389,13 +405,22 @@ def main():
 
     st, r = shop_list(categoryId=CAT_A, pageSize=100)
     cat_a_items = (r.get("data") or {}).get("list") or []
-    check("按分类筛选后，每一条的 categoryId 都等于所筛分类",
+    # ⚠️ 里程碑 16 起，「所筛分类的商品」不再只有 categoryId 等于它的那些 ——
+    #    挂到它【子分类】下的商品也算（见 5.1）。
+    #    这条断言之所以还成立，是因为 CAT_A 是种子分类，而种子区里
+    #    六个分类【全是根】（parent_id 都是 0），没人有子分类。
+    #    ★ 换句话说：它守的是「没有子分类时行为没变」，不是「含后代」那条规则。
+    #      「含后代」由 5.1 专门守，两条各司其职 —— 不要以为这条能替代它。
+    check("按分类筛选后，每一条的 categoryId 都等于所筛分类（该分类无子分类时）",
           cat_a_items and all(i.get("categoryId") == CAT_A for i in cat_a_items),
           f"{[i.get('categoryId') for i in cat_a_items]}")
 
     st, r = shop_list(categoryId=999999, pageSize=10)
     check("不存在的分类 → total=0，不报错",
           st == 200 and (r.get("data") or {}).get("total") == 0, f"HTTP {st} / {r}")
+    # ★★ 上面这条在里程碑 16 里比看上去重要得多。
+    #    后端把 categoryId 展开成 id 集合后，若集合为空还硬把 IN () 发下去，
+    #    这里就会变成 HTTP 500 而不是 total=0。它是一条【语法级】的哨兵。
 
     st, r = shop_list(keyword=TAG, categoryId=CAT_B, pageSize=100)
     check("关键词 + 分类组合筛选按 AND 生效（命中上架商品B）",
@@ -403,6 +428,71 @@ def main():
 
     st, r = shop_list(keyword=TAG, categoryId=CAT_B, pageSize=100)
     check("组合筛选下下架商品依然不可见", p_off not in ids_of(r.get("data") or {}), f"{r}")
+
+    # ==================================================================
+    section("5.1 ★★ 筛【父分类】要含子分类的商品（里程碑 16 新增）")
+
+    # ★ 为什么这一段自带一整套「建 → 验 → 拆」，而不是把数据留着给后面用：
+    #   本文件第 4/7/8 节的分页断言全部拿 baseline_total（= 开局快照 + 2）
+    #   当参照。这里要是多留下一件上架商品，那些断言会集体变红，
+    #   而它们红的原因和它们测的东西【毫无关系】——
+    #   一个"被别的用例污染"的断言，比没有断言更难查。
+    #   所以：这一段必须自己收干净，收不干净就不该在这个位置写。
+
+    # 对照组先行：先证明这个子分类自己【一件商品都没有】。
+    # 没有这一步，下面「筛父分类能查到子分类的商品」可能只是
+    # 因为那件商品本来就挂在了父分类上（那这条断言就什么也没证明）。
+    st, r = call("POST", "/admin/categories",
+                 {"name": f"ZZ-sptest{RUN}-子分类", "sort": 9800, "status": 1,
+                  "parentId": CAT_A}, token=ADMIN_TOKEN)
+    child_cat = r.get("data")
+    check("在 CAT_A 下建一个子分类 → 200", r.get("code") == 200 and isinstance(child_cat, int),
+          f"HTTP {st} / {r}")
+
+    st, r = shop_list(categoryId=child_cat, pageSize=100)
+    check("★ 对照：新建的子分类下【一件商品都没有】",
+          st == 200 and (r.get("data") or {}).get("total") == 0, f"HTTP {st} / {r}")
+
+    # 把商品挂到【子】分类上 —— 这是整段的关键：
+    # 商品的 categoryId 是 child_cat，而不是 CAT_A。
+    p_c = create_product(f"{TAG} 子分类商品C", child_cat, "44.44", 5, 1)
+    print(f"  已创建：子分类={child_cat}（父={CAT_A}）  商品={p_c}")
+
+    st, r = shop_list(categoryId=child_cat, pageSize=100)
+    check("按【子】分类筛 → 查得到（直接命中）",
+          p_c in ids_of(r.get("data") or {}), f"{ids_of(r.get('data') or {})}")
+
+    st, r = shop_list(categoryId=CAT_A, pageSize=100)
+    ids = ids_of(r.get("data") or {})
+    check("★★ 按【父】分类筛 → 子分类的商品【也】在（含后代）",
+          p_c in ids, f"{ids} 期望包含 {p_c}")
+
+    # ★★ 真正的回归哨兵：这一条和 test-category.py 里那条【同一份判断】，
+    #    只是端不同。若哪天有人只改了一端（比如把展开只加在管理端），
+    #    两条断言会一绿一红 —— 而不是两条都绿。理由写在
+    #    ShopProductServiceImpl.page 的注释里：同一件商品在两端数字对不上，
+    #    运营会先怀疑后台统计错了，不会先怀疑这是两个不同的规则。
+    st, r = shop_list(keyword=TAG, categoryId=CAT_A, pageSize=100)
+    check("★★ 父分类 + 关键词组合筛：子分类商品同样被含进来",
+          p_c in ids_of(r.get("data") or {}), f"{ids_of(r.get('data') or {})}")
+
+    # 拆：先删商品，再删子分类。
+    # ★ 顺序不能反 —— 分类底下还挂着商品时删除会被 1004 拒掉，
+    #   而那条拒绝本身在 test-category.py 里是【被断言的行为】，不是故障。
+    #   全库零外键，所以这个顺序是人为约定，数据库不会替你纠正。
+    st, r = call("DELETE", f"/admin/products/{p_c}", token=ADMIN_TOKEN)
+    check("清理：删除子分类下的测试商品", r.get("code") == 200, f"HTTP {st} / {r}")
+
+    st, r = call("DELETE", f"/admin/categories/{child_cat}", token=ADMIN_TOKEN)
+    check("清理：删除子分类（此时已经没有商品和子分类挡着）",
+          r.get("code") == 200, f"HTTP {st} / {r}")
+
+    # ★ 按【自己刚刚记下的那个 id】核对，不按名字前缀筛 ——
+    #   反通配符清理原则：脚本只对自己登记的精确 id 负责。
+    st, r = call("GET", "/admin/categories/options", token=ADMIN_TOKEN)
+    names = [c["name"] for c in (r.get("data") or [])]
+    check("清理后子分类确实不在了（按 id 登记核对，不按前缀扫）",
+          f"ZZ-sptest{RUN}-子分类" not in names, f"{names}")
 
     # ==================================================================
     section("6. 排序")

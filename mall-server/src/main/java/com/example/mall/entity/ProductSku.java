@@ -64,6 +64,52 @@ public class ProductSku {
      */
     private BigDecimal price;
 
+    /**
+     * 划线价（原价/市场价），★ 里程碑 16 新增。{@code null} 表示商家没设。
+     *
+     * <p>★ <b>它是「缺席」而不是「0」</b>：数据库那列是 {@code DEFAULT NULL}，
+     * 不是 {@code NOT NULL DEFAULT 0} —— 判据（以及它为什么和
+     * {@code category.parent_id} 的选择故意相反）见 {@code migration-14b} 头部。
+     * 简单说：{@code parent_id = 0} 只是一个「没有父」的标记，
+     * 而 {@code market_price = 0} 会被拿去和售价比大小。
+     *
+     * <p>⚠️ <b>它不需要「大于 0」这条校验</b>：保存时有一条更强的规则
+     * 「{@code marketPrice} 必须大于 {@code price}」，而 {@code price} 本身
+     * 有 {@code >= 0.01} 的下界，所以这条已经把它盖住了。
+     * 再加一条 {@code @DecimalMin} 就是同一个事实的第二个定义。
+     *
+     * <p>★ 展示规则是「{@code marketPrice > price} 时才画删除线」，
+     * 那条判断在<b>前端</b>（后端只给数、不给 {@code showDiscount} 布尔位）。
+     * ⚠️ 代价是「填错的划线价会被静默吃掉」，所以保存时有一条 400 拦住它 ——
+     * 而且那条校验必须按<b>入库时的舍入</b>比大小，见 {@code ProductServiceImpl.planSkus}。
+     */
+    private BigDecimal marketPrice;
+
+    /**
+     * 成本价（进货价），★ 里程碑 16 新增。{@code null} 表示商家没填。
+     *
+     * <p>★★ <b>它是本项目唯一一条「列存在、但绝不能出用户端」的字段。</b>
+     * 边界不在 SQL（{@code ProductSkuMapper} 的三个查询都照常查它），
+     * 而在 VO 的继承树上：
+     * <pre>
+     *   SkuVO          公共字段（用户端也看得到）—— 【没有成本】
+     *    ├─ ShopSkuVO  用户端出口（/api/shop/skus/{id}、购物车）
+     *    └─ AdminSkuVO 管理端出口 —— 在这里加 costPrice / grossMargin
+     * </pre>
+     *
+     * <p>⚠️ 所以<b>任何时候都不要把这个字段（或它的两个派生量）挪到 {@link com.example.mall.vo.SkuVO} 上</b>：
+     * {@code ShopSkuVO extends SkuVO}，挪上去就等于让
+     * {@code /api/shop/skus/{id}} <b>匿名</b>泄漏成本价 ——
+     * 一行改动、零编译错误、不用登录就能读到。
+     * 守着这条的是 {@code sql/test-price.py} 的 E 组（<b>双向</b>：
+     * 用户端一个都不许有、管理端必须有）。
+     *
+     * <p>★ 唯一的业务校验是 {@code >= 0}（一条协议层规则，写在 {@code SkuSaveDTO} 上）。
+     * <b>「成本价高于售价」（亏本卖）是被允许的</b> —— 那是真实存在的生意状态，
+     * 只该在管理端标红，不该被拒绝。
+     */
+    private BigDecimal costPrice;
+
     /** 库存数量。扣减走 {@code decreaseSkuStock} 的条件 UPDATE，不先查后判 */
     private Integer stock;
 

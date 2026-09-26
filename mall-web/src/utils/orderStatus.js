@@ -58,6 +58,15 @@
  * <p>⚠️ 后端有一条纪律：<b>状态的取值定下来之后就不能再改了</b>
  * （状态写进了数据库，改了就等于把所有历史数据的含义改变）。
  * 所以这个字典<b>只会往后追加</b>，不会重排 —— 前端的对应关系很稳。
+ *
+ * <p>★ {@code REFUNDED: 5} 是里程碑 17 追加的（售后 + 运费）。
+ * 它对这个页面的直接后果：<b>「发货」按钮会自动消失</b>
+ * （条件写的是 {@code row.status === 1}）。
+ * 这不是巧合，正是这个状态存在的理由 —— 一张全部明细都退完款的订单
+ * 必须离开「已付款」，否则管理员点一下「发货」就把<b>已经退过款的东西发出去了</b>，
+ * 钱货两空，而且没有任何一层会报错。
+ * ⚠️ 但真正的闸门仍然是 SQL 里的 {@code WHERE status = 1} ——
+ * 这里的标签错了最多让人看到一个不该出现的按钮，点了也会拿到 1002。
  */
 export const ORDER_STATUS = {
   PENDING_PAY: 0,
@@ -65,6 +74,7 @@ export const ORDER_STATUS = {
   SHIPPED: 2,
   COMPLETED: 3,
   CANCELLED: 4,
+  REFUNDED: 5,
 }
 
 /**
@@ -87,6 +97,8 @@ export function orderStatusLabel(status) {
       return '已完成'
     case ORDER_STATUS.CANCELLED:
       return '已取消'
+    case ORDER_STATUS.REFUNDED:
+      return '已退款'
     default:
       return '未知状态'
   }
@@ -105,6 +117,7 @@ export function orderStatusLabel(status) {
  *   已发货 → primary 蓝。在途，不需要任何人做事
  *   已完成 → success 绿。终态，好事
  *   已取消 → info    灰。终态，不需要管理员做任何事
+ *   已退款 → info    灰。终态，同上（里程碑 17 追加）
  * </pre>
  *
  * <p>⚠️ 这里和 {@code mall-shop} 那份<b>有两个颜色不一样</b>
@@ -125,6 +138,12 @@ export function orderStatusTagType(status) {
     case ORDER_STATUS.COMPLETED:
       return 'success'
     case ORDER_STATUS.CANCELLED:
+      return 'info'
+    case ORDER_STATUS.REFUNDED:
+      // ★ 和「已取消」同色：终态，不需要管理员做任何事。
+      //   不要因为「退款完成了」就配绿 —— 对<b>订单</b>来说这不是办成了，
+      //   是这单黄了。绿留给真正的成功终态（已完成）。
+      //   （售后单自己的「退款完成」是绿的，那是另一个层次的事实，见 afterSaleStatus.js）
       return 'info'
     default:
       return 'info'
@@ -159,16 +178,23 @@ export function payMethodLabel(method) {
  * <p>★ 和展示字典放在同一个文件里，理由和 {@code mall-shop} 的
  * {@code PAY_METHODS} 一样：让「加一个状态」只需要改一个地方。
  *
- * <p>★ 这里<b>把五个状态全摆上了，包括「已取消」</b> ——
+ * <p>★ 这里<b>把【全部】状态都摆上了，包括「已取消」和「已退款」</b> ——
  * 这一点和用户端（{@code mall-shop} 的「我的订单」）不同，
- * 那边刻意<b>没有</b>给「已取消」单独的 Tab，理由写在 Orders.vue 里：
- * 顾客不会专门去找一笔自己取消掉的订单。
+ * 那边刻意<b>没有</b>给「已取消」「已退款」单独的 Tab，理由写在 Orders.vue 里：
+ * 顾客不会专门去找一笔自己取消掉、或者已经退完款的订单。
  *
  * <p>管理端为什么要给？因为管理员查已取消的订单是<b>有真实用途</b>的：
  * 核对一笔被超时取消的订单释放了多少库存、排查用户投诉
  * 「我的单怎么没了」。这些是顾客不会做、而运营真的会做的事。
  * <b>同一个筛选条件在两个端该不该出现，取决于"谁会来用它做什么"，
  * 而不是"这个状态存不存在"。</b>
+ *
+ * <p>★★ <b>「已退款」必须在这里 —— 漏了它是最安静的一种错。</b>
+ * 少一项的后果不是页面报错、也不是代码报错，而是
+ * <b>运营永远筛不出已退款的订单</b>：他不会报 bug，只会以为「就是没有这种单」。
+ * 所以 {@code sql/test-frontend-format.py} 的规则 6 专门量这个数组 ——
+ * 它的取值集合必须<b>正好等于</b>后端的六个状态，少一项就红。
+ * <b>一个不会报错的缺口，只有人专门去量它才会被发现。</b>
  *
  * <p>⚠️ 「全部」的 value 是 {@code null}，必须放在第一个 ——
  * 这样 {@code el-select} 的初始值取 null 时显示的就是「全部状态」。
@@ -181,4 +207,5 @@ export const ORDER_STATUS_OPTIONS = [
   { value: ORDER_STATUS.SHIPPED, label: '已发货' },
   { value: ORDER_STATUS.COMPLETED, label: '已完成' },
   { value: ORDER_STATUS.CANCELLED, label: '已取消' },
+  { value: ORDER_STATUS.REFUNDED, label: '已退款' },
 ]

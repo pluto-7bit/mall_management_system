@@ -101,6 +101,53 @@ public class ShopProductVO {
     private BigDecimal minPrice;
 
     /**
+     * 最高价 —— 所有规格里最贵的那个（{@code MAX(product_sku.price)}），
+     * ★ 里程碑 16 新增。
+     *
+     * <p>首页卡片靠 {@code minPrice} 和它一起显示价格<b>区间</b>：
+     * {@code ¥4999 ~ ¥6999}。两者相等时（单规格商品）只显示一个数 ——
+     * <b>「起」这个字因此可以退休了</b>：它表达不了区间，
+     * 而「4999 起」在只有两档 4999 / 6999 时信息量太低。
+     *
+     * <p>⚠️ 同样<b>不 COALESCE</b>：没有 SKU 的商品是 null，
+     * 和 {@link #minPrice} 保持一致（理由见 {@code ProductMapper.xml} 里
+     * {@code skuAggregate} 上面那段）。
+     */
+    private BigDecimal maxPrice;
+
+    /**
+     * 划线价（原价/市场价），★ 里程碑 16 新增。<b>只在单规格商品上有值。</b>
+     *
+     * <h3>★★ 为什么多规格商品上它整个消失（而不是「挑一个」）</h3>
+     *
+     * <p>因为它没有唯一答案。{@code MIN(price)}（起售价）和
+     * {@code MIN(market_price)}（原价里最小的那个）<b>可以来自两个不同的 SKU 行</b>：
+     * <pre>
+     *   黑色 售价 ¥4999 / 原价 未设
+     *   白色 售价 ¥6999 / 原价 ¥8999
+     *   → 卡片如果并排显示 MIN(price) 和 MIN(market_price)
+     *     就成了「¥4999 ~~¥8999~~」—— 一个【不存在的折扣】
+     * </pre>
+     * 8999 是白色那一档的原价，4999 是黑色那一档的售价，
+     * 这两个数字从来不属于同一个规格。<b>那是凭空造出来的促销信息。</b>
+     *
+     * <p>所以 SQL 里套了 {@code CASE WHEN sku_count = 1} 这把锁
+     * （和 {@link #defaultSkuId} 是同一把锁、同一条判据）。
+     * <b>多规格商品想看划线价，去详情页看</b> —— 那里用户选中了一个 SKU，
+     * 那一行的原价是唯一确定的（{@code ShopSkuVO.marketPrice} 逐行带出）。
+     *
+     * <h3>★ 前端契约</h3>
+     *
+     * <p>⚠️ 多规格时这个 key 从 JSON 里<b>整个消失</b>（{@code non_null}），
+     * 所以判断用宽松真值：{@code p.marketPrice}，不要写成「等于 null」。
+     *
+     * <p>⚠️ 「要不要画删除线」由前端判断：<b>{@code marketPrice > price} 才画</b>。
+     * 后端只给数、不给 {@code showDiscount} 布尔位 —— 和
+     * {@code skuCount > 1} 时前端自己加「起」字是同一种分工。
+     */
+    private BigDecimal marketPrice;
+
+    /**
      * 所有规格的库存合计（{@code SUM(product_sku.stock)}）。
      *
      * <p>⚠️ <b>它的用途只有一个：判断「这件商品是不是彻底没货了」。</b>

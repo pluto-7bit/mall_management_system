@@ -44,14 +44,24 @@
  * 各自内部保持一致才是要紧的。
  * 在只有一个使用者的地方引入一套同步层，是纯粹的不一致。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { cancelOrder, completeOrder, listMyOrders } from '@/api/order'
+import { cancelOrder, completeOrder, getOrderLogistics, listMyOrders } from '@/api/order'
+import { applyAfterSale } from '@/api/afterSale'
 import ReviewFormDialog from '@/components/ReviewFormDialog.vue'
 import { formatAmount } from '@/utils/format'
 import { readOrderStatus } from '@/utils/query'
 import { ORDER_STATUS, orderStatusLabel, orderStatusTagType } from '@/utils/orderStatus'
+import {
+  AFTER_SALE_REASONS,
+  AFTER_SALE_TYPES,
+  afterSaleReasonLabel,
+  afterSaleStatusLabel,
+  afterSaleStatusTagType,
+  afterSaleTypeLabel,
+} from '@/utils/afterSaleStatus'
+import { logisticsStatusLabel, logisticsStatusTagType } from '@/utils/logisticsStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -305,6 +315,118 @@ function backOffIfLastRow() {
 }
 
 // ---------------------------------------------------------------------------
+// 申请售后（★ 里程碑 17）
+// ---------------------------------------------------------------------------
+
+const afterSaleVisible = ref(false)
+const applyingOrder = ref(null)
+/** 这一单里【够资格】申请售后的明细，弹窗把它们列成可勾选项 */
+const applyingItems = ref([])
+/** 勾选的明细 id。默认勾上被点的那一行 —— 整单退只是多勾几个 */
+const selectedItemIds = ref([])
+const afterSaleForm = reactive({ reason: '', description: '' })
+const applying = ref(false)
+
+/**
+ * ★ 售后类型【不给用户选】，由订单状态唯一决定。
+ * 已付款（未发货）→ 仅退款（货还在仓库，没什么可寄回的）；
+ * 已发货 / 已完成 → 退货退款。
+ * 后端 checkTypeMatchesStatus 是真正的闸门，这里只是不让用户选一个注定被拒的值。
+ */
+const afterSaleType = computed(() =>
+  applyingOrder.value?.status === ORDER_STATUS.PAID
+    ? AFTER_SALE_TYPES.ONLY_REFUND
+    : AFTER_SALE_TYPES.RETURN_REFUND,
+)
+
+/** 原因下拉从字典反推，避免再抄一份文案 */
+const reasonOptions = Object.values(AFTER_SALE_REASONS).map((v) => ({
+  value: v,
+  label: afterSaleReasonLabel(v),
+}))
+
+/** 'YYYY-MM-DD HH:mm:ss' → Date。和 Pay.vue 同一个写法（带空格的格式 Safari 不认） */
+function parseTime(s) {
+  return new Date(String(s).replace(' ', 'T'))
+}
+
+/**
+ * 申请期限只作用于【已完成】的订单（其余状态没有 complete_time，没有起点）。
+ * 后端给的是绝对时刻，前端不自己算「7 天」—— 见 OrderVO.afterSaleDeadline 的注释。
+ */
+function isAfterSaleExpired(order) {
+  if (!order.afterSaleDeadline) {
+    return false
+  }
+  return Date.now() > parseTime(order.afterSaleDeadline).getTime()
+}
+
+/**
+ * 这一行能不能申请售后（前端只是体验优化，后端才是不变量）。
+ * ⚠️ it.afterSaleNo / it.refunded 都用真值判断 —— 全局 non_null 会把
+ * 没值时的整个 key 删掉，写 === null 判断恒为 false，入口永远显示。
+ */
+function canApplyAfterSale(order, item) {
+  if (
+    order.status !== ORDER_STATUS.PAID &&
+    order.status !== ORDER_STATUS.SHIPPED &&
+    order.status !== ORDER_STATUS.COMPLETED
+  ) {
+    return false
+  }
+  if (item.afterSaleNo || item.refunded) {
+    return false
+  }
+  return !isAfterSaleExpired(order)
+}
+
+function openAfterSale(order, item) {
+  applyingOrder.value = order
+  applyingItems.value = (order.items || []).filter((it) => canApplyAfterSale(order, it))
+  selectedItemIds.value = [item.id]
+  afterSaleForm.reason = ''
+  afterSaleForm.description = ''
+  afterSaleVisible.value = true
+}
+
+const selectedSubtotal = computed(() =>
+  applyingItems.value
+    .filter((it) => selectedItemIds.value.includes(it.id))
+    .reduce((sum, it) => sum + Number(it.subtotal || 0), 0),
+)
+
+async function submitAfterSale() {
+  if (selectedItemIds.value.length === 0) {
+    ElMessage.warning('请至少选择一件商品')
+    return
+  }
+  if (!afterSaleForm.reason) {
+    ElMessage.warning('请选择申请原因')
+    return
+  }
+
+  applying.value = true
+  try {
+    await applyAfterSale({
+      orderNo: applyingOrder.value.orderNo,
+      orderItemIds: selectedItemIds.value,
+      type: afterSaleType.value,
+      reason: afterSaleForm.reason,
+      description: afterSaleForm.description,
+    })
+    ElMessage.success('申请已提交，等待商家处理')
+    afterSaleVisible.value = false
+    load()
+  } catch {
+    // 失败最常见的原因是「并发重复申请」（1012）—— 那一行已经是「处理中」了，
+    // 界面还显示着入口就是错的，所以照样重查一次
+    load()
+  } finally {
+    applying.value = false
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 行内操作
 // ---------------------------------------------------------------------------
 
@@ -425,6 +547,54 @@ async function handleComplete(order) {
  * 「忘了改这里」的症状是「URL 变了但列表没变」，很难查。
  */
 watch(() => route.query, load, { immediate: true })
+
+// ---------------------------------------------------------------------------
+// 物流（里程碑 18）
+// ---------------------------------------------------------------------------
+
+/**
+ * 物流弹窗的状态。★ 这是本页唯一的【只读】弹窗。
+ *
+ * <p>★ 和售后弹窗（{@code afterSaleVisible}）有一个关键差别：
+ * 那个弹窗里有表单、有提交；这个<b>一个字都不能改</b>。
+ * 轨迹是管理员在管理端手工录的，会员能做的只有看。
+ * 所以模板里不该出现任何输入框 —— 否则用户会试着填它。
+ *
+ * <p>★ {@code traces} 初始值是空数组而不是 null：弹窗一打开就渲染时间线，
+ * {@code v-for} 撞上 null 会白屏。（服务端也保证它永远是数组。）
+ */
+const logisticsVisible = ref(false)
+const logisticsLoading = ref(false)
+const logisticsData = ref({ traces: [] })
+
+/**
+ * 打开物流弹窗。
+ *
+ * <p>★ <b>先开弹窗再发请求</b>，并且立刻转圈 —— 否则从点击到弹窗出现
+ * 之间有一段空白，用户会以为按钮没生效、再点一次。
+ *
+ * <p>⚠️ 这里【不】做成「把轨迹塞进订单对象里一起查回来」。理由是
+ * 一个有性能代价的：订单列表是分页的（{@code pageSize = 5}），
+ * 把轨迹嵌进每一行意味着<b>每翻一页都要把所有订单的轨迹全查一遍</b>，
+ * 而其中绝大多数根本没人会点开。轨迹走独立接口之后，
+ * 只有真正点开的那一单会产生这次查询。
+ *
+ * <p>★ 附带好处：列表接口的响应形状没变，所以这一轮
+ * {@code test-frontend-contract.py} 里订单列表那一节不用改。
+ */
+async function openLogistics(order) {
+  logisticsData.value = { traces: [] }
+  logisticsVisible.value = true
+  logisticsLoading.value = true
+  try {
+    logisticsData.value = await getOrderLogistics(order.orderNo)
+  } catch {
+    // 提示已在响应拦截器里统一处理。★ 这里【不关】弹窗 ——
+    // 关掉的话用户只会看到一个弹窗闪过去，不知道发生了什么。
+  } finally {
+    logisticsLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -489,6 +659,30 @@ watch(() => route.query, load, { immediate: true })
           <span v-if="o.payTime" class="muted">支付于 {{ o.payTime }}</span>
           <span v-if="o.shipTime" class="muted">发货于 {{ o.shipTime }}</span>
           <span v-if="o.completeTime" class="muted">完成于 {{ o.completeTime }}</span>
+
+          <!--
+            ★★ 里程碑 18：承运商 + 单号 + 「查看物流」入口。
+
+            ★★ 入口放在【单号旁边】，不放在下面的 card-actions 里。
+               原因是一个具体的 bug：card-actions 的 v-if 是
+               `status === PENDING_PAY || status === SHIPPED` ——
+               【已完成的订单根本没有这个区块】。
+               把按钮放进 card-actions，货收到之后就再也看不到物流了，
+               而那恰恰是最需要它的时候（「到底哪天送到的」）。
+               ★ 这是一条可以照抄的判据：**入口的归属看「这件事属于哪个
+                 区块的语义」，而不是看「放哪里代码少写两行」。**
+
+            ⚠️ v-if 只能用假值判断，【不能写 === null】：
+               后端配了 non_null，没发货时这个 key 会被整个从 JSON 里删掉，
+               对消失的 key 取属性得到的是 undefined，`=== null` 恒为 false
+               → 入口永远不显示。同一个坑本项目已经踩过 5 次。
+          -->
+          <span v-if="o.trackingNo" class="muted">
+            {{ o.logisticsCompany }} {{ o.trackingNo }}
+            <el-button type="primary" link size="small" @click="openLogistics(o)">
+              查看物流
+            </el-button>
+          </span>
         </div>
 
         <!-- 商品明细。★ 这一屏就能看清「这笔钱花在了什么上」 -->
@@ -557,14 +751,36 @@ watch(() => route.query, load, { immediate: true })
                 因为评价这件事对那一行【已经永远结束了】，
                 给一个禁用的「评价」按钮会让人以为「等会儿还能点」。
             -->
-            <template v-if="o.status === ORDER_STATUS.COMPLETED">
+            <span class="item-action">
+              <!--
+                ★ 售后优先显示状态，不显示入口：正在处理中 / 已退款的行
+                  不该再看到「申请售后」。三个字段的 null 规则各不相同
+                  （完整版见 OrderItemVO）： afterSaleNo 可能整个 key 消失、
+                  afterSaleStatus 跟它同一次 join、refunded 是 Boolean。
+              -->
+              <template v-if="it.afterSaleNo">
+                <el-tag :type="afterSaleStatusTagType(it.afterSaleStatus)" size="small">
+                  {{ afterSaleStatusLabel(it.afterSaleStatus) }}
+                </el-tag>
+              </template>
+              <el-tag v-else-if="it.refunded" type="info" size="small">已退款</el-tag>
+              <el-button
+                v-else-if="canApplyAfterSale(o, it)"
+                type="primary"
+                link
+                @click="openAfterSale(o, it)"
+              >
+                申请售后
+              </el-button>
+
               <!--
                 ⚠️ 是 !it.reviewId 而不是 it.reviewId === null ——
                 全局 Jackson 配了 non_null，没评价时这个键【整个不存在】，
                 写成 === null 的话判断恒为 false，每一行都会显示「评价」按钮。
                 （同一个坑里程碑 11 咬过两次。）
+                ★ 退过款的行不再显示评价入口：钱都退了就没有「评价这件商品」的资格。
               -->
-              <span class="item-action">
+              <template v-if="o.status === ORDER_STATUS.COMPLETED && !it.refunded">
                 <el-button
                   v-if="!it.reviewId"
                   type="primary"
@@ -575,8 +791,8 @@ watch(() => route.query, load, { immediate: true })
                   评价
                 </el-button>
                 <el-tag v-else type="info" size="small">已评价</el-tag>
-              </span>
-            </template>
+              </template>
+            </span>
           </li>
         </ul>
 
@@ -693,6 +909,144 @@ watch(() => route.query, load, { immediate: true })
       :order-item="reviewingItem"
       @success="handleReviewSuccess"
     />
+
+    <!--
+      ★ 售后弹窗同样放在页面级，理由和上面那段一样。
+      ★ 整单退 = 在这里多勾几行，提交时 body 是 orderItemIds: [...]，
+        后端一个事务建 N 张售后单（全成或全败）。
+    -->
+    <el-dialog v-model="afterSaleVisible" title="申请售后" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="订单号">
+          <span class="plain-text">{{ applyingOrder?.orderNo }}</span>
+        </el-form-item>
+        <el-form-item label="售后类型">
+          <span class="plain-text">{{ afterSaleTypeLabel(afterSaleType) }}</span>
+        </el-form-item>
+        <el-form-item label="申请商品">
+          <el-checkbox-group v-model="selectedItemIds">
+            <el-checkbox v-for="it in applyingItems" :key="it.id" :value="it.id">
+              {{ it.productName }}
+              <span v-if="it.skuSpec">/ {{ it.skuSpec }}</span>
+              × {{ it.quantity }}
+            </el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="申请原因">
+          <el-select v-model="afterSaleForm.reason" placeholder="请选择">
+            <el-option
+              v-for="r in reasonOptions"
+              :key="r.value"
+              :label="r.label"
+              :value="r.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="补充说明">
+          <el-input
+            v-model="afterSaleForm.description"
+            type="textarea"
+            :rows="2"
+            maxlength="255"
+            placeholder="选填"
+          />
+        </el-form-item>
+      </el-form>
+
+      <!--
+        ★ 这里【不】写「将退 ¥x」—— 退款金额由服务端在退款那一刻算，
+          运费退不退取决于之后整单是否退完。前端能确定的只有货款，
+          所以文案说「货款」，并说明运费的条件。
+      -->
+      <p class="refund-tip">
+        货款合计：¥{{ formatAmount(selectedSubtotal) }}<br />
+        整笔订单的每一件都退款成功时，运费会一并退还。最终金额以商家退款时核算为准。
+      </p>
+
+      <template #footer>
+        <el-button @click="afterSaleVisible = false">取消</el-button>
+        <el-button type="primary" :loading="applying" @click="submitAfterSale">
+          提交申请
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!--
+      ============ 物流弹窗（里程碑 18） ============
+
+      ★★ 这是本页唯一的【只读】弹窗：没有表单、没有提交按钮、
+         连「复制单号」都没有。轨迹是管理员手工录的，用户只能看。
+
+      ★ 为什么不做「复制单号」：它要多一个 navigator.clipboard 调用，
+         而那个 API 在非安全上下文（http 且非 localhost）下会【静默失败】——
+         用户点一下，什么都没发生，也没有任何提示。
+         收益是省一次拖选，代价是一个「有时候能用」的按钮。不值。
+
+      ★ 弹窗打开时立刻显示 loading（见 openLogistics）——
+         因为没有 loading 的空白弹窗看起来就像「这单没有物流」。
+    -->
+    <el-dialog v-model="logisticsVisible" title="物流信息" width="480px">
+      <div v-loading="logisticsLoading" class="logi-body">
+        <!--
+          ⚠️ 三个字段都用假值判断，【不能写 === null】——
+             未发货时它们会被 non_null 从 JSON 里整个删掉。
+             ★ 未发货的订单能打开这个弹窗吗？界面上不能（入口是
+               v-if="o.trackingNo"），但代码不该依赖「界面上不可能」——
+               那样的话一旦有人加了别的入口，这里会显示三个空白行。
+        -->
+        <div class="logi-head">
+          <div class="logi-line">
+            <span class="muted">承运商</span>{{ logisticsData.logisticsCompany || '—' }}
+          </div>
+          <div class="logi-line">
+            <span class="muted">单号</span>
+            <span class="mono">{{ logisticsData.trackingNo || '—' }}</span>
+          </div>
+          <div class="logi-line">
+            <span class="muted">发货时间</span>{{ logisticsData.shipTime || '—' }}
+          </div>
+        </div>
+
+        <el-divider />
+
+        <div class="logi-title">物流轨迹</div>
+
+        <!--
+          ⚠️ 空轨迹是【正常状态】——刚发货、快递还没揽收就是这样。
+             所以这里必须有一句明确的说明，而不是一片空白：
+             空白会让人以为「页面坏了 / 还没加载出来」，然后反复刷新。
+        -->
+        <div
+          v-if="!logisticsData.traces || logisticsData.traces.length === 0"
+          class="logi-empty"
+        >
+          暂时没有物流轨迹。快递有进展后，商家会更新在这里。
+        </div>
+
+        <!--
+          ★ 顺序完全按服务端给的（trace_time DESC, id DESC），前端【不排】——
+            重排就是第二个定义者，而且很容易写成「按 id 排」，
+            那样商家补录一条昨天的节点会让时间线倒过来。
+            ★ 时间线显示的是 traceTime（【发生】的时刻），不是 createTime
+              （商家录入的时刻）—— 用户的问题是「我的包裹什么时候到的」。
+        -->
+        <div v-else class="timeline">
+          <div v-for="t in logisticsData.traces" :key="t.id" class="trace-item">
+            <div class="trace-main">
+              <el-tag :type="logisticsStatusTagType(t.status)" size="small">
+                {{ logisticsStatusLabel(t.status) }}
+              </el-tag>
+              <span class="trace-time mono">{{ t.traceTime }}</span>
+            </div>
+            <div class="trace-desc">{{ t.description }}</div>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button @click="logisticsVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -820,8 +1174,28 @@ watch(() => route.query, load, { immediate: true })
  */
 .item-action {
   flex: none;
-  width: 60px;
-  text-align: right;
+  /* ★ 里程碑 17 从 60px 加宽：这一列现在【可能上下堆两样东西】
+     （售后的入口/状态 + 评价的入口/状态），60px 装不下「申请售后」四个字。
+     用列布局而不是让它撑开宽度 —— 撑开的话同一页里有的行宽有的行窄。 */
+  width: 88px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.plain-text {
+  color: #606266;
+}
+
+.refund-tip {
+  margin: 0;
+  padding: 8px 10px;
+  background: #fafafa;
+  border-radius: 4px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.8;
 }
 
 .card-foot {
@@ -871,5 +1245,71 @@ watch(() => route.query, load, { immediate: true })
 .pager {
   margin-top: 18px;
   justify-content: center;
+}
+
+/* ---- 物流弹窗（里程碑 18） ---- */
+
+.logi-head {
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #fafafa;
+}
+
+.logi-line {
+  font-size: 13px;
+  line-height: 1.9;
+  color: #333;
+}
+
+/* ★ 给标签一个固定宽度，三行的值才会左对齐 ——
+     不给它的话「承运商 / 单号 / 发货时间」三个词不一样宽，
+     三行的值参差不齐（看起来像排版坏了）。同 .item-sub 那个 90px。 */
+.logi-line .muted {
+  display: inline-block;
+  width: 64px;
+  color: #909399;
+}
+
+.logi-title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #606266;
+}
+
+.logi-empty {
+  color: #909399;
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.timeline {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ★ 左边那条竖线是「这是一串按时间排的事件」的唯一视觉线索 */
+.trace-item {
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid var(--jd-border-light);
+}
+
+.trace-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trace-time {
+  color: #909399;
+  font-size: 12px;
+}
+
+.trace-desc {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #333;
+  word-break: break-all;
 }
 </style>

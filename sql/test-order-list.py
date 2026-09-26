@@ -260,8 +260,14 @@ def complete(token, order_no):
     return call("POST", f"/shop/orders/{order_no}/complete", None, token=token)
 
 
+# ★ 里程碑 18：发货接口现在【必须】带承运商 + 快递单号（服务端不接受空值）。
+#   这里用一组固定值 —— 本脚本要验的是订单列表/发货/确认收货，不是单号格式。
+SHIP_BODY = {"logisticsCompany": "顺丰", "trackingNo": "SF1234567890"}
+
+
 def ship(order_no):
-    return call("POST", f"/admin/orders/{order_no}/ship", None, token=ADMIN_TOKEN)
+    return call("POST", f"/admin/orders/{order_no}/ship", SHIP_BODY,
+                token=ADMIN_TOKEN)
 
 
 def shop_list(token, **params):

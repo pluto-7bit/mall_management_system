@@ -762,9 +762,33 @@ def main():
           cart_keys_for(ID_A) == [p1], f"{cart_keys_for(ID_A)}")
 
     # 金额精度：0.10 × 3 必须是 0.30，不能是 0.30000000000000004
-    total = Decimal(str((r.get("data") or {}).get("totalAmount")))
+    #
+    # ★★ 里程碑 17：这里拆成了三条，因为 total_amount 的语义【变了】。
+    #   它现在是「实付 = 商品小计 + 运费」，继续断言 totalAmount == 0.30
+    #   等于在断言一句旧的话 —— 而运费是真实存在、必须被收的钱（0.30 远不到包邮门槛）。
+    #
+    #   ★ 但精度这件事本身仍然要测，只是该看【明细小计】那个数：
+    #     它是 price × quantity 的直接结果，也正是精度问题会出现的地方。
+    #
+    #   ★ 这里【刻意不写死 10.00】。运费的具体值和 99/98.99 两侧的边界
+    #     由 test-after-sale.py 去测（它从 application.yml 里读门槛和运费，
+    #     不靠抄）。这里只测那条【与配置无关的不变量】，
+    #     所以运营改运费规则不会让这条断言变红，而真正的 bug 一定会让它红。
+    data = r.get("data") or {}
+    item0 = (data.get("items") or [{}])[0]
+    subtotal = Decimal(str(item0.get("subtotal")))
+    freight = Decimal(str(data.get("freightAmount")))
+    total = Decimal(str(data.get("totalAmount")))
+
     check("★★ 0.10 × 3 = 0.30（BigDecimal 精度，不能用 double）",
-          total == Decimal("0.30"), f"实际 = {total}")
+          subtotal == Decimal("0.30"), f"实际 = {subtotal}")
+
+    check("★ 这单不到包邮门槛，运费不是 0（★ 忘了给 insert 加 freight_amount 就是这里红）",
+          freight > 0, f"实际 = {freight}")
+
+    check("★★ 实付 = 明细小计 + 运费（total_amount 的新语义）",
+          total == subtotal + freight,
+          f"实付 {total} / 明细 {subtotal} + 运费 {freight}")
 
     # 立即购买用的幂等键和购物车结算的互不干扰
     check("★ 上面几笔立即购买的订单都落库了",

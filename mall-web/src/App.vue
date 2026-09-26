@@ -123,6 +123,17 @@ onMounted(async () => {
         -->
         <el-menu-item index="/order">订单管理</el-menu-item>
         <!--
+          ★ 里程碑 17 加的。⚠️ 同样的硬要求：
+            index 的 "/after-sale" 必须和 router/index.js 里那条 path 逐字相同。
+            ★ 它是【连字符】写法，不要"顺手"改成 /afterSale ——
+              两个文件里都得一起改，而漏改一个的症状
+              就是「点了 404 + 菜单永远不高亮」。
+          ★ 放在订单管理正下方，因为售后单属于订单 ——
+            但它们是两条不同的链路（售后有自己的状态机和管理员的动作），
+            所以是【两个菜单】，不是订单页里的一个 Tab。
+        -->
+        <el-menu-item index="/after-sale">售后管理</el-menu-item>
+        <!--
           ★ 里程碑 12 加的。⚠️ 同样的硬要求：
             index 的 "/review" 必须和 router/index.js 里那条 path 逐字相同。
             （菜单是硬编码的这一件事，见上面那段注释 ——
